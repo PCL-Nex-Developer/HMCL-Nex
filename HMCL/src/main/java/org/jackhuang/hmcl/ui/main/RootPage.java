@@ -26,6 +26,7 @@ import org.jackhuang.hmcl.event.RefreshedVersionsEvent;
 import org.jackhuang.hmcl.game.HMCLGameRepository;
 import org.jackhuang.hmcl.game.ModpackHelper;
 import org.jackhuang.hmcl.game.Version;
+import org.jackhuang.hmcl.plugin.PluginUIRegistry;
 import org.jackhuang.hmcl.setting.Accounts;
 import org.jackhuang.hmcl.setting.GameDirectory;
 import org.jackhuang.hmcl.setting.GameDirectoryManager;
@@ -190,6 +191,12 @@ public class RootPage extends DecoratorAnimatedPage implements DecoratorPage {
             }
 
             // fifth item in left sidebar
+            AdvancedListItem pluginItem = new AdvancedListItem();
+            pluginItem.setLeftIcon(SVG.EXTENSION);
+            pluginItem.setTitle(i18n("plugin"));
+            pluginItem.setOnAction(e -> showPluginPopupMenu(pluginItem));
+
+            // sixth item in left sidebar
             AdvancedListItem launcherSettingsItem = new AdvancedListItem();
             launcherSettingsItem.setLeftIcon(SVG.SETTINGS);
             launcherSettingsItem.setTitle(i18n("settings"));
@@ -201,7 +208,7 @@ public class RootPage extends DecoratorAnimatedPage implements DecoratorPage {
                 FXUtils.prepareOnMouseEnter(launcherSettingsItem, Controllers::prepareSettingsPage);
             }
 
-            // sixth item in left sidebar
+            // seventh item in left sidebar
             AdvancedListItem terracottaItem = new AdvancedListItem();
             terracottaItem.setLeftIcon(SVG.GRAPH2);
             terracottaItem.setTitle(i18n("terracotta"));
@@ -233,6 +240,7 @@ public class RootPage extends DecoratorAnimatedPage implements DecoratorPage {
                     .add(gameItem)
                     .add(downloadItem)
                     .startCategory(i18n("settings.launcher.general").toUpperCase(Locale.ROOT))
+                    .add(pluginItem)
                     .add(launcherSettingsItem)
                     .add(terracottaItem)
                     .addNavigationDrawerItem(i18n("contact.chat"), SVG.CHAT, () -> {
@@ -253,6 +261,37 @@ public class RootPage extends DecoratorAnimatedPage implements DecoratorPage {
                     0,
                     getSkinnable().getMainPage().getRepository(),
                     getSkinnable().getMainPage().getVersions());
+        }
+
+        private void showPluginPopupMenu(Region pluginItem) {
+            AdvancedListBox menu = new AdvancedListBox()
+                    .addNavigationDrawerItem(i18n("plugin.manage"), SVG.EXTENSION, () -> {
+                        Controllers.getSettingsPage().showPluginManagement();
+                        Controllers.navigate(Controllers.getSettingsPage());
+                    })
+                    .addNavigationDrawerItem(i18n("plugin.store"), SVG.LISTS, () -> {
+                        Controllers.getSettingsPage().showPluginStore();
+                        Controllers.navigate(Controllers.getSettingsPage());
+                    });
+
+            // Add plugin-contributed sidebar items
+            List<PluginUIRegistry.SidebarItem> pluginItems = PluginUIRegistry.getSidebarItems();
+            if (!pluginItems.isEmpty()) {
+                menu.startCategory(i18n("plugin").toUpperCase(Locale.ROOT));
+                for (PluginUIRegistry.SidebarItem item : pluginItems) {
+                    menu.addNavigationDrawerItem(item.getTitle(), SVG.EXTENSION_FILL, item.getOnAction());
+                }
+            }
+
+            menu.getStyleClass().add("popup-menu-content");
+            FXUtils.setLimitWidth(menu, 220);
+
+            JFXPopup popup = new JFXPopup(menu);
+            popup.show(pluginItem,
+                    JFXPopup.PopupVPosition.TOP,
+                    JFXPopup.PopupHPosition.LEFT,
+                    pluginItem.getWidth(),
+                    0);
         }
     }
 

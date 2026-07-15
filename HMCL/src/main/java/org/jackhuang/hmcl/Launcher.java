@@ -171,6 +171,13 @@ public final class Launcher extends Application {
                 return LauncherSettings.getDefaultCommonDirectory();
             }
         }, settings().commonDirectoryProperty(), settings().commonDirectoryTypeProperty()));
+
+        // Initialize plugin system
+        try {
+            org.jackhuang.hmcl.plugin.PluginManager.getInstance().discoverPlugins();
+        } catch (Exception e) {
+            LOG.error("Failed to initialize plugin system", e);
+        }
     }
 
     private static void appendScreen(StringBuilder builder, Screen screen) {
