@@ -64,6 +64,11 @@ dependencies {
     implementation(libs.monet.fx)
     implementation(libs.nayuki.qrcodegen)
     implementation(libs.uuid.tools)
+    implementation(libs.mixin)
+    implementation(libs.guava)
+    implementation(libs.asm.tree)
+    implementation(libs.asm.commons)
+    implementation(libs.asm.util)
 
     testImplementation(libs.jimfs)
 
@@ -191,6 +196,8 @@ val jarPath = tasks.jar.get().archiveFile.get().asFile
 tasks.shadowJar {
     dependsOn(createPropertiesFile)
 
+    mergeServiceFiles()
+
     archiveClassifier.set(null as String?)
 
     exclude("**/package-info.class")
@@ -206,6 +213,9 @@ tasks.shadowJar {
 
     minimize {
         exclude(dependency("com.google.code.gson:.*:.*"))
+        exclude(dependency("com.google.guava:guava:.*"))
+        exclude(dependency("org.spongepowered:mixin:.*"))
+        exclude(dependency("org.ow2.asm:.*:.*"))
         exclude(dependency("net.java.dev.jna:jna:.*"))
         exclude(dependency("libs:JFoenix:.*"))
         exclude(project(":HMCLBoot"))
@@ -215,6 +225,9 @@ tasks.shadowJar {
         "Created-By" to "Copyright(c) 2013-2025 huangyuhui.",
         "Implementation-Version" to project.version.toString(),
         "Main-Class" to "org.jackhuang.hmcl.Main",
+        "Premain-Class" to "org.jackhuang.hmcl.plugin.mixin.bootstrap.HmclMixinAgent",
+        "Can-Redefine-Classes" to "false",
+        "Can-Retransform-Classes" to "false",
         "Multi-Release" to "true",
         "Add-Opens" to addOpens.joinToString(" "),
         "Enable-Native-Access" to "ALL-UNNAMED",

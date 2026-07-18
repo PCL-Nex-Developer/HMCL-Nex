@@ -36,12 +36,14 @@ org/jackhuang/hmcl/ui/main/
 
 ## 插件生命周期
 
-1. **发现**: 扫描 `plugins/` 目录下的 `.npl` 文件
-2. **加载**: 解压 `.npl`，读取 `plugin.json`，实例化插件
-3. **初始化**: 调用 `onLoad(context)`
-4. **启用**: 调用 `onEnable()`
-5. **禁用**: 调用 `onDisable()`
-6. **卸载**: 调用 `onUnload()`
+1. **启动前发现**: 读取启用状态，扫描 Java/Kotlin 插件的 `mixins`，安全解压到校验过哈希的启动缓存
+2. **Mixin Agent 引导**: 首个 JVM 自动用当前 HMCL JAR 作为 `-javaagent` 启动第二个 JVM；`premain` 在 `Main` 加载前初始化 SpongePowered Mixin 0.8.7 并注册字节码变换器
+3. **常规发现**: 扫描 `plugins/` 目录下的 `.npl` 文件，验证清单并按依赖拓扑排序
+4. **加载**: 防 Zip Slip/解压炸弹地提取 `.npl`，实例化插件
+5. **初始化**: 调用 `onLoad(context)`
+6. **启用**: 调用 `onEnable()`
+7. **禁用**: 调用 `onDisable()`
+8. **卸载**: 调用 `onUnload()`
 
 ## 插件类型
 
@@ -140,6 +142,7 @@ JavaScript 插件固定使用 HMCL 管理的 Node.js v24.18.0 子进程。启动
 
 ```json
 {
+  "schemaVersion": 2,
   "id": "com.example.myplugin",
   "name": "My Plugin",
   "version": "1.0.0",
@@ -147,10 +150,15 @@ JavaScript 插件固定使用 HMCL 管理的 Node.js v24.18.0 子进程。启动
   "author": "Your Name",
   "type": "java",
   "entrypoint": "com.example.myplugin.MyPlugin",
+  "mixins": ["mixins.com.example.myplugin.json"],
   "dependencies": [],
   "minLauncherVersion": "3.0.0"
 }
 ```
+
+`mixins` 仅适用于 Java/Kotlin 插件。配置和 Mixin 类位于插件根目录或 `libs/*.jar` 中；启用、禁用、更新、卸载含 Mixin 的插件都需要重启，运行中不会尝试撤销已经定义的类。
+
+若第三方 Mixin 导致启动失败，可临时添加 JVM 参数 `-Dhmcl.plugin.mixins.disabled=true` 进入恢复模式，再在插件管理页禁用或卸载问题插件。
 
 ## 使用方法
 
@@ -208,7 +216,9 @@ plugin.js_engine_unavailable=JavaScript 引擎不可用
 
 ### 类加载
 
-Java/Kotlin 插件使用 `URLClassLoader`，父加载器为 HMCL 的类加载器，允许插件访问所有启动器 API。
+普通 Java/Kotlin 插件使用专用 `URLClassLoader`，卸载时关闭。只要存在已启用 Mixin 插件，首个 JVM 就会自动启动带 HMCL `premain` Agent 的第二个 JVM；Agent 把启动时发现的 JVM 插件根资源和 JAR 追加到系统类加载器搜索路径，并在任何 HMCL 应用类加载前注册 Mixin 变换器。HMCL、JavaFX 和 Mixin 插件因此都使用唯一的系统类加载器类身份，避免重复加载启动器类。
+
+Agent 启动期间加入系统搜索路径的 JVM 插件类无法在运行中真正移除，因此涉及 Mixin 的启用、禁用、更新和卸载统一采用等待重启语义。
 
 ### JavaScript 引擎
 
@@ -221,7 +231,9 @@ JavaScript 插件通过固定 Node.js 子进程运行：
 ### 插件隔离
 
 每个插件有：
-- 独立的解压目录 (`.hmcl/plugin-data/<plugin-id>/`)
+- 独立的包解压目录 (`.hmcl/plugin-data/<plugin-id>/`)
+- 独立的持久化数据目录 (`.hmcl/plugin-storage/<plugin-id>/`)
+- 启动 Mixin 缓存 (`.hmcl/plugin-cache/<plugin-id>/`)
 - 独立的类加载器（Java/Kotlin）
 - 独立的 Node.js 子进程调用序列（JavaScript）
 
