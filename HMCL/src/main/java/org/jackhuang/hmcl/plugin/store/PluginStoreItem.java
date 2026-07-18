@@ -17,24 +17,48 @@
  */
 package org.jackhuang.hmcl.plugin.store;
 
-public class PluginStoreItem {
-    private final PluginStoreRegistry.PluginStoreEntry entry;
-    private final PluginStoreManifest manifest;
+import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 
-    public PluginStoreItem(PluginStoreRegistry.PluginStoreEntry entry, PluginStoreManifest manifest) {
+/// Combines one registry entry with its resolved repository manifest.
+@NotNullByDefault
+public final class PluginStoreItem {
+    /// Registry metadata used for listing and search.
+    private final PluginStoreRegistry.PluginStoreEntry entry;
+
+    /// Resolved repository manifest, or `null` when that repository is temporarily unavailable.
+    private final @Nullable PluginStoreManifest manifest;
+
+    /// Creates a resolved or partially resolved store item.
+    ///
+    /// @param entry registry entry
+    /// @param manifest repository manifest or `null`
+    public PluginStoreItem(
+            PluginStoreRegistry.PluginStoreEntry entry,
+            @Nullable PluginStoreManifest manifest
+    ) {
         this.entry = entry;
         this.manifest = manifest;
     }
 
+    /// Returns registry metadata.
+    ///
+    /// @return registry entry
     public PluginStoreRegistry.PluginStoreEntry getEntry() {
         return entry;
     }
 
-    public PluginStoreManifest getManifest() {
+    /// Returns the repository manifest when it resolved successfully.
+    ///
+    /// @return repository manifest or `null`
+    public @Nullable PluginStoreManifest getManifest() {
         return manifest;
     }
 
-    public PluginStoreManifest.PluginVersion getLatestVersion() {
+    /// Returns the greatest published version from the repository manifest.
+    ///
+    /// @return latest version or `null`
+    public @Nullable PluginStoreManifest.PluginVersionEntry getLatestVersion() {
         return manifest == null ? null : manifest.getLatestVersion();
     }
 }

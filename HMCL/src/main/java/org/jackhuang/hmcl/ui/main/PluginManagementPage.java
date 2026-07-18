@@ -253,7 +253,9 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
             versionLabel.setStyle("-fx-text-fill: gray;");
         }
 
-        Label typeLabel = new Label("[" + container.getManifest().getType().name() + "]");
+        String typeText = container.getManifest().getType().name()
+                + (container.getManifest().hasMixins() ? " + MIXIN" : "");
+        Label typeLabel = new Label("[" + typeText + "]");
         typeLabel.setStyle("-fx-text-fill: #2196F3; -fx-font-size: 12px;");
 
         Region spacer = new Region();
@@ -264,6 +266,9 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
         if (markedForUninstall) {
             statusLabel.setText(i18n("plugin.pending_uninstall"));
             statusLabel.setStyle("-fx-text-fill: #d32f2f; -fx-font-weight: bold;");
+        } else if (container.isRestartRequired()) {
+            statusLabel.setText(i18n("plugin.restart_pending"));
+            statusLabel.setStyle("-fx-text-fill: #e65100; -fx-font-weight: bold;");
         } else if (container.isEnabled()) {
             statusLabel.setText(i18n("plugin.enabled"));
             statusLabel.setStyle("-fx-text-fill: green; -fx-font-weight: bold;");
@@ -408,7 +413,7 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
         if (result.isPresent() && result.get() == ButtonType.OK) {
             String pluginId = container.getManifest().getId();
 
-            if (wasEnabled) {
+            if (wasEnabled || pluginManager.requiresRestartForUninstall(pluginId)) {
                 // Mark for uninstall and require restart
                 pluginManager.markForUninstall(pluginId);
                 refresh();

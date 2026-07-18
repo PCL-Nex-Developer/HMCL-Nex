@@ -19,23 +19,20 @@ package org.jackhuang.hmcl.plugin.loader;
 
 import org.jackhuang.hmcl.plugin.Plugin;
 import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jetbrains.annotations.NotNullByDefault;
 
 import java.io.IOException;
 import java.nio.file.Path;
 
-/**
- * Interface for plugin loaders.
- */
+/// Creates a lifecycle implementation from an extracted plugin package.
+@NotNullByDefault
 public interface PluginLoader {
-
-    /**
-     * Load a plugin from the extracted directory.
-     *
-     * @param manifest Plugin manifest
-     * @param extractedDir Directory where plugin is extracted
-     * @param nplFile Original .npl file
-     * @return Loaded plugin instance
-     * @throws IOException If loading fails
-     */
+    /// Loads one validated plugin package.
+    ///
+    /// @param manifest validated plugin manifest
+    /// @param extractedDir extracted package directory
+    /// @param nplFile original package path
+    /// @return loaded lifecycle implementation
+    /// @throws IOException if loading fails
     Plugin load(PluginManifest manifest, Path extractedDir, Path nplFile) throws IOException;
 }

@@ -202,7 +202,8 @@ public class PluginStorePage extends VBox implements DecoratorPage {
                 || contains(entry.getAuthor(), keyword)
                 || contains(entry.getDescription(), keyword)
                 || contains(entry.getCategory(), keyword)
-                || (entry.getTags() != null && entry.getTags().stream().anyMatch(tag -> contains(tag, keyword)));
+                || entry.getTags().stream().anyMatch(tag -> contains(tag, keyword))
+                || entry.getCapabilities().stream().anyMatch(capability -> contains(capability, keyword));
     }
 
     private boolean contains(String value, String keyword) {
@@ -211,7 +212,7 @@ public class PluginStorePage extends VBox implements DecoratorPage {
 
     private VBox createPluginCard(PluginStoreItem item) {
         PluginStoreRegistry.PluginStoreEntry entry = item.getEntry();
-        PluginStoreManifest.PluginVersion latestVersion = item.getLatestVersion();
+        PluginStoreManifest.PluginVersionEntry latestVersion = item.getLatestVersion();
         PluginContainer installed = pluginManager.getPlugin(entry.getId());
         boolean isInstalled = installed != null;
         boolean hasUpdate = storeManager.hasUpdate(installed, latestVersion);
@@ -288,7 +289,7 @@ public class PluginStorePage extends VBox implements DecoratorPage {
 
     private void installPlugin(PluginStoreItem item) {
         PluginStoreRegistry.PluginStoreEntry entry = item.getEntry();
-        PluginStoreManifest.PluginVersion latestVersion = item.getLatestVersion();
+        PluginStoreManifest.PluginVersionEntry latestVersion = item.getLatestVersion();
         if (latestVersion == null) {
             showError(i18n("plugin.store.install_failed"), i18n("plugin.store.no_version"));
             return;
@@ -310,11 +311,18 @@ public class PluginStorePage extends VBox implements DecoratorPage {
             Task.supplyAsync(() -> {
                 try {
                     PluginContainer installed = pluginManager.getPlugin(entry.getId());
+                    if (installed != null && pluginManager.requiresRestartForUninstall(entry.getId())) {
+                        Path pluginFile = storeManager.downloadPlugin(
+                                entry.getId(), latestVersion, pluginManager.getPluginsDirectory());
+                        pluginManager.stagePluginUpdate(entry.getId(), pluginFile);
+                        return null;
+                    }
                     if (installed != null) {
                         pluginManager.uninstallPlugin(entry.getId());
                     }
 
-                    Path pluginFile = storeManager.downloadPlugin(entry.getId(), latestVersion, pluginManager.getPluginsDirectory());
+                    Path pluginFile = storeManager.downloadPlugin(
+                            entry.getId(), latestVersion, pluginManager.getPluginsDirectory());
 
                     // Prepare plugin in background thread (extract, load classes)
                     return pluginManager.preparePlugin(pluginFile);
@@ -329,8 +337,10 @@ public class PluginStorePage extends VBox implements DecoratorPage {
                 } else {
                     // Register and enable on JavaFX thread
                     try {
-                        PluginContainer container = pluginManager.registerPreparedPlugin(prepared);
-                        pluginManager.enablePlugin(container.getManifest().getId());
+                        if (prepared != null) {
+                            PluginContainer container = pluginManager.registerPreparedPlugin(prepared);
+                            pluginManager.enablePlugin(container.getManifest().getId());
+                        }
                         PluginDialogs.showInstallFinishedAndOfferRestart(pluginName);
                         applyFilter();
                     } catch (Exception e) {
@@ -345,7 +355,7 @@ public class PluginStorePage extends VBox implements DecoratorPage {
     private void showPluginDetails(PluginStoreItem item) {
         PluginStoreRegistry.PluginStoreEntry entry = item.getEntry();
         PluginStoreManifest manifest = item.getManifest();
-        PluginStoreManifest.PluginVersion latestVersion = item.getLatestVersion();
+        PluginStoreManifest.PluginVersionEntry latestVersion = item.getLatestVersion();
         PluginContainer installed = pluginManager.getPlugin(entry.getId());
 
         Alert detailsAlert = new Alert(Alert.AlertType.INFORMATION);
@@ -413,10 +423,14 @@ public class PluginStorePage extends VBox implements DecoratorPage {
         Optional<String> result = dialog.showAndWait();
         result.ifPresent(url -> {
             if (!url.trim().isEmpty()) {
-                storeManager.addCustomRegistry(url.trim());
-                sourceBox.getItems().setAll(storeManager.getRegistryUrls());
-                sourceBox.getSelectionModel().select(url.trim());
-                loadPluginStore();
+                try {
+                    storeManager.addCustomRegistry(url.trim());
+                    sourceBox.getItems().setAll(storeManager.getRegistryUrls());
+                    sourceBox.getSelectionModel().select(url.trim());
+                    loadPluginStore();
+                } catch (IllegalArgumentException exception) {
+                    showError(i18n("plugin.store.load_failed"), exception.getMessage());
+                }
             }
         });
     }
