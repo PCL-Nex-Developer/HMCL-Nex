@@ -24,6 +24,7 @@ import org.jackhuang.hmcl.EntryPoint;
 import org.jackhuang.hmcl.Main;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.java.JavaRuntime;
+import org.jackhuang.hmcl.plugin.mixin.bootstrap.HmclMixinBootstrap;
 import org.jackhuang.hmcl.task.Task;
 import org.jackhuang.hmcl.task.TaskExecutor;
 import org.jackhuang.hmcl.ui.Controllers;
@@ -35,6 +36,7 @@ import org.jackhuang.hmcl.util.SwingUtils;
 import org.jackhuang.hmcl.util.TaskCancellationAction;
 import org.jackhuang.hmcl.util.io.JarUtils;
 import org.jackhuang.hmcl.util.platform.OperatingSystem;
+import org.jetbrains.annotations.NotNullByDefault;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -53,7 +55,15 @@ import static org.jackhuang.hmcl.util.Lang.thread;
 import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
+@NotNullByDefault
 public final class UpdateHandler {
+    /// Process-local Mixin properties that must be recomputed by the next launcher process.
+    private static final Set<String> TRANSIENT_MIXIN_PROPERTIES = Set.of(
+            HmclMixinBootstrap.AGENT_ACTIVE_PROPERTY,
+            HmclMixinBootstrap.ACTIVE_PROPERTY,
+            HmclMixinBootstrap.DISABLE_PROPERTY
+    );
+
     private UpdateHandler() {
     }
 
@@ -206,14 +216,16 @@ public final class UpdateHandler {
 
         try {
             for (String inputArgument : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
-                if (inputArgument.startsWith("-D") || inputArgument.startsWith("-X")) {
+                if (shouldInheritJvmInputArgument(inputArgument)) {
                     commandline.add(inputArgument);
                 }
             }
         } catch (Throwable ignored) {
             // ManagementFactory not available
             for (Map.Entry<Object, Object> entry : System.getProperties().entrySet()) {
-                if (entry.getKey() instanceof String key && key.startsWith("hmcl.")) {
+                if (entry.getKey() instanceof String key
+                        && key.startsWith("hmcl.")
+                        && !TRANSIENT_MIXIN_PROPERTIES.contains(key)) {
                     commandline.add("-D" + key + "=" + entry.getValue());
                 }
             }
@@ -227,6 +239,26 @@ public final class UpdateHandler {
                 .directory(Paths.get("").toAbsolutePath().toFile())
                 .inheritIO()
                 .start();
+    }
+
+    /// Returns whether a JVM input argument is safe to carry into a fresh HMCL process.
+    ///
+    /// Mixin agent state describes only the current process. Inheriting it without the
+    /// instrumentation agent makes the next process skip Mixin initialization.
+    ///
+    /// @param inputArgument current JVM input argument
+    /// @return whether the restart command should retain the argument
+    static boolean shouldInheritJvmInputArgument(String inputArgument) {
+        if (inputArgument.startsWith("-X")) {
+            return true;
+        }
+        if (!inputArgument.startsWith("-D")) {
+            return false;
+        }
+
+        int equals = inputArgument.indexOf('=', 2);
+        String propertyName = inputArgument.substring(2, equals >= 0 ? equals : inputArgument.length());
+        return !TRANSIENT_MIXIN_PROPERTIES.contains(propertyName);
     }
 
     private static Optional<Path> tryRename(Path path, String newVersion) {

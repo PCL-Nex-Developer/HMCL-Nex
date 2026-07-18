@@ -21,6 +21,7 @@ import org.jackhuang.hmcl.util.FileSaver;
 import org.jackhuang.hmcl.util.SelfDependencyPatcher;
 import org.jackhuang.hmcl.util.SwingUtils;
 import org.jackhuang.hmcl.java.JavaRuntime;
+import org.jackhuang.hmcl.plugin.mixin.bootstrap.HmclMixinBootstrap;
 import org.jackhuang.hmcl.util.io.FileUtils;
 import org.jackhuang.hmcl.util.io.JarUtils;
 import org.jackhuang.hmcl.util.platform.OperatingSystem;
@@ -43,6 +44,10 @@ public final class EntryPoint {
     }
 
     public static void main(String[] args) {
+        if (HmclMixinBootstrap.relaunchIfNeeded(args)) {
+            return;
+        }
+
         System.getProperties().putIfAbsent("java.net.useSystemProxies", "true");
         System.getProperties().putIfAbsent("javafx.autoproxy.disable", "true");
         System.getProperties().putIfAbsent("http.agent", "HMCL/" + Metadata.VERSION);

@@ -21,91 +21,119 @@ import com.google.gson.JsonObject;
 import javafx.stage.Stage;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.ui.Controllers;
+import org.jetbrains.annotations.NotNullByDefault;
 
 import java.nio.file.Path;
 
-/**
- * Plugin context provides access to launcher APIs and resources.
- */
-public class PluginContext {
-
+/// Exposes package metadata, storage locations, class loading, and UI registration to one plugin.
+@NotNullByDefault
+public final class PluginContext {
+    /// Authoritative package manifest.
     private final PluginManifest manifest;
-    private final Path pluginDirectory;
+
+    /// Directory containing extracted package resources.
+    private final Path packageDirectory;
+
+    /// Persistent private storage directory for this plugin ID.
+    private final Path dataDirectory;
+
+    /// Class loader that defined the plugin lifecycle implementation.
     private final ClassLoader classLoader;
 
-    public PluginContext(PluginManifest manifest, Path pluginDirectory, ClassLoader classLoader) {
+    /// Creates a plugin context.
+    ///
+    /// @param manifest package manifest
+    /// @param packageDirectory extracted package directory
+    /// @param dataDirectory persistent plugin data directory
+    /// @param classLoader plugin class loader
+    public PluginContext(
+            PluginManifest manifest,
+            Path packageDirectory,
+            Path dataDirectory,
+            ClassLoader classLoader
+    ) {
         this.manifest = manifest;
-        this.pluginDirectory = pluginDirectory;
+        this.packageDirectory = packageDirectory;
+        this.dataDirectory = dataDirectory;
         this.classLoader = classLoader;
     }
 
-    /**
-     * Get the plugin manifest.
-     */
+    /// Returns the authoritative package manifest.
+    ///
+    /// @return plugin manifest
     public PluginManifest getManifest() {
         return manifest;
     }
 
-    /**
-     * Get the plugin directory (extracted .npl contents).
-     */
+    /// Returns the extracted package directory containing bundled resources and libraries.
+    ///
+    /// @return extracted package directory
     public Path getPluginDirectory() {
-        return pluginDirectory;
+        return packageDirectory;
     }
 
-    /**
-     * Get the plugin's class loader.
-     */
+    /// Returns the extracted package directory containing bundled resources and libraries.
+    ///
+    /// @return extracted package directory
+    public Path getPackageDirectory() {
+        return packageDirectory;
+    }
+
+    /// Returns the loader that defined the lifecycle implementation.
+    ///
+    /// @return plugin class loader
     public ClassLoader getClassLoader() {
         return classLoader;
     }
 
-    /**
-     * Get the launcher version.
-     */
+    /// Returns the current launcher version.
+    ///
+    /// @return launcher version
     public String getLauncherVersion() {
         return Metadata.VERSION;
     }
 
-    /**
-     * Get the primary stage.
-     */
+    /// Returns the primary JavaFX stage.
+    ///
+    /// @return primary stage
     public Stage getPrimaryStage() {
         return Controllers.getStage();
     }
 
-    /**
-     * Get the launcher data directory.
-     */
+    /// Returns HMCL's launcher-wide local data directory.
+    ///
+    /// @return launcher data directory
     public Path getLauncherDataDirectory() {
         return Metadata.HMCL_LOCAL_HOME;
     }
 
-    /**
-     * Get the HMCL data directory.
-     */
+    /// Returns the persistent private data directory assigned to this plugin ID.
+    ///
+    /// @return plugin data directory
     public Path getDataDirectory() {
-        return Metadata.HMCL_LOCAL_HOME;
+        return dataDirectory;
     }
 
-    /**
-     * Register a sidebar item in the launcher main page.
-     * The item will appear under the "Plugin" dropdown menu.
-     *
-     * @param title The display title for the sidebar item
-     * @param onAction The action to execute when the item is clicked
-     */
+    /// Registers a JavaFX sidebar action owned by this plugin.
+    ///
+    /// @param title displayed sidebar title
+    /// @param onAction action invoked when the item is selected
     public void registerSidebarItem(String title, Runnable onAction) {
         PluginUIRegistry.registerSidebarItem(manifest.getId(), title, onAction);
     }
 
-    /**
-     * Register a sidebar item backed by a declarative JavaFX page from a JavaScript plugin.
-     */
-    public void registerJavaScriptSidebarItem(String title, JsonObject page,
-                                              JavaScriptPluginPage.EventHandler eventHandler) {
-        PluginUIRegistry.registerSidebarItem(manifest.getId(), title, () -> {
-            Controllers.navigate(new JavaScriptPluginPage(title, page, eventHandler));
-        });
+    /// Registers a sidebar item backed by a declarative JavaScript plugin page.
+    ///
+    /// @param title displayed sidebar title
+    /// @param page declarative control tree
+    /// @param eventHandler JavaScript event bridge
+    public void registerJavaScriptSidebarItem(
+            String title,
+            JsonObject page,
+            JavaScriptPluginPage.EventHandler eventHandler
+    ) {
+        PluginUIRegistry.registerSidebarItem(manifest.getId(), title, () ->
+                Controllers.navigate(new JavaScriptPluginPage(title, page, eventHandler))
+        );
     }
 }
