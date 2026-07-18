@@ -33,6 +33,7 @@ subprojects {
 
         maven(url = "https://jitpack.io")
         maven(url = "https://libraries.minecraft.net")
+        maven(url = "https://repo.spongepowered.org/repository/maven-public/")
     }
 
     tasks.withType<JavaCompile> {

@@ -17,35 +17,30 @@
  */
 package org.jackhuang.hmcl.plugin;
 
-/**
- * Base interface for all HMCL plugins.
- * Plugins have full access to the launcher runtime and can modify any operation.
- */
-public interface Plugin {
+import org.jetbrains.annotations.NotNullByDefault;
 
-    /**
-     * Called when the plugin is loaded.
-     * @param context The plugin context providing access to launcher APIs
-     */
+/// Defines the lifecycle implemented by Java and Kotlin HMCL plugins.
+@NotNullByDefault
+public interface Plugin {
+    /// Receives immutable package metadata and launcher services after the plugin class is created.
+    ///
+    /// @param context plugin context
     void onLoad(PluginContext context);
 
-    /**
-     * Called when the plugin is enabled.
-     */
+    /// Activates the plugin after all declared dependencies are loaded and enabled.
     void onEnable();
 
-    /**
-     * Called when the plugin is disabled.
-     */
+    /// Deactivates runtime registrations owned by the plugin.
     void onDisable();
 
-    /**
-     * Called when the plugin is unloaded.
-     */
-    default void onUnload() {}
+    /// Releases resources immediately before the plugin class loader is closed.
+    default void onUnload() {
+    }
 
-    /**
-     * Get the plugin manifest.
-     */
+    /// Returns the plugin manifest associated with this instance.
+    ///
+    /// The manager uses the package manifest as the authoritative value and exposes this method for compatibility.
+    ///
+    /// @return plugin manifest
     PluginManifest getManifest();
 }
