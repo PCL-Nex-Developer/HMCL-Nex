@@ -23,9 +23,9 @@ jobs:
       uses: gradle/actions/setup-gradle@v5
       with:
         cache-cleanup: never
-    - name: Set release build number
+    - name: Set release version
       if: startsWith(github.ref, 'refs/tags/v26.8-beta.')
-      run: echo "BUILD_NUMBER=${GITHUB_REF_NAME##*.}" >> "$GITHUB_ENV"
+      run: echo "BUILD_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
     - name: Build with Gradle
       run: ./gradlew build --no-daemon --parallel
       env:
