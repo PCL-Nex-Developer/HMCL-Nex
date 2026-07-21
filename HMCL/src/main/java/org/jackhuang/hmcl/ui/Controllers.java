@@ -331,10 +331,13 @@ public final class Controllers {
 
         WeakInvalidationListener weakListener = new WeakInvalidationListener(stageSizeChangeListener);
 
-        double initContentWidth = Math.max(MIN_CONTENT_WIDTH, state().getWidth());
-        double initContentHeight = Math.max(MIN_CONTENT_HEIGHT, state().getHeight());
-        double initWidth = toStageWidth(initContentWidth);
-        double initHeight = toStageHeight(initContentHeight);
+        Rectangle2D initialVisualBounds = SCREEN.getVisualBounds();
+        double requestedContentWidth = Math.max(MIN_CONTENT_WIDTH, state().getWidth());
+        double requestedContentHeight = Math.max(MIN_CONTENT_HEIGHT, state().getHeight());
+        double initWidth = Math.min(toStageWidth(requestedContentWidth), initialVisualBounds.getWidth());
+        double initHeight = Math.min(toStageHeight(requestedContentHeight), initialVisualBounds.getHeight());
+        double initContentWidth = toContentWidth(initWidth);
+        double initContentHeight = toContentHeight(initHeight);
 
         {
             double initContentX = state().getX() * SCREEN.getBounds().getWidth();
@@ -361,8 +364,12 @@ public final class Controllers {
                         * SCREEN.getBounds().getHeight();
             }
 
-            double initX = toStageX(initContentX);
-            double initY = toStageY(initContentY);
+            double initX = Math.max(initialVisualBounds.getMinX(), Math.min(
+                    toStageX(initContentX),
+                    Math.max(initialVisualBounds.getMinX(), initialVisualBounds.getMaxX() - initWidth)));
+            double initY = Math.max(initialVisualBounds.getMinY(), Math.min(
+                    toStageY(initContentY),
+                    Math.max(initialVisualBounds.getMinY(), initialVisualBounds.getMaxY() - initHeight)));
             stage.setX(initX);
             stage.setY(initY);
             stageX.set(initX);
@@ -398,8 +405,8 @@ public final class Controllers {
 
         scene = new Scene(decorator.getDecorator());
         scene.setFill(Color.TRANSPARENT);
-        stage.setMinWidth(MIN_WIDTH);
-        stage.setMinHeight(MIN_HEIGHT);
+        stage.setMinWidth(Math.min(MIN_WIDTH, initialVisualBounds.getWidth()));
+        stage.setMinHeight(Math.min(MIN_HEIGHT, initialVisualBounds.getHeight()));
         decorator.getDecorator().prefWidthProperty().bind(scene.widthProperty());
         decorator.getDecorator().prefHeightProperty().bind(scene.heightProperty());
         StyleSheets.init(scene);

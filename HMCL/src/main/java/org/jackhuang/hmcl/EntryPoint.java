@@ -18,6 +18,7 @@
 package org.jackhuang.hmcl;
 
 import org.jackhuang.hmcl.util.FileSaver;
+import org.jackhuang.hmcl.util.RestartBarrier;
 import org.jackhuang.hmcl.util.SelfDependencyPatcher;
 import org.jackhuang.hmcl.util.SwingUtils;
 import org.jackhuang.hmcl.java.JavaRuntime;
@@ -44,7 +45,8 @@ public final class EntryPoint {
     }
 
     public static void main(String[] args) {
-        if (HmclMixinBootstrap.relaunchIfNeeded(args)) {
+        String[] launcherArgs = RestartBarrier.awaitParentsAndStrip(args);
+        if (HmclMixinBootstrap.relaunchIfNeeded(launcherArgs)) {
             return;
         }
 
@@ -70,7 +72,7 @@ public final class EntryPoint {
         addEnableNativeAccess();
         enableUnsafeMemoryAccess();
 
-        Launcher.main(args);
+        Launcher.main(launcherArgs);
     }
 
     public static void exit(int exitCode) {

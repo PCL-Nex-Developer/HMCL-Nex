@@ -393,9 +393,8 @@ public final class Launcher extends Application {
         LOG.info("Stopping application.\n" + StringUtils.getStackTrace(Thread.currentThread().getStackTrace()));
 
         runInFX(() -> {
-            if (Controllers.getStage() == null)
-                return;
-            Controllers.getStage().close();
+            if (Controllers.getStage() != null)
+                Controllers.getStage().close();
             Schedulers.shutdown();
             Controllers.shutdown();
             Platform.exit();

@@ -126,10 +126,24 @@ public class DecoratorController {
         return decorator;
     }
 
+    /** Returns the page currently owned by this decorator's navigator. */
+    public Node getCurrentPage() {
+        return navigator.getCurrentPage();
+    }
+
     // ==== Navigation ====
 
     public void navigate(Node node, AnimationProducer animationProducer, Duration duration, Interpolator interpolator) {
         navigator.navigate(node, animationProducer, duration, interpolator);
+    }
+
+    /**
+     * Replaces the current page without adding another history entry.
+     * Intended for persistent top-level navigation surfaces such as plugin
+     * supplied shell tabs.
+     */
+    public void replace(Node node, AnimationProducer animationProducer, Duration duration, Interpolator interpolator) {
+        navigator.replace(node, animationProducer, duration, interpolator);
     }
 
     public BooleanProperty backableProperty() {
