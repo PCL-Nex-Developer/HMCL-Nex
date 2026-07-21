@@ -24,6 +24,7 @@ import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jackhuang.hmcl.util.io.HttpRequest;
+import org.jackhuang.hmcl.util.io.NetworkUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -32,6 +33,7 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -212,26 +214,41 @@ public final class PluginStoreManager {
         LOG.info("Downloading plugin " + pluginId + " v" + version.getVersion()
                 + " from " + version.getPackageUrl());
 
-        try (InputStream input = new BufferedInputStream(
-                HttpRequest.GET(version.getPackageUrl()).createConnection().getInputStream()
-        ); BufferedOutputStream output = new BufferedOutputStream(Files.newOutputStream(temporaryFile))) {
-            int read;
-            while ((read = input.read(buffer)) >= 0) {
-                if (read == 0) {
-                    continue;
+        @Nullable HttpURLConnection connection = null;
+        try {
+            connection = NetworkUtils.resolveConnection(
+                    HttpRequest.GET(version.getPackageUrl()).createConnection()
+            );
+            validateRemoteUrl(connection.getURL().toString(), "plugin package redirect");
+            int responseCode = connection.getResponseCode();
+            if (responseCode / 100 != 2) {
+                throw new IOException("Plugin package request failed with HTTP " + responseCode);
+            }
+
+            try (InputStream input = new BufferedInputStream(connection.getInputStream());
+                 BufferedOutputStream output = new BufferedOutputStream(Files.newOutputStream(temporaryFile))) {
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    if (read == 0) {
+                        continue;
+                    }
+                    totalBytes = Math.addExact(totalBytes, read);
+                    if (totalBytes > MAX_PACKAGE_BYTES || declaredSize != null && totalBytes > declaredSize) {
+                        throw new IOException("Plugin package exceeds its declared or maximum size");
+                    }
+                    digest.update(buffer, 0, read);
+                    output.write(buffer, 0, read);
                 }
-                totalBytes = Math.addExact(totalBytes, read);
-                if (totalBytes > MAX_PACKAGE_BYTES || declaredSize != null && totalBytes > declaredSize) {
-                    throw new IOException("Plugin package exceeds its declared or maximum size");
-                }
-                digest.update(buffer, 0, read);
-                output.write(buffer, 0, read);
             }
         } catch (ArithmeticException exception) {
             throw new IOException("Plugin package size overflow", exception);
         } catch (IOException exception) {
             Files.deleteIfExists(temporaryFile);
             throw exception;
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
         }
 
         try {
