@@ -36,7 +36,7 @@ public final class PluginContainer {
     private final PluginContext context;
 
     /// Installed `.npl` package path.
-    private final Path nplFile;
+    private Path nplFile;
 
     /// Observable lifecycle enablement state.
     private final BooleanProperty enabled = new SimpleBooleanProperty(false);
@@ -77,6 +77,15 @@ public final class PluginContainer {
     /// @return `.npl` path
     public Path getNplFile() {
         return nplFile;
+    }
+
+    /// Replaces the installed package path after an update is staged for restart.
+    ///
+    /// The current lifecycle classes continue using their already extracted package version.
+    ///
+    /// @param nplFile replacement package path
+    void setNplFile(Path nplFile) {
+        this.nplFile = nplFile;
     }
 
     /// Returns whether the lifecycle is currently enabled.

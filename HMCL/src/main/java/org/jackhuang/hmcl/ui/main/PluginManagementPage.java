@@ -40,6 +40,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 import java.util.Optional;
 
 import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
@@ -57,6 +58,16 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
     public PluginManagementPage() {
         setSpacing(10);
         setPadding(new Insets(10));
+
+        // JavaFX exposes desktop file drops consistently on Windows, macOS,
+        // X11 and Wayland-capable Linux desktops. Reuse HMCL's shared drag
+        // listener so installing an .npl does not depend on platform-specific
+        // native APIs or a file chooser implementation.
+        FXUtils.applyDragListener(this,
+                path -> Files.isRegularFile(path)
+                        && Files.isReadable(path)
+                        && path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".npl"),
+                paths -> installPlugin(paths.get(0).toFile()));
 
         // Top bar with buttons
         HBox topBar = new HBox(10);
@@ -256,7 +267,7 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
         String typeText = container.getManifest().getType().name()
                 + (container.getManifest().hasMixins() ? " + MIXIN" : "");
         Label typeLabel = new Label("[" + typeText + "]");
-        typeLabel.setStyle("-fx-text-fill: #2196F3; -fx-font-size: 12px;");
+        typeLabel.setStyle("-fx-text-fill: -monet-primary; -fx-font-size: 12px;");
 
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
@@ -347,57 +358,75 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
 
         File file = fileChooser.showOpenDialog(Controllers.getStage());
         if (file != null) {
-            String pluginName = file.getName();
-            Path pluginPath = file.toPath();
-            Path targetPath = pluginManager.getPluginsDirectory().resolve(file.getName());
-
-            // Show warning dialog asynchronously
-            PluginDialogs.confirmPluginInstall(pluginName, confirmed -> {
-                if (!confirmed) {
-                    return;
-                }
-
-                // User confirmed, proceed with installation
-                Task.supplyAsync(() -> {
-                    try {
-                        // Do file copy and plugin preparation in background thread
-                        if (!pluginPath.equals(targetPath)) {
-                            Files.copy(pluginPath, targetPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                        }
-                        // Prepare plugin (extract ZIP, load classes) - all IO operations
-                        return pluginManager.preparePlugin(targetPath);
-                    } catch (IOException e) {
-                        LOG.error("Failed to prepare plugin", e);
-                        throw new RuntimeException(e);
-                    }
-                }).whenComplete(Schedulers.javafx(), (prepared, exception) -> {
-                    if (exception != null) {
-                        Alert alert = new Alert(Alert.AlertType.ERROR);
-                        alert.setTitle(i18n("plugin.install"));
-                        alert.setHeaderText(i18n("plugin.install_failed"));
-                        alert.setContentText(exception.getMessage());
-                        alert.initOwner(Controllers.getStage());
-                        alert.showAndWait();
-                    } else {
-                        // Register and enable plugin on JavaFX thread
-                        try {
-                            PluginContainer container = pluginManager.registerPreparedPlugin(prepared);
-                            pluginManager.enablePlugin(container.getManifest().getId());
-                            refresh();
-                            PluginDialogs.showInstallFinishedAndOfferRestart(pluginName);
-                        } catch (Exception e) {
-                            LOG.error("Failed to register plugin", e);
-                            Alert alert = new Alert(Alert.AlertType.ERROR);
-                            alert.setTitle(i18n("plugin.install"));
-                            alert.setHeaderText(i18n("plugin.install_failed"));
-                            alert.setContentText(e.getMessage());
-                            alert.initOwner(Controllers.getStage());
-                            alert.showAndWait();
-                        }
-                    }
-                }).start();
-            });
+            installPlugin(file);
         }
+    }
+
+    private void installPlugin(File file) {
+        String pluginName = file.getName();
+        Path pluginPath = file.toPath();
+
+        if (!Files.isRegularFile(pluginPath) || !Files.isReadable(pluginPath)) {
+            showInstallError(new IOException("Plugin package is not readable: " + pluginPath));
+            return;
+        }
+
+        // Show warning dialog asynchronously
+        PluginDialogs.confirmPluginInstall(pluginName, confirmed -> {
+            if (!confirmed) {
+                return;
+            }
+
+            // User confirmed, proceed with installation
+            Task.supplyAsync(() -> {
+                try {
+                    // Validate and copy in the background. Existing IDs are staged for restart
+                    // instead of being registered a second time in the current JVM.
+                    return pluginManager.prepareLocalPluginInstallation(pluginPath);
+                } catch (IOException e) {
+                    LOG.error("Failed to prepare plugin", e);
+                    throw new RuntimeException(e);
+                }
+            }).whenComplete(Schedulers.javafx(), (installation, exception) -> {
+                if (exception != null) {
+                    showInstallError(exception);
+                } else {
+                    // Register and enable plugin on JavaFX thread
+                    try {
+                        if (installation.isRestartRequired()) {
+                            refresh();
+                            PluginDialogs.showInstallFinishedAndOfferRestart(
+                                    installation.getManifest().getName()
+                            );
+                            return;
+                        }
+                        PluginContainer container = pluginManager.registerPreparedPlugin(
+                                installation.getPreparedPlugin()
+                        );
+                        pluginManager.enablePlugin(container.getManifest().getId());
+                        refresh();
+                        PluginDialogs.showInstallFinishedAndOfferRestart(pluginName);
+                    } catch (Exception e) {
+                        LOG.error("Failed to register plugin", e);
+                        showInstallError(e);
+                    }
+                }
+            }).start();
+        });
+    }
+
+    private void showInstallError(Throwable exception) {
+        Throwable cause = exception;
+        while (cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        String message = cause.getMessage() != null ? cause.getMessage() : cause.toString();
+        Alert alert = new Alert(Alert.AlertType.ERROR);
+        alert.setTitle(i18n("plugin.install"));
+        alert.setHeaderText(i18n("plugin.install_failed"));
+        alert.setContentText(message);
+        alert.initOwner(Controllers.getStage());
+        alert.showAndWait();
     }
 
     private void uninstallPlugin(PluginContainer container) {

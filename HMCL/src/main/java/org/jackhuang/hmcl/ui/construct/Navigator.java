@@ -93,6 +93,70 @@ public class Navigator extends TransitionPane {
         node.addEventHandler(PageCloseEvent.CLOSE, handler);
     }
 
+    /**
+     * Replace the current page without growing the navigation history.
+     *
+     * <p>Long-lived shell integrations (for example a launcher theme with
+     * persistent top-level tabs) should not push a new page every time the
+     * user switches tabs.  Replacing the stack top keeps the normal root and
+     * back/close semantics while still going through the same transition and
+     * navigation events as {@link #navigate(Node, AnimationProducer, Duration,
+     * Interpolator)}.</p>
+     *
+     * @param node the replacement page
+     * @param animationProducer transition to use
+     * @param duration transition duration
+     * @param interpolator transition interpolator
+     * @throws IllegalStateException if this navigator has not been initialized
+     */
+    @SuppressWarnings("unchecked")
+    public void replace(Node node, AnimationProducer animationProducer,
+                        Duration duration, Interpolator interpolator) {
+        FXUtils.checkFxUserThread();
+
+        if (!initialized)
+            throw new IllegalStateException("Navigator must have a root page");
+
+        Node from = stack.peek();
+        if (from == node)
+            return;
+
+        LOG.info("Replace " + from + " with " + node);
+
+        // Give the outgoing page the same lifecycle notification it receives
+        // when it is popped, then remove its close handler before reusing the
+        // stack slot.  The root page is never replaced by callers in normal
+        // use, but set() also keeps this method well-defined for size == 1.
+        from.fireEvent(new NavigationEvent(this, from,
+                Navigation.NavigationDirection.PREVIOUS, NavigationEvent.EXITED));
+        if (from instanceof PageAware pageAware)
+            pageAware.onPageHidden();
+        Object oldHandler = from.getProperties().remove(PROPERTY_DIALOG_CLOSE_HANDLER);
+        if (oldHandler instanceof EventHandler<?> handler)
+            from.removeEventHandler(PageCloseEvent.CLOSE, (EventHandler<PageCloseEvent>) handler);
+
+        stack.set(stack.size() - 1, node);
+        backable.set(canGoBack());
+
+        NavigationEvent navigating = new NavigationEvent(this, from,
+                Navigation.NavigationDirection.NEXT, NavigationEvent.NAVIGATING);
+        fireEvent(navigating);
+        node.fireEvent(navigating);
+
+        node.getProperties().put("hmcl.navigator.animation", animationProducer);
+        setContent(node, animationProducer, duration, interpolator);
+
+        NavigationEvent navigated = new NavigationEvent(this, node,
+                Navigation.NavigationDirection.NEXT, NavigationEvent.NAVIGATED);
+        node.fireEvent(navigated);
+        if (node instanceof PageAware pageAware)
+            pageAware.onPageShown();
+
+        EventHandler<PageCloseEvent> handler = event -> close(node);
+        node.getProperties().put(PROPERTY_DIALOG_CLOSE_HANDLER, handler);
+        node.addEventHandler(PageCloseEvent.CLOSE, handler);
+    }
+
     public void close() {
         close(stack.peek());
     }

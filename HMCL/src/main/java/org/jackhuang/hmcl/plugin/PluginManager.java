@@ -22,6 +22,7 @@ import com.google.gson.GsonBuilder;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import org.jackhuang.hmcl.Metadata;
+import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.loader.JavaPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.JavaScriptPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.PluginLoader;
@@ -31,8 +32,6 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.UnmodifiableView;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -44,11 +43,11 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
@@ -65,12 +64,6 @@ public final class PluginManager {
 
     /// Maximum uncompressed size accepted for `plugin.json`.
     private static final int MAX_MANIFEST_BYTES = 1024 * 1024;
-
-    /// Maximum number of archive entries accepted from one plugin package.
-    private static final int MAX_ARCHIVE_ENTRIES = 10_000;
-
-    /// Maximum aggregate uncompressed bytes accepted from one plugin package.
-    private static final long MAX_ARCHIVE_BYTES = 512L * 1024L * 1024L;
 
     /// JSON codec used for persisted plugin state.
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -107,11 +100,21 @@ public final class PluginManager {
 
     /// Creates the singleton manager and its storage directories.
     private PluginManager() {
-        pluginsDirectory = Metadata.HMCL_LOCAL_HOME.resolve("plugins");
-        pluginPackageDirectory = Metadata.HMCL_LOCAL_HOME.resolve("plugin-data");
-        pluginStorageDirectory = Metadata.HMCL_LOCAL_HOME.resolve("plugin-storage");
-        pluginMixinCacheDirectory = Metadata.HMCL_LOCAL_HOME.resolve("plugin-cache");
-        stateFile = Metadata.HMCL_LOCAL_HOME.resolve("plugin-states.json");
+        this(Metadata.HMCL_LOCAL_HOME);
+    }
+
+    /// Creates an isolated manager rooted at the supplied HMCL home.
+    ///
+    /// This constructor is package-private so lifecycle and installation behavior can be tested without
+    /// mutating the user's launcher directory.
+    ///
+    /// @param localHome isolated HMCL home
+    PluginManager(Path localHome) {
+        pluginsDirectory = localHome.resolve("plugins");
+        pluginPackageDirectory = localHome.resolve("plugin-data");
+        pluginStorageDirectory = localHome.resolve("plugin-storage");
+        pluginMixinCacheDirectory = localHome.resolve("plugin-cache");
+        stateFile = localHome.resolve("plugin-states.json");
 
         try {
             Files.createDirectories(pluginsDirectory);
@@ -163,7 +166,7 @@ public final class PluginManager {
             return;
         }
         for (@Nullable String value : source) {
-            if (value != null) {
+            if (value != null && PluginManifest.isValidId(value)) {
                 target.add(value);
             }
         }
@@ -248,7 +251,7 @@ public final class PluginManager {
                         LOG.error("Duplicate plugin ID " + manifest.getId() + " in "
                                 + previous.nplFile.getFileName() + " and " + nplFile.getFileName());
                     }
-                } catch (IOException exception) {
+                } catch (IOException | RuntimeException exception) {
                     LOG.error("Invalid plugin package: " + nplFile.getFileName(), exception);
                 }
             }
@@ -402,8 +405,11 @@ public final class PluginManager {
             }
         }
 
-        Path packageDirectory = pluginPackageDirectory.resolve(pluginId);
-        extractPackage(nplFile, packageDirectory);
+        Path packageDirectory = PluginPackageVersions.prepareLifecyclePackage(
+                nplFile,
+                pluginPackageDirectory,
+                pluginId
+        );
         Path dataDirectory = pluginStorageDirectory.resolve(pluginId);
         Files.createDirectories(dataDirectory);
 
@@ -440,75 +446,6 @@ public final class PluginManager {
             return true;
         }
         return PluginVersion.compare(Metadata.VERSION, minimumVersion) >= 0;
-    }
-
-    /// Safely extracts a package into an atomically replaced directory.
-    ///
-    /// @param nplFile source package
-    /// @param targetDirectory final package directory
-    /// @throws IOException if extraction is unsafe or fails
-    private static void extractPackage(Path nplFile, Path targetDirectory) throws IOException {
-        Path temporaryDirectory = targetDirectory.resolveSibling(
-                targetDirectory.getFileName() + ".tmp-" + UUID.randomUUID()
-        );
-        FileUtils.deleteDirectory(temporaryDirectory);
-        Files.createDirectories(temporaryDirectory);
-
-        int entryCount = 0;
-        long totalBytes = 0;
-        byte[] buffer = new byte[8192];
-        try (ZipFile zipFile = new ZipFile(nplFile.toFile())) {
-            Iterator<? extends ZipEntry> entries = zipFile.stream().iterator();
-            while (entries.hasNext()) {
-                ZipEntry entry = entries.next();
-                entryCount++;
-                if (entryCount > MAX_ARCHIVE_ENTRIES) {
-                    throw new IOException("Plugin package contains too many entries");
-                }
-
-                Path output = temporaryDirectory.resolve(entry.getName()).normalize();
-                if (!output.startsWith(temporaryDirectory)) {
-                    throw new IOException("Plugin package contains unsafe path: " + entry.getName());
-                }
-                if (entry.isDirectory()) {
-                    Files.createDirectories(output);
-                    continue;
-                }
-
-                @Nullable Path parent = output.getParent();
-                if (parent != null) {
-                    Files.createDirectories(parent);
-                }
-                try (InputStream input = new BufferedInputStream(zipFile.getInputStream(entry));
-                     BufferedOutputStream outputStream = new BufferedOutputStream(Files.newOutputStream(output))) {
-                    int read;
-                    while ((read = input.read(buffer)) >= 0) {
-                        if (read == 0) {
-                            continue;
-                        }
-                        totalBytes = Math.addExact(totalBytes, read);
-                        if (totalBytes > MAX_ARCHIVE_BYTES) {
-                            throw new IOException("Plugin package expands beyond the allowed size");
-                        }
-                        outputStream.write(buffer, 0, read);
-                    }
-                }
-            }
-
-            if (!Files.isRegularFile(temporaryDirectory.resolve(PLUGIN_MANIFEST))) {
-                throw new IOException("Extracted package has no " + PLUGIN_MANIFEST);
-            }
-            FileUtils.deleteDirectory(targetDirectory);
-            try {
-                Files.move(temporaryDirectory, targetDirectory, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporaryDirectory, targetDirectory);
-            }
-        } catch (ArithmeticException exception) {
-            throw new IOException("Plugin package size overflow", exception);
-        } finally {
-            FileUtils.deleteDirectory(temporaryDirectory);
-        }
     }
 
     /// Closes a dedicated plugin loader after preparation fails.
@@ -696,6 +633,138 @@ public final class PluginManager {
         LOG.info("Unloaded plugin: " + pluginId);
     }
 
+    /// Validates and prepares a user-selected local plugin package for installation.
+    ///
+    /// New plugin IDs are copied into the plugin directory and prepared for JavaFX registration. If the same
+    /// plugin ID is already installed or loaded, the replacement is staged for the next restart instead; the
+    /// currently loaded classes are never registered a second time.
+    ///
+    /// @param sourcePackage user-selected `.npl` package
+    /// @return prepared new installation or restart-staged update
+    /// @throws IOException if validation, copying, preparation, or staging fails
+    public LocalPluginInstallation prepareLocalPluginInstallation(Path sourcePackage) throws IOException {
+        Path source = sourcePackage.toAbsolutePath().normalize();
+        validateLocalPluginPackage(source);
+
+        PluginManifest manifest = readManifest(source);
+        String pluginId = manifest.getId();
+        if (!isLauncherCompatible(manifest.getMinLauncherVersion())) {
+            throw new IOException("Plugin " + pluginId + " requires HMCL "
+                    + manifest.getMinLauncherVersion() + " or newer");
+        }
+
+        boolean restartUpdate = pluginMap.containsKey(pluginId)
+                || !findInstalledPackages(pluginId).isEmpty();
+        Path installedPackage = source;
+        boolean copied = false;
+        if (!Objects.equals(source.getParent(), pluginsDirectory.toAbsolutePath().normalize())) {
+            installedPackage = copyLocalPluginPackage(source, manifest, restartUpdate);
+            copied = true;
+        }
+
+        try {
+            if (restartUpdate) {
+                stagePluginUpdate(pluginId, installedPackage);
+                return LocalPluginInstallation.staged(manifest);
+            }
+            return LocalPluginInstallation.prepared(preparePluginInternal(installedPackage));
+        } catch (IOException | RuntimeException | Error exception) {
+            if (copied) {
+                try {
+                    Files.deleteIfExists(installedPackage);
+                } catch (IOException cleanupException) {
+                    exception.addSuppressed(cleanupException);
+                }
+            }
+            throw exception;
+        }
+    }
+
+    /// Rejects missing, unreadable, non-regular, or incorrectly named local packages.
+    ///
+    /// @param packageFile candidate local package
+    /// @throws IOException if the package cannot be safely consumed
+    private static void validateLocalPluginPackage(Path packageFile) throws IOException {
+        @Nullable Path fileName = packageFile.getFileName();
+        if (fileName == null
+                || !fileName.toString().toLowerCase(Locale.ROOT).endsWith(".npl")
+                || !Files.isRegularFile(packageFile)
+                || !Files.isReadable(packageFile)) {
+            throw new IOException("Plugin package is not a readable .npl file: " + packageFile);
+        }
+    }
+
+    /// Copies an external local package into the plugin directory without overwriting any live package.
+    ///
+    /// Updates always use a unique path so validation or staging failure leaves the old package untouched.
+    /// New installations use the stable `<plugin-id>.npl` name when it is available.
+    ///
+    /// @param source validated source package
+    /// @param manifest validated source manifest
+    /// @param restartUpdate whether an existing package will be replaced at restart
+    /// @return copied package path inside the plugin directory
+    /// @throws IOException if copying, validation, or atomic publication fails
+    private Path copyLocalPluginPackage(
+            Path source,
+            PluginManifest manifest,
+            boolean restartUpdate
+    ) throws IOException {
+        String pluginId = manifest.getId();
+        Path target = pluginsDirectory.resolve(pluginId + ".npl");
+        if (restartUpdate || Files.exists(target)) {
+            target = pluginsDirectory.resolve(pluginId + "-" + UUID.randomUUID() + ".npl");
+        }
+
+        Path temporaryFile = pluginsDirectory.resolve(
+                "." + pluginId + "-" + UUID.randomUUID() + ".installing"
+        );
+        try {
+            Files.copy(source, temporaryFile);
+            PluginManifest copiedManifest = readManifest(temporaryFile);
+            if (!pluginId.equals(copiedManifest.getId())) {
+                throw new IOException("Plugin package changed while it was being copied: " + source);
+            }
+            if (!isLauncherCompatible(copiedManifest.getMinLauncherVersion())) {
+                throw new IOException("Plugin " + pluginId + " requires HMCL "
+                        + copiedManifest.getMinLauncherVersion() + " or newer");
+            }
+            try {
+                Files.move(temporaryFile, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ignored) {
+                Files.move(temporaryFile, target);
+            }
+            return target;
+        } finally {
+            Files.deleteIfExists(temporaryFile);
+        }
+    }
+
+    /// Finds readable installed packages that declare the supplied plugin ID.
+    ///
+    /// @param pluginId validated plugin ID
+    /// @return sorted matching paths
+    /// @throws IOException if the installed plugin directory cannot be listed
+    private List<Path> findInstalledPackages(String pluginId) throws IOException {
+        List<Path> matches = new ArrayList<>();
+        try (Stream<Path> files = Files.list(pluginsDirectory)) {
+            for (Path packageFile : files
+                    .filter(Files::isRegularFile)
+                    .filter(Files::isReadable)
+                    .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".npl"))
+                    .sorted()
+                    .toList()) {
+                try {
+                    if (pluginId.equals(readManifest(packageFile).getId())) {
+                        matches.add(packageFile.toAbsolutePath().normalize());
+                    }
+                } catch (IOException | RuntimeException ignored) {
+                    // Invalid packages are handled by normal discovery and must not block a local install.
+                }
+            }
+        }
+        return matches;
+    }
+
     /// Copies, loads, and enables a local plugin package.
     ///
     /// @param nplFile source package
@@ -719,7 +788,14 @@ public final class PluginManager {
     /// @param replacementPackage downloaded replacement package already stored in the plugin directory
     /// @throws IOException if the replacement is invalid or file replacement fails
     public void stagePluginUpdate(String pluginId, Path replacementPackage) throws IOException {
-        PluginManifest replacementManifest = readManifest(replacementPackage);
+        Path replacement = replacementPackage.toAbsolutePath().normalize();
+        Path pluginRoot = pluginsDirectory.toAbsolutePath().normalize();
+        validateLocalPluginPackage(replacement);
+        if (!Objects.equals(replacement.getParent(), pluginRoot)) {
+            throw new IOException("Staged plugin package must be stored directly in " + pluginRoot);
+        }
+
+        PluginManifest replacementManifest = readManifest(replacement);
         if (!pluginId.equals(replacementManifest.getId())) {
             throw new IOException("Downloaded package ID " + replacementManifest.getId()
                     + " does not match store entry " + pluginId);
@@ -729,14 +805,23 @@ public final class PluginManager {
                     + replacementManifest.getMinLauncherVersion() + " or newer");
         }
 
+        for (Path installedPackage : findInstalledPackages(pluginId)) {
+            if (!installedPackage.equals(replacement)) {
+                Files.deleteIfExists(installedPackage);
+            }
+        }
+
         @Nullable PluginContainer container = pluginMap.get(pluginId);
         if (container != null) {
             Path oldPackage = container.getNplFile().toAbsolutePath().normalize();
-            Path newPackage = replacementPackage.toAbsolutePath().normalize();
-            if (!oldPackage.equals(newPackage)) {
+            if (!oldPackage.equals(replacement)) {
                 Files.deleteIfExists(oldPackage);
             }
+            container.setNplFile(replacement);
             container.setRestartRequired(true);
+        }
+        if (pendingUninstall.remove(pluginId)) {
+            saveStates();
         }
         LOG.info("Staged plugin update for next restart: " + pluginId);
     }
@@ -846,8 +931,16 @@ public final class PluginManager {
     /// @throws IOException if deletion fails
     private void deletePluginDirectories(String pluginId) throws IOException {
         FileUtils.deleteDirectory(pluginPackageDirectory.resolve(pluginId));
+        FileUtils.deleteDirectory(PluginPackageVersions.getPluginVersionsDirectory(
+                pluginPackageDirectory,
+                pluginId
+        ));
         FileUtils.deleteDirectory(pluginStorageDirectory.resolve(pluginId));
         FileUtils.deleteDirectory(pluginMixinCacheDirectory.resolve(pluginId));
+        FileUtils.deleteDirectory(PluginPackageVersions.getPluginVersionsDirectory(
+                pluginMixinCacheDirectory,
+                pluginId
+        ));
     }
 
     /// Lazily initialized singleton holder.
@@ -902,6 +995,69 @@ public final class PluginManager {
 
         /// Candidate traversal has completed successfully or unsuccessfully.
         VISITED
+    }
+
+    /// Describes the background portion of a user-selected local plugin installation.
+    @NotNullByDefault
+    public static final class LocalPluginInstallation {
+        /// Validated package manifest.
+        private final PluginManifest manifest;
+
+        /// Prepared lifecycle value for a new plugin, or `null` for a restart-staged update.
+        private final @Nullable PreparedPlugin preparedPlugin;
+
+        /// Creates a local installation result.
+        ///
+        /// @param manifest validated package manifest
+        /// @param preparedPlugin prepared new plugin or `null` for an update
+        private LocalPluginInstallation(
+                PluginManifest manifest,
+                @Nullable PreparedPlugin preparedPlugin
+        ) {
+            this.manifest = manifest;
+            this.preparedPlugin = preparedPlugin;
+        }
+
+        /// Creates a result for a new plugin that is ready for JavaFX registration.
+        ///
+        /// @param preparedPlugin prepared plugin
+        /// @return prepared installation result
+        private static LocalPluginInstallation prepared(PreparedPlugin preparedPlugin) {
+            return new LocalPluginInstallation(preparedPlugin.getManifest(), preparedPlugin);
+        }
+
+        /// Creates a result for an existing plugin whose package is staged for restart.
+        ///
+        /// @param manifest replacement package manifest
+        /// @return restart-staged update result
+        private static LocalPluginInstallation staged(PluginManifest manifest) {
+            return new LocalPluginInstallation(manifest, null);
+        }
+
+        /// Returns the validated replacement or installation manifest.
+        ///
+        /// @return package manifest
+        public PluginManifest getManifest() {
+            return manifest;
+        }
+
+        /// Returns whether this update must wait for a launcher restart.
+        ///
+        /// @return whether no runtime registration should be attempted
+        public boolean isRestartRequired() {
+            return preparedPlugin == null;
+        }
+
+        /// Returns the prepared new plugin for JavaFX registration.
+        ///
+        /// @return prepared plugin
+        /// @throws IllegalStateException if this result represents a restart-staged update
+        public PreparedPlugin getPreparedPlugin() {
+            if (preparedPlugin == null) {
+                throw new IllegalStateException("Plugin update is staged for restart");
+            }
+            return preparedPlugin;
+        }
     }
 
     /// Holds a package whose I/O preparation is complete but whose JavaFX lifecycle registration is pending.

@@ -274,7 +274,7 @@ public final class PluginManifest {
     ///
     /// @param value candidate ID
     /// @return whether the ID is valid
-    private static boolean isValidId(@Nullable String value) {
+    static boolean isValidId(@Nullable String value) {
         return value != null && ID_PATTERN.matcher(value).matches();
     }
 

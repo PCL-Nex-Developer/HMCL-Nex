@@ -18,38 +18,30 @@
 package org.jackhuang.hmcl.plugin.mixin.bootstrap;
 
 import com.google.gson.Gson;
+import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.management.ManagementFactory;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
-import java.util.zip.ZipInputStream;
 
 /// Discovers enabled JVM plugins and relaunches HMCL with its premain Mixin instrumentation agent.
 @NotNullByDefault
@@ -71,12 +63,6 @@ public final class HmclMixinBootstrap {
 
     /// Maximum accepted uncompressed size of one plugin manifest.
     private static final int MAX_MANIFEST_BYTES = 1024 * 1024;
-
-    /// Maximum number of files accepted in an extracted plugin package.
-    private static final int MAX_ARCHIVE_ENTRIES = 10_000;
-
-    /// Maximum aggregate uncompressed bytes accepted from one plugin package.
-    private static final long MAX_ARCHIVE_BYTES = 512L * 1024L * 1024L;
 
     /// Plugin IDs accepted for cache directory names and dependency references.
     private static final Pattern PLUGIN_ID_PATTERN = Pattern.compile("[a-zA-Z0-9][a-zA-Z0-9._-]{1,127}");
@@ -266,7 +252,7 @@ public final class HmclMixinBootstrap {
                         continue;
                     }
 
-                    Path cacheDirectory = preparePluginCache(nplFile, cacheRoot.resolve(id));
+                    Path cacheDirectory = preparePluginCache(nplFile, cacheRoot, id);
                     @Unmodifiable List<Path> pluginClassPath = collectPluginClassPath(cacheDirectory);
                     @Unmodifiable List<String> mixinConfigs = sanitizeMixinConfigs(manifest.mixins, id);
                     descriptors.add(new PluginLaunchDescriptor(id, pluginClassPath, mixinConfigs));
@@ -428,143 +414,28 @@ public final class HmclMixinBootstrap {
         return List.copyOf(result);
     }
 
-    /// Prepares an extracted cache whose contents match the source package hash.
+    /// Prepares an immutable extracted cache version for one enabled Mixin plugin.
     ///
     /// @param nplFile source plugin package
-    /// @param cacheDirectory target cache directory
-    /// @return ready cache directory
-    /// @throws IOException if hashing, extraction, or replacement fails
-    private static Path preparePluginCache(Path nplFile, Path cacheDirectory) throws IOException {
-        String sourceHash = calculateSha256(nplFile);
-        Path marker = cacheDirectory.resolve(".source.sha256");
-        if (Files.isRegularFile(marker)
-                && sourceHash.equalsIgnoreCase(Files.readString(marker, StandardCharsets.UTF_8).trim())
-                && Files.isRegularFile(cacheDirectory.resolve(PLUGIN_MANIFEST))) {
-            return cacheDirectory;
-        }
-
-        Path temporaryDirectory = cacheDirectory.resolveSibling(
-                cacheDirectory.getFileName() + ".tmp-" + UUID.randomUUID()
-        );
-        deleteRecursively(temporaryDirectory);
-        Files.createDirectories(temporaryDirectory);
-
-        try {
-            extractPlugin(nplFile, temporaryDirectory);
-            Files.writeString(
-                    temporaryDirectory.resolve(".source.sha256"),
-                    sourceHash + System.lineSeparator(),
-                    StandardCharsets.UTF_8
-            );
-            deleteRecursively(cacheDirectory);
-            try {
-                Files.move(temporaryDirectory, cacheDirectory, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporaryDirectory, cacheDirectory);
-            }
-            return cacheDirectory;
-        } finally {
-            deleteRecursively(temporaryDirectory);
-        }
+    /// @param cacheRoot Mixin cache root
+    /// @param pluginId validated plugin identifier
+    /// @return ready immutable cache directory
+    /// @throws IOException if hashing, extraction, validation, or publication fails
+    static Path preparePluginCache(Path nplFile, Path cacheRoot, String pluginId) throws IOException {
+        return PluginPackageVersions.prepareMixinPackage(nplFile, cacheRoot, pluginId);
     }
 
-    /// Extracts a plugin package with zip-slip, entry-count, and aggregate-size protection.
-    ///
-    /// @param nplFile source plugin package
-    /// @param targetDirectory extraction directory
-    /// @throws IOException if the package is unsafe or cannot be extracted
-    private static void extractPlugin(Path nplFile, Path targetDirectory) throws IOException {
-        int entryCount = 0;
-        long totalBytes = 0;
-        byte[] buffer = new byte[8192];
-
-        try (ZipInputStream zipInput = new ZipInputStream(
-                new BufferedInputStream(Files.newInputStream(nplFile)),
-                StandardCharsets.UTF_8
-        )) {
-            @Nullable ZipEntry entry;
-            while ((entry = zipInput.getNextEntry()) != null) {
-                entryCount++;
-                if (entryCount > MAX_ARCHIVE_ENTRIES) {
-                    throw new IOException("Plugin package contains too many entries");
-                }
-
-                Path output = targetDirectory.resolve(entry.getName()).normalize();
-                if (!output.startsWith(targetDirectory)) {
-                    throw new IOException("Plugin package contains an unsafe path: " + entry.getName());
-                }
-
-                if (entry.isDirectory()) {
-                    Files.createDirectories(output);
-                    continue;
-                }
-
-                @Nullable Path parent = output.getParent();
-                if (parent != null) {
-                    Files.createDirectories(parent);
-                }
-                try (BufferedOutputStream outputStream = new BufferedOutputStream(Files.newOutputStream(output))) {
-                    int read;
-                    while ((read = zipInput.read(buffer)) >= 0) {
-                        if (read == 0) {
-                            continue;
-                        }
-                        totalBytes = Math.addExact(totalBytes, read);
-                        if (totalBytes > MAX_ARCHIVE_BYTES) {
-                            throw new IOException("Plugin package expands beyond the allowed size");
-                        }
-                        outputStream.write(buffer, 0, read);
-                    }
-                }
-            }
-        } catch (ArithmeticException exception) {
-            throw new IOException("Plugin package size overflow", exception);
-        }
-    }
-
-    /// Calculates a lower-case SHA-256 digest for a plugin package.
-    ///
-    /// @param file file to hash
-    /// @return hexadecimal digest
-    /// @throws IOException if the file cannot be read or SHA-256 is unavailable
-    private static String calculateSha256(Path file) throws IOException {
-        final MessageDigest digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException exception) {
-            throw new IOException("SHA-256 is unavailable", exception);
-        }
-
-        try (InputStream input = new BufferedInputStream(Files.newInputStream(file))) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) >= 0) {
-                if (read > 0) {
-                    digest.update(buffer, 0, read);
-                }
-            }
-        }
-
-        StringBuilder result = new StringBuilder(digest.getDigestLength() * 2);
-        for (byte value : digest.digest()) {
-            result.append(String.format(Locale.ROOT, "%02x", value & 0xff));
-        }
-        return result.toString();
-    }
-
-    /// Collects the extracted plugin root and all nested JAR files in deterministic order.
+    /// Collects all generated and nested plugin JAR files in deterministic order.
     ///
     /// @param cacheDirectory extracted plugin directory
     /// @return plugin class path entries
     /// @throws IOException if traversal fails
     private static @Unmodifiable List<Path> collectPluginClassPath(Path cacheDirectory) throws IOException {
         List<Path> entries = new ArrayList<>();
-        entries.add(cacheDirectory);
         try (Stream<Path> files = Files.walk(cacheDirectory)) {
             for (Path jar : files
                     .filter(Files::isRegularFile)
                     .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
-                    .filter(path -> !path.getFileName().toString().equals(HmclMixinAgent.ROOT_RESOURCE_JAR))
                     .sorted()
                     .toList()) {
                 entries.add(jar);
@@ -611,7 +482,7 @@ public final class HmclMixinBootstrap {
         }
     }
 
-    /// Checks that a declared Mixin configuration exists in an extracted root or nested plugin JAR.
+    /// Checks that a declared Mixin configuration exists in a generated or nested plugin JAR.
     ///
     /// @param descriptors enabled JVM plugin descriptors
     /// @param config resource name
@@ -622,9 +493,6 @@ public final class HmclMixinBootstrap {
     ) throws IOException {
         for (PluginLaunchDescriptor descriptor : descriptors) {
             for (Path entry : descriptor.classPath) {
-                if (Files.isDirectory(entry) && Files.isRegularFile(entry.resolve(config))) {
-                    return true;
-                }
                 if (Files.isRegularFile(entry)) {
                     try (ZipFile zipFile = new ZipFile(entry.toFile())) {
                         if (zipFile.getEntry(config) != null) {
@@ -635,21 +503,6 @@ public final class HmclMixinBootstrap {
             }
         }
         return false;
-    }
-
-    /// Deletes a directory tree when present.
-    ///
-    /// @param path path to delete
-    /// @throws IOException if deletion fails
-    private static void deleteRecursively(Path path) throws IOException {
-        if (!Files.exists(path)) {
-            return;
-        }
-        try (Stream<Path> files = Files.walk(path)) {
-            for (Path file : files.sorted(Comparator.reverseOrder()).toList()) {
-                Files.deleteIfExists(file);
-            }
-        }
     }
 
     /// Prints a bootstrap diagnostic before the regular logger is initialized.
