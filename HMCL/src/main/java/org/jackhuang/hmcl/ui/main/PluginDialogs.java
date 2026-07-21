@@ -19,6 +19,7 @@ package org.jackhuang.hmcl.ui.main;
 
 import com.jfoenix.controls.JFXButton;
 import javafx.application.Platform;
+import org.jackhuang.hmcl.Launcher;
 import org.jackhuang.hmcl.ui.Controllers;
 import org.jackhuang.hmcl.ui.construct.MessageDialogPane;
 import org.jackhuang.hmcl.util.Restarter;
@@ -103,9 +104,8 @@ final class PluginDialogs {
 
     private static void restartLauncher() {
         try {
-            Controllers.onApplicationStop();
             Restarter.restartSelf();
-            Platform.exit();
+            Launcher.stopApplication();
         } catch (IOException e) {
             LOG.warning("Failed to restart self", e);
             Platform.runLater(() -> {

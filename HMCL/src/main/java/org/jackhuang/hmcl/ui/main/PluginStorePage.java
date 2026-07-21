@@ -228,7 +228,7 @@ public class PluginStorePage extends VBox implements DecoratorPage {
         nameLabel.setStyle("-fx-font-size: 16px; -fx-font-weight: bold;");
 
         Label versionLabel = new Label(latestVersion == null ? i18n("plugin.store.version_unknown") : "v" + latestVersion.getVersion());
-        versionLabel.setStyle("-fx-text-fill: #2196F3;");
+        versionLabel.setStyle("-fx-text-fill: -monet-primary;");
 
         Label authorLabel = new Label(i18n("plugin.author") + ": " + Optional.ofNullable(entry.getAuthor()).orElse(""));
         authorLabel.setStyle("-fx-text-fill: #666; -fx-font-size: 12px;");

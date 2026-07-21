@@ -15,35 +15,28 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-package org.jackhuang.hmcl.util;
+package org.jackhuang.hmcl.util.testsupport;
 
-import org.jackhuang.hmcl.upgrade.UpdateHandler;
-import org.jackhuang.hmcl.util.io.JarUtils;
+import org.jetbrains.annotations.NotNullByDefault;
 
 import java.io.IOException;
-import java.nio.file.Path;
 
-import static org.jackhuang.hmcl.util.logging.Logger.LOG;
-
-/// @author Glavo
-public final class Restarter {
-
-    /// Restart the current application.
-    public static void restartSelf() throws IOException {
-        LOG.info("Restarting HMCL");
-
-        Path thisJar = JarUtils.thisJarPath();
-        if (thisJar == null) {
-            throw new IOException("Failed to find current HMCL location");
+/// Provides a real child process whose lifetime is controlled through standard input.
+@NotNullByDefault
+public final class RestartBarrierParent {
+    /// Announces readiness and remains alive until the test closes standard input.
+    ///
+    /// @param args ignored command-line arguments
+    /// @throws IOException if standard input cannot be read
+    public static void main(String[] args) throws IOException {
+        System.out.println("READY");
+        System.out.flush();
+        while (System.in.read() >= 0) {
+            // Keep the process alive until the controlling test closes the stream.
         }
-
-        UpdateHandler.startJava(
-                thisJar,
-                RestartBarrier.PARENT_PROCESS_ARGUMENT,
-                Long.toString(ProcessHandle.current().pid())
-        );
     }
 
-    private Restarter() {
+    /// Prevents construction of the process helper.
+    private RestartBarrierParent() {
     }
 }

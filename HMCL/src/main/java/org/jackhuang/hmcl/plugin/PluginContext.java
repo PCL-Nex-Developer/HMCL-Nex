@@ -65,14 +65,20 @@ public final class PluginContext {
         return manifest;
     }
 
-    /// Returns the extracted package directory containing bundled resources and libraries.
+    /// Returns the read-only extracted package directory containing bundled resources and libraries.
+    ///
+    /// The directory is content-addressed and may change after a plugin update. Plugins must not
+    /// persist this path or write private state here; use [getDataDirectory] for persistent data.
     ///
     /// @return extracted package directory
     public Path getPluginDirectory() {
         return packageDirectory;
     }
 
-    /// Returns the extracted package directory containing bundled resources and libraries.
+    /// Returns the read-only extracted package directory containing bundled resources and libraries.
+    ///
+    /// The directory is content-addressed and may change after a plugin update. Plugins must not
+    /// persist this path or write private state here; use [getDataDirectory] for persistent data.
     ///
     /// @return extracted package directory
     public Path getPackageDirectory() {
