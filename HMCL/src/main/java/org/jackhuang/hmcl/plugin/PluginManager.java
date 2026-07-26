@@ -17,239 +17,295 @@
  */
 package org.jackhuang.hmcl.plugin;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
+import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jackhuang.hmcl.plugin.loader.JavaPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.JavaScriptPluginLoader;
 import org.jackhuang.hmcl.plugin.loader.PluginLoader;
-import org.jackhuang.hmcl.plugin.mixin.bootstrap.HmclMixinBootstrap;
-import org.jackhuang.hmcl.util.io.FileUtils;
+import org.jackhuang.hmcl.plugin.mixin.bootstrap.PluginAgentSnapshot;
+import org.jackhuang.hmcl.ui.FXUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 import org.jetbrains.annotations.UnmodifiableView;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Stream;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
 
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
 /// Discovers, validates, orders, loads, enables, disables, and removes HMCL plugins.
+/// State-changing entry points reject ordinary plugin class loaders and lifecycle callbacks. This guard prevents
+/// plugins from casually bypassing launcher confirmation through the public singleton, but it is not a security
+/// boundary against Mixin-injected HMCL classes, unrestricted reflection, `Unsafe`, or direct filesystem access in
+/// the shared JVM.
 @NotNullByDefault
 public final class PluginManager {
-    /// Root manifest entry inside every plugin package.
-    private static final String PLUGIN_MANIFEST = "plugin.json";
-
-    /// Maximum uncompressed size accepted for `plugin.json`.
-    private static final int MAX_MANIFEST_BYTES = 1024 * 1024;
-
-    /// JSON codec used for persisted plugin state.
-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-
     /// Directory containing installed `.npl` files.
     private final Path pluginsDirectory;
-
     /// Directory containing extracted package contents used for normal lifecycle loading.
     private final Path pluginPackageDirectory;
-
     /// Directory containing persistent per-plugin private data.
     private final Path pluginStorageDirectory;
-
-    /// Directory containing startup Mixin extraction caches.
-    private final Path pluginMixinCacheDirectory;
-
-    /// Persisted enablement and pending-uninstall state file.
-    private final Path stateFile;
-
+    /// Persisted desired enablement and pending-uninstall state store.
+    private final PluginStateStore stateStore;
+    /// Read-only installed package and manifest repository.
+    private final PluginPackageRepository packageRepository;
+    /// Exact installed and loaded artifact identity resolver.
+    private final PluginArtifactResolver artifactResolver;
+    /// Prospective dependency graph and reverse-dependency planner.
+    private final PluginDependencyPlanner dependencyPlanner;
+    /// Durable package, permission, and state publication service.
+    private final PluginPackageMutationService packageMutationService;
+    /// Cross-process lock shared by package, state, and permission mutations.
+    private final PluginMutationLock mutationLock;
+    /// Artifact-bound user permission decisions.
+    private final PluginPermissionService permissionService;
+    /// Exact-artifact policy for plugin-store dependency reuse.
+    private final PluginReusePolicy reusePolicy;
+    /// Exact prior-state capture and final replacement revalidation.
+    private final PluginInstallationStateGuard installationStateGuard;
+    /// Same-process guard protecting launcher-administrative entry points from ordinary plugin code.
+    private final PluginAdministrativeGuard administrativeGuard;
+    /// Lightweight JVM-local lock protecting in-memory runtime state from concurrent UI reads and background mutations.
+    private final ReadWriteLock stateLock = new ReentrantReadWriteLock();
     /// Mutable observable list backing the plugin management UI.
     private final ObservableList<PluginContainer> plugins = FXCollections.observableArrayList();
-
     /// Loaded plugins indexed by validated plugin ID.
     private final Map<String, PluginContainer> pluginMap = new LinkedHashMap<>();
-
+    /// Process-local exact artifact status and diagnostic store.
+    private final PluginRuntimeStateStore runtimeState = new PluginRuntimeStateStore();
     /// Runtime loaders indexed by plugin implementation type.
     private final Map<PluginManifest.PluginType, PluginLoader> loaders = new EnumMap<>(PluginManifest.PluginType.class);
-
     /// Plugin IDs that should be enabled now or after the next Mixin-capable restart.
     private final Set<String> enabledStates = new HashSet<>();
-
     /// Plugin IDs whose files and data should be removed at the next startup.
     private final Set<String> pendingUninstall = new HashSet<>();
-
     /// Creates the singleton manager and its storage directories.
-    private PluginManager() {
-        this(Metadata.HMCL_LOCAL_HOME);
+    PluginManager() {
+        this(Metadata.HMCL_LOCAL_HOME, false);
     }
 
     /// Creates an isolated manager rooted at the supplied HMCL home.
-    ///
     /// This constructor is package-private so lifecycle and installation behavior can be tested without
     /// mutating the user's launcher directory.
-    ///
     /// @param localHome isolated HMCL home
     PluginManager(Path localHome) {
+        this(localHome, true);
+    }
+
+    /// Creates one manager with an explicit construction-stack trust policy.
+    /// @param localHome launcher-local home
+    /// @param trustConstructionStack whether to trust exact test-framework loaders on the construction stack
+    private PluginManager(Path localHome, boolean trustConstructionStack) {
+        administrativeGuard = new PluginAdministrativeGuard(trustConstructionStack);
         pluginsDirectory = localHome.resolve("plugins");
         pluginPackageDirectory = localHome.resolve("plugin-data");
         pluginStorageDirectory = localHome.resolve("plugin-storage");
-        pluginMixinCacheDirectory = localHome.resolve("plugin-cache");
-        stateFile = localHome.resolve("plugin-states.json");
-
+        packageRepository = new PluginPackageRepository(pluginsDirectory);
+        artifactResolver = new PluginArtifactResolver(packageRepository, pluginMap, runtimeState);
+        installationStateGuard = new PluginInstallationStateGuard(artifactResolver);
+        dependencyPlanner = new PluginDependencyPlanner(packageRepository);
+        mutationLock = new PluginMutationLock(localHome);
+        stateStore = new PluginStateStore(localHome.resolve("plugin-states.json"), mutationLock);
+        packageMutationService = new PluginPackageMutationService(
+                localHome,
+                pluginsDirectory,
+                packageRepository
+        );
         try {
             Files.createDirectories(pluginsDirectory);
             Files.createDirectories(pluginPackageDirectory);
             Files.createDirectories(pluginStorageDirectory);
-            Files.createDirectories(pluginMixinCacheDirectory);
         } catch (IOException exception) {
             LOG.error("Failed to create plugin directories", exception);
         }
-
-        loadStates();
+        if (!recoverBatchTransaction()) {
+            LOG.error("Plugin batch recovery is incomplete; discovery will retry before loading plugins");
+        }
+        permissionService = new PluginPermissionService(
+                localHome.resolve("plugin-permissions.json"),
+                artifactResolver::findCurrentPermissionArtifact,
+                mutationLock
+        );
+        reusePolicy = new PluginReusePolicy(packageRepository, permissionService, PluginManager::isLauncherCompatible);
+        stateStore.load(enabledStates, pendingUninstall);
         loaders.put(PluginManifest.PluginType.JAVA, new JavaPluginLoader());
         loaders.put(PluginManifest.PluginType.KOTLIN, new JavaPluginLoader());
         loaders.put(PluginManifest.PluginType.JAVASCRIPT, new JavaScriptPluginLoader());
     }
 
     /// Returns the process-wide plugin manager.
-    ///
     /// @return plugin manager singleton
     public static PluginManager getInstance() {
-        return Holder.INSTANCE;
+        return PluginManagerHolder.INSTANCE;
     }
 
-    /// Loads persisted enablement and uninstall state, discarding malformed null IDs.
-    private void loadStates() {
-        if (!Files.isRegularFile(stateFile)) {
-            return;
-        }
-        try {
-            @Nullable PluginStates states = GSON.fromJson(
-                    Files.readString(stateFile, StandardCharsets.UTF_8),
-                    PluginStates.class
-            );
-            if (states != null) {
-                copyNonNull(states.enabled, enabledStates);
-                copyNonNull(states.pendingUninstall, pendingUninstall);
-            }
-        } catch (IOException | RuntimeException exception) {
-            LOG.warning("Failed to load plugin states", exception);
-        }
-    }
-
-    /// Copies non-null strings from a deserialized list into a mutable set.
-    ///
-    /// @param source deserialized values or `null`
-    /// @param target destination set
-    private static void copyNonNull(@Nullable List<@Nullable String> source, Set<String> target) {
-        if (source == null) {
-            return;
-        }
-        for (@Nullable String value : source) {
-            if (value != null && PluginManifest.isValidId(value)) {
-                target.add(value);
-            }
-        }
-    }
-
-    /// Persists plugin state through an atomic replacement when supported by the file system.
+    /// Persists plugin state through the dedicated shared-lock state store.
     private void saveStates() {
-        PluginStates states = new PluginStates();
-        states.enabled = enabledStates.stream().sorted().toList();
-        states.pendingUninstall = pendingUninstall.stream().sorted().toList();
+        stateStore.save(enabledStates, pendingUninstall);
+    }
 
-        Path temporaryFile = stateFile.resolveSibling(stateFile.getFileName() + ".tmp");
+    /// Recovers the package journal while excluding concurrent launcher mutations.
+    ///
+    /// @return whether no unresolved package transaction remains
+    private boolean recoverBatchTransaction() {
         try {
-            Files.createDirectories(stateFile.getParent());
-            Files.writeString(temporaryFile, GSON.toJson(states), StandardCharsets.UTF_8);
-            try {
-                Files.move(
-                        temporaryFile,
-                        stateFile,
-                        StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING
-                );
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporaryFile, stateFile, StandardCopyOption.REPLACE_EXISTING);
-            }
+            return mutationLock.call(packageMutationService::recover);
         } catch (IOException exception) {
-            LOG.warning("Failed to save plugin states", exception);
-        } finally {
-            try {
-                Files.deleteIfExists(temporaryFile);
-            } catch (IOException exception) {
-                LOG.warning("Failed to delete temporary plugin state file", exception);
-            }
+            LOG.error("Failed to acquire the plugin mutation lock for transaction recovery", exception);
+            return false;
         }
     }
 
     /// Discovers packages, applies pending removals, loads dependencies first, and restores enablement state.
     public void discoverPlugins() {
+        administrativeGuard.checkTrustedCaller();
         LOG.info("Discovering plugins...");
         try {
-            Map<String, PluginCandidate> candidates = readCandidates();
-            applyPendingUninstalls(candidates);
-
-            Map<String, VisitState> visitStates = new HashMap<>();
-            List<PluginContainer> loadOrder = new ArrayList<>();
-            Set<String> failed = new HashSet<>();
-            for (PluginCandidate candidate : candidates.values()) {
-                loadCandidate(candidate, candidates, visitStates, failed, loadOrder);
-            }
-
-            for (PluginContainer container : loadOrder) {
-                String pluginId = container.getManifest().getId();
-                if (enabledStates.contains(pluginId)) {
-                    enablePlugin(pluginId);
-                }
-            }
-            LOG.info("Discovered " + plugins.size() + " plugin(s)");
-        } catch (IOException exception) {
+            mutationLock.run(this::discoverPluginsLocked);
+        } catch (IOException | RuntimeException | Error exception) {
             LOG.error("Failed to discover plugins", exception);
         }
     }
 
-    /// Reads and validates every package manifest, rejecting duplicate IDs deterministically.
+    /// Performs one complete discovery pass under the shared package, state, and permission lock.
     ///
+    /// Holding the lock through lifecycle construction keeps the final permission snapshot and package identity
+    /// unchanged between policy evaluation and the first plugin callback.
+    ///
+    /// @throws IOException if package recovery, permission reload, or package discovery fails
+    private void discoverPluginsLocked() throws IOException {
+        runtimeState.clear();
+        if (!packageMutationService.recover()) {
+            LOG.error("Cannot discover plugins while batch-install recovery is incomplete");
+            return;
+        }
+        try {
+            permissionService.reload();
+        } catch (IOException exception) {
+            LOG.error("Cannot reload plugin permissions after transaction recovery", exception);
+            return;
+        }
+
+        stateStore.load(enabledStates, pendingUninstall);
+        Map<String, PluginPackageCandidate> candidates = readCandidates();
+        applyPendingUninstalls(candidates);
+        reconcileLoadedContainers(candidates);
+        try {
+            retainInstalledPermissionArtifacts(candidates);
+        } catch (IOException exception) {
+            LOG.warning(
+                    "Failed to prune stale plugin permission decisions; exact artifact binding remains fail-closed",
+                    exception
+            );
+        }
+
+        Map<String, PluginVisitState> visitStates = new HashMap<>();
+        Set<String> failed = new HashSet<>();
+        for (PluginPackageCandidate candidate : candidates.values()) {
+            if (candidate.manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
+                enabledStates.remove(candidate.manifest.getId());
+                setRuntimeStatus(
+                        candidate.identity,
+                        PluginRuntimeStatus.BLOCKED_LEGACY,
+                        "Plugin " + candidate.manifest.getId() + " uses legacy manifest schema "
+                                + candidate.manifest.getSchemaVersion() + " and cannot execute"
+                );
+                continue;
+            }
+            if (enabledStates.contains(candidate.manifest.getId())) {
+                loadCandidate(candidate, candidates, visitStates, failed);
+            } else {
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.INSTALLED_DISABLED, null);
+            }
+        }
+        saveStates();
+        LOG.info("Discovered " + plugins.size() + " plugin(s)");
+    }
+
+    /// Reconciles process-local containers with the exact package set and persisted enablement read for this pass.
+    ///
+    /// Missing packages are unloaded, exact disabled artifacts are stopped, and replacements remain on their old
+    /// in-process code until restart while the newly published artifact is reported as waiting for restart.
+    ///
+    /// @param candidates exact packages published for the next launcher start
+    /// @throws IOException if installed dependency manifests cannot be read while stopping stale containers
+    private void reconcileLoadedContainers(Map<String, PluginPackageCandidate> candidates) throws IOException {
+        for (PluginContainer container : List.copyOf(plugins)) {
+            String pluginId = container.getManifest().getId();
+            @Nullable PluginPackageCandidate candidate = candidates.get(pluginId);
+            if (candidate == null) {
+                unloadPluginLocked(pluginId);
+                continue;
+            }
+
+            PluginArtifactIdentity loadedIdentity = PluginArtifactIdentity.of(
+                    container.getManifest(),
+                    container.getContext().getArtifactSha256()
+            );
+            if (!candidate.identity.equals(loadedIdentity)) {
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
+                if (!enabledStates.contains(pluginId) && container.isEnabled()) {
+                    disablePluginLocked(pluginId);
+                }
+                continue;
+            }
+            if (!enabledStates.contains(pluginId) && container.isEnabled()) {
+                disablePluginLocked(pluginId);
+            }
+        }
+    }
+
+    /// Reads and validates every package manifest, rejecting duplicate IDs deterministically.
     /// @return package candidates indexed by ID
     /// @throws IOException if the plugin directory cannot be listed
-    private Map<String, PluginCandidate> readCandidates() throws IOException {
-        Map<String, PluginCandidate> candidates = new LinkedHashMap<>();
+    private Map<String, PluginPackageCandidate> readCandidates() throws IOException {
+        Map<String, PluginPackageCandidate> candidates = new LinkedHashMap<>();
         try (Stream<Path> files = Files.list(pluginsDirectory)) {
             for (Path nplFile : files
-                    .filter(Files::isRegularFile)
-                    .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".npl"))
+                    .filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+                    .filter(path -> !Files.isSymbolicLink(path))
+                    .filter(path -> path.getFileName().toString()
+                            .toLowerCase(java.util.Locale.ROOT).endsWith(".npl"))
                     .sorted()
                     .toList()) {
                 try {
-                    PluginManifest manifest = readManifest(nplFile);
-                    PluginCandidate previous = candidates.putIfAbsent(
+                    PluginManifest manifest = packageRepository.readManifest(nplFile);
+                    String sha256 = PluginPackageVersions.calculateSha256(nplFile);
+                    PluginArtifactIdentity identity = PluginArtifactIdentity.of(manifest, sha256);
+                    @Nullable PluginPackageCandidate previous = candidates.putIfAbsent(
                             manifest.getId(),
-                            new PluginCandidate(nplFile, manifest)
+                            new PluginPackageCandidate(
+                                    nplFile,
+                                    manifest,
+                                    identity
+                            )
                     );
                     if (previous != null) {
                         LOG.error("Duplicate plugin ID " + manifest.getId() + " in "
                                 + previous.nplFile.getFileName() + " and " + nplFile.getFileName());
+                    } else {
+                        runtimeState.remember(identity);
                     }
                 } catch (IOException | RuntimeException exception) {
                     LOG.error("Invalid plugin package: " + nplFile.getFileName(), exception);
@@ -260,156 +316,332 @@ public final class PluginManager {
     }
 
     /// Removes packages and data marked for uninstall before any plugin classes are loaded.
-    ///
     /// @param candidates mutable package candidates
-    private void applyPendingUninstalls(Map<String, PluginCandidate> candidates) {
-        boolean stateChanged = false;
+    private void applyPendingUninstalls(Map<String, PluginPackageCandidate> candidates) {
         for (String pluginId : List.copyOf(pendingUninstall)) {
-            @Nullable PluginCandidate candidate = candidates.remove(pluginId);
+            @Unmodifiable List<String> blockingDependents = candidates.values().stream()
+                    .map(candidate -> candidate.manifest)
+                    .filter(manifest -> !manifest.getId().equals(pluginId))
+                    .filter(manifest -> !pendingUninstall.contains(manifest.getId()))
+                    .filter(manifest -> manifest.getSchemaVersion()
+                            >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION)
+                    .filter(manifest -> manifest.getDependencies().contains(pluginId))
+                    .map(PluginManifest::getId)
+                    .sorted()
+                    .toList();
+            if (!blockingDependents.isEmpty()) {
+                LOG.warning("Cannot complete pending uninstall of " + pluginId
+                        + " because installed plugins depend on it: " + blockingDependents);
+                continue;
+            }
             try {
-                if (candidate != null) {
-                    Files.deleteIfExists(candidate.nplFile);
-                }
-                deletePluginDirectories(pluginId);
-                pendingUninstall.remove(pluginId);
-                enabledStates.remove(pluginId);
-                stateChanged = true;
+                Set<String> nextEnabledStates = new HashSet<>(enabledStates);
+                Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+                nextEnabledStates.remove(pluginId);
+                nextPendingUninstall.remove(pluginId);
+                @Unmodifiable List<Path> installedPackages = packageRepository.findInstalledPackages(pluginId);
+                packageMutationService.publishRemoval(
+                        installedPackages,
+                        pluginId,
+                        () -> {
+                            permissionService.removePlugin(pluginId);
+                            stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
+                        },
+                        () -> {
+                            permissionService.reload();
+                            stateStore.load(enabledStates, pendingUninstall);
+                        }
+                );
+
+                enabledStates.clear();
+                enabledStates.addAll(nextEnabledStates);
+                pendingUninstall.clear();
+                pendingUninstall.addAll(nextPendingUninstall);
+                candidates.remove(pluginId);
+                clearArtifactState(pluginId);
                 LOG.info("Uninstalled plugin marked for removal: " + pluginId);
             } catch (IOException exception) {
                 LOG.warning("Failed to complete pending plugin uninstall: " + pluginId, exception);
             }
         }
-        if (stateChanged) {
-            saveStates();
+    }
+
+    /// Removes permission decisions that do not belong to an installed or currently loaded artifact.
+    /// @param candidates installed package candidates selected for discovery
+    /// @throws IOException if stale decisions cannot be removed atomically
+    private void retainInstalledPermissionArtifacts(
+            Map<String, PluginPackageCandidate> candidates
+    ) throws IOException {
+        Set<PluginPermissionStore.Artifact> retainedArtifacts = new HashSet<>();
+        candidates.values().stream()
+                .map(candidate -> permissionService.artifact(
+                        candidate.manifest,
+                        candidate.identity.getSha256()
+                ))
+                .forEach(retainedArtifacts::add);
+        for (PluginContainer container : plugins) {
+            retainedArtifacts.add(permissionService.artifact(
+                    container.getManifest(),
+                    container.getContext().getArtifactSha256()
+            ));
         }
+        permissionService.retainArtifacts(retainedArtifacts);
     }
 
     /// Loads a candidate after recursively loading all declared dependencies.
-    ///
     /// @param candidate candidate to load
     /// @param candidates available candidates
     /// @param visitStates dependency traversal states
     /// @param failed plugin IDs that cannot be loaded
-    /// @param loadOrder successfully loaded containers in dependency order
-    /// @return whether the candidate loaded successfully
+    /// @return whether the candidate loaded and enabled successfully
     private boolean loadCandidate(
-            PluginCandidate candidate,
-            Map<String, PluginCandidate> candidates,
-            Map<String, VisitState> visitStates,
-            Set<String> failed,
-            List<PluginContainer> loadOrder
+            PluginPackageCandidate candidate,
+            Map<String, PluginPackageCandidate> candidates,
+            Map<String, PluginVisitState> visitStates,
+            Set<String> failed
     ) {
         String pluginId = candidate.manifest.getId();
-        if (pluginMap.containsKey(pluginId)) {
-            return true;
-        }
         if (failed.contains(pluginId)) {
             return false;
         }
+        @Nullable PluginContainer existing = pluginMap.get(pluginId);
+        if (existing != null) {
+            PluginArtifactIdentity loadedIdentity = PluginArtifactIdentity.of(
+                    existing.getManifest(),
+                    existing.getContext().getArtifactSha256()
+            );
+            if (!candidate.identity.equals(loadedIdentity)) {
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
+                failed.add(pluginId);
+                return false;
+            }
+            if (existing.isEnabled()) {
+                return true;
+            }
+            if (!enablePlugin(pluginId, new HashSet<>())) {
+                failed.add(pluginId);
+                return false;
+            }
+            return true;
+        }
 
-        @Nullable VisitState state = visitStates.get(pluginId);
-        if (state == VisitState.VISITING) {
-            LOG.error("Cyclic plugin dependency detected at " + pluginId);
+        @Nullable PluginVisitState state = visitStates.get(pluginId);
+        if (state == PluginVisitState.VISITING) {
+            String message = "Cyclic plugin dependency detected at " + pluginId;
+            LOG.error(message);
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
             failed.add(pluginId);
             return false;
         }
-        if (state == VisitState.VISITED) {
+        if (state == PluginVisitState.VISITED) {
             return !failed.contains(pluginId);
         }
 
-        visitStates.put(pluginId, VisitState.VISITING);
-        for (String dependencyId : candidate.manifest.getDependencies()) {
-            @Nullable PluginCandidate dependency = candidates.get(dependencyId);
-            if (dependency == null && !pluginMap.containsKey(dependencyId)) {
-                LOG.error("Plugin " + pluginId + " requires missing dependency " + dependencyId);
+        @Nullable PluginRuntimeStatus blockedStatus = getPreLoadBlock(candidate);
+        if (blockedStatus != null) {
+            failed.add(pluginId);
+            visitStates.put(pluginId, PluginVisitState.VISITED);
+            return false;
+        }
+
+        visitStates.put(pluginId, PluginVisitState.VISITING);
+        for (PluginDependency declaredDependency : candidate.manifest.getPluginDependencies()) {
+            String dependencyId = declaredDependency.getId();
+            @Nullable PluginPackageCandidate dependency = candidates.get(dependencyId);
+            @Nullable PluginContainer loadedDependency = pluginMap.get(dependencyId);
+            if (dependency == null && loadedDependency == null) {
+                String message = "Plugin " + pluginId + " requires missing dependency " + dependencyId;
+                LOG.error(message);
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
                 failed.add(pluginId);
-                visitStates.put(pluginId, VisitState.VISITED);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+            if (dependency != null && !enabledStates.contains(dependencyId)) {
+                String message = "Plugin " + pluginId + " requires disabled dependency " + dependencyId;
+                LOG.error(message);
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
                 return false;
             }
             if (dependency != null
-                    && !loadCandidate(dependency, candidates, visitStates, failed, loadOrder)) {
-                LOG.error("Plugin " + pluginId + " cannot load because dependency " + dependencyId + " failed");
+                    && !loadCandidate(dependency, candidates, visitStates, failed)) {
+                String message = "Plugin " + pluginId + " cannot load because dependency "
+                        + dependencyId + " failed";
+                LOG.error(message);
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
                 failed.add(pluginId);
-                visitStates.put(pluginId, VisitState.VISITED);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
+                return false;
+            }
+            String dependencyVersion = dependency != null
+                    ? dependency.manifest.getVersion()
+                    : Objects.requireNonNull(loadedDependency).getManifest().getVersion();
+            if (!declaredDependency.matchesVersion(dependencyVersion)) {
+                String message = "Plugin " + pluginId + " requires dependency " + dependencyId + " "
+                        + declaredDependency.getVersion() + " but found " + dependencyVersion;
+                LOG.error(message);
+                setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, message);
+                failed.add(pluginId);
+                visitStates.put(pluginId, PluginVisitState.VISITED);
                 return false;
             }
         }
 
         try {
-            PluginContainer container = loadPlugin(candidate.nplFile);
-            loadOrder.add(container);
-        } catch (IOException | RuntimeException exception) {
+            loadPlugin(candidate);
+            if (!enablePlugin(pluginId, new HashSet<>())) {
+                failed.add(pluginId);
+            }
+        } catch (IOException | RuntimeException | Error exception) {
             failed.add(pluginId);
+            @Nullable String failureMessage = exception.getMessage();
+            setRuntimeStatus(
+                    candidate.identity,
+                    PluginRuntimeStatus.LOAD_FAILED,
+                    failureMessage == null || failureMessage.isBlank() ? exception.toString() : failureMessage
+            );
             LOG.error("Failed to load plugin: " + candidate.nplFile.getFileName(), exception);
         }
-        visitStates.put(pluginId, VisitState.VISITED);
+        visitStates.put(pluginId, PluginVisitState.VISITED);
         return !failed.contains(pluginId);
     }
 
-    /// Reads and validates a bounded manifest directly from a plugin package.
+    /// Returns the fail-closed policy state that must prevent any class loading for one candidate.
     ///
-    /// @param nplFile plugin package path
-    /// @return validated manifest
-    /// @throws IOException if the package or manifest is invalid
-    private PluginManifest readManifest(Path nplFile) throws IOException {
-        try (ZipFile zipFile = new ZipFile(nplFile.toFile())) {
-            @Nullable ZipEntry manifestEntry = zipFile.getEntry(PLUGIN_MANIFEST);
-            if (manifestEntry == null || manifestEntry.isDirectory()) {
-                throw new IOException(PLUGIN_MANIFEST + " not found in " + nplFile.getFileName());
-            }
-            if (manifestEntry.getSize() > MAX_MANIFEST_BYTES) {
-                throw new IOException("Plugin manifest is too large: " + nplFile.getFileName());
-            }
-            byte[] bytes;
-            try (InputStream input = zipFile.getInputStream(manifestEntry)) {
-                bytes = input.readNBytes(MAX_MANIFEST_BYTES + 1);
-            }
-            if (bytes.length > MAX_MANIFEST_BYTES) {
-                throw new IOException("Plugin manifest is too large: " + nplFile.getFileName());
-            }
-            return PluginManifest.fromJson(new java.io.StringReader(new String(bytes, StandardCharsets.UTF_8)));
+    /// @param candidate exact installed package candidate
+    /// @return blocking status or `null` when lifecycle preparation may continue
+    private @Nullable PluginRuntimeStatus getPreLoadBlock(PluginPackageCandidate candidate) {
+        PluginManifest manifest = candidate.manifest;
+        if (manifest.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
+            String detail = "Plugin " + manifest.getId() + " uses legacy manifest schema "
+                    + manifest.getSchemaVersion() + " and cannot execute";
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.BLOCKED_LEGACY, detail);
+            return PluginRuntimeStatus.BLOCKED_LEGACY;
         }
+        if (!PluginManifest.isCanonicalExecutableId(manifest.getId())) {
+            String detail = "Plugin " + manifest.getId()
+                    + " does not use a portable canonical lower-case ID";
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, detail);
+            return PluginRuntimeStatus.LOAD_FAILED;
+        }
+        if (!isLauncherCompatible(manifest)) {
+            String detail = "Plugin " + manifest.getId() + " requires launcher version "
+                    + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION;
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, detail);
+            return PluginRuntimeStatus.LOAD_FAILED;
+        }
+        @Unmodifiable Set<PluginPermission> granted = permissionService.getGrantedPermissions(
+                manifest,
+                candidate.identity.getSha256()
+        );
+        if (!granted.containsAll(manifest.getRequiredPermissions())) {
+            EnumSet<PluginPermission> denied = EnumSet.noneOf(PluginPermission.class);
+            denied.addAll(manifest.getRequiredPermissions());
+            denied.removeAll(granted);
+            String detail = "Plugin " + manifest.getId() + " cannot run until every required permission is granted: "
+                    + denied.stream().map(PluginPermission::getId).sorted().toList();
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.BLOCKED_PERMISSION, detail);
+            return PluginRuntimeStatus.BLOCKED_PERMISSION;
+        }
+        if (!manifest.hasMixins()) {
+            return null;
+        }
+        if (!manifest.isPermissionRequired(PluginPermission.MIXIN)) {
+            String detail = "Plugin " + manifest.getId() + " declares Mixins without required permission mixin";
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.LOAD_FAILED, detail);
+            return PluginRuntimeStatus.LOAD_FAILED;
+        }
+
+        String mixinDigest = PluginAgentSnapshot.calculateMixinConfigurationDigest(manifest.getMixins());
+        if (!PluginAgentSnapshot.current().confirms(candidate.identity, mixinDigest)) {
+            String detail = "The active Mixin Agent did not confirm exact artifact " + candidate.identity;
+            setRuntimeStatus(candidate.identity, PluginRuntimeStatus.BLOCKED_AGENT, detail);
+            return PluginRuntimeStatus.BLOCKED_AGENT;
+        }
+        return null;
+    }
+
+    /// Records one artifact-bound runtime status and optional diagnostic.
+    ///
+    /// @param identity exact artifact
+    /// @param status authoritative runtime status
+    /// @param detail diagnostic or `null`
+    private void setRuntimeStatus(
+            PluginArtifactIdentity identity,
+            PluginRuntimeStatus status,
+            @Nullable String detail
+    ) {
+        runtimeState.set(identity, status, detail);
+    }
+
+    /// Removes every runtime identity and diagnostic belonging to one plugin ID.
+    ///
+    /// @param pluginId plugin ID
+    private void clearArtifactState(String pluginId) {
+        runtimeState.removePlugin(pluginId);
     }
 
     /// Extracts, loads, registers, and invokes `onLoad` for a plugin package.
-    ///
     /// This method mutates the observable plugin list and must run on the JavaFX thread.
     ///
-    /// @param nplFile installed package path
+    /// @param candidate exact installed package candidate
     /// @return registered plugin container
     /// @throws IOException if preparation or registration fails
-    public PluginContainer loadPlugin(Path nplFile) throws IOException {
-        return registerPreparedPlugin(preparePluginInternal(nplFile));
+    private PluginContainer loadPlugin(PluginPackageCandidate candidate) throws IOException {
+        return registerPreparedPlugin(preparePluginInternal(candidate));
     }
 
-    /// Performs package validation, compatibility checks, safe extraction, and lifecycle class loading.
+    /// Performs compatibility checks, verified extraction, and lifecycle class loading.
     ///
-    /// @param nplFile installed package path
+    /// @param candidate exact package candidate that already passed runtime policy
     /// @return prepared plugin value
     /// @throws IOException if preparation fails
-    private PreparedPlugin preparePluginInternal(Path nplFile) throws IOException {
+    private PreparedPlugin preparePluginInternal(PluginPackageCandidate candidate) throws IOException {
+        Path nplFile = candidate.nplFile;
         LOG.info("Preparing plugin: " + nplFile.getFileName());
-        PluginManifest manifest = readManifest(nplFile);
+        String artifactSha256 = candidate.identity.getSha256();
+        PluginPackageMutationService.verifyPackageHash(nplFile, artifactSha256);
+        PluginManifest manifest = candidate.manifest;
         String pluginId = manifest.getId();
 
         if (pluginMap.containsKey(pluginId)) {
             throw new IOException("Plugin already loaded: " + pluginId);
         }
-        if (!isLauncherCompatible(manifest.getMinLauncherVersion())) {
-            throw new IOException("Plugin " + pluginId + " requires HMCL "
-                    + manifest.getMinLauncherVersion() + " or newer");
+        if (!isLauncherCompatible(manifest)) {
+            throw new IOException("Plugin " + pluginId + " requires launcher version "
+                    + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION);
         }
-        for (String dependencyId : manifest.getDependencies()) {
-            if (!pluginMap.containsKey(dependencyId)) {
-                throw new IOException("Plugin " + pluginId + " requires loaded dependency " + dependencyId);
+        for (PluginDependency dependency : manifest.getPluginDependencies()) {
+            @Nullable PluginContainer dependencyContainer = pluginMap.get(dependency.getId());
+            if (dependencyContainer == null) {
+                throw new IOException("Plugin " + pluginId + " requires loaded dependency "
+                        + dependency.getId());
+            }
+            String installedVersion = dependencyContainer.getManifest().getVersion();
+            if (!dependency.matchesVersion(installedVersion)) {
+                throw new IOException("Plugin " + pluginId + " requires dependency " + dependency.getId()
+                        + " " + dependency.getVersion() + " but found " + installedVersion);
             }
         }
 
-        Path packageDirectory = PluginPackageVersions.prepareLifecyclePackage(
+        VerifiedPluginPackage pluginPackage = PluginPackageVersions.prepareVerifiedLifecyclePackage(
                 nplFile,
                 pluginPackageDirectory,
-                pluginId
+                candidate.identity
         );
+        candidate.verifySnapshotManifest(pluginPackage);
+        PluginPackageMutationService.verifyPackageHash(nplFile, artifactSha256);
+        if (!artifactSha256.equals(PluginPackageVersions.calculateSha256(nplFile))) {
+            throw new IOException("Plugin package changed while it was being prepared: " + nplFile);
+        }
+        for (String mixinConfig : manifest.getMixins()) {
+            if (!pluginPackage.containsResource(mixinConfig)) {
+                throw new IOException("Mixin configuration resource not found: " + mixinConfig);
+            }
+        }
+        pluginPackage.verifyIntegrity();
         Path dataDirectory = pluginStorageDirectory.resolve(pluginId);
         Files.createDirectories(dataDirectory);
 
@@ -418,44 +650,43 @@ public final class PluginManager {
             throw new IOException("No loader found for plugin type: " + manifest.getType());
         }
 
-        Plugin plugin = loader.load(manifest, packageDirectory, nplFile);
+        Plugin plugin = administrativeGuard.callPluginLoadingCallback(
+                () -> loader.load(manifest, pluginPackage, nplFile)
+        );
         ClassLoader classLoader = plugin.getClass().getClassLoader();
-        for (String mixinConfig : manifest.getMixins()) {
-            if (classLoader.getResource(mixinConfig) == null) {
-                closeLoaderAfterFailure(plugin, classLoader);
-                throw new IOException("Mixin configuration resource not found: " + mixinConfig);
-            }
-        }
 
-        PluginContext context = new PluginContext(manifest, packageDirectory, dataDirectory, classLoader);
-        return new PreparedPlugin(plugin, context, manifest, nplFile);
+        PluginContext context = new PluginContext(
+                manifest,
+                pluginPackage.getDirectory(),
+                dataDirectory,
+                classLoader,
+                artifactSha256,
+                () -> permissionService.getGrantedPermissions(manifest, artifactSha256)
+        );
+        return new PreparedPlugin(
+                plugin,
+                context,
+                manifest,
+                nplFile
+        );
     }
 
-    /// Returns whether the current launcher version satisfies a non-empty minimum version.
+    /// Returns whether the current launcher version satisfies one manifest's normalized version constraint.
     ///
-    /// Development snapshots are treated as compatible with their current major line.
-    ///
-    /// @param minimumVersion minimum version or an empty string
+    /// @param manifest plugin manifest to check
     /// @return whether the launcher is compatible
-    private static boolean isLauncherCompatible(String minimumVersion) {
-        if (minimumVersion.isBlank()) {
-            return true;
-        }
-        String current = Metadata.VERSION.toLowerCase(Locale.ROOT);
-        if (current.contains("snapshot") || current.contains("develop")) {
-            return true;
-        }
-        return PluginVersion.compare(Metadata.VERSION, minimumVersion) >= 0;
+    private static boolean isLauncherCompatible(PluginManifest manifest) {
+        return manifest.matchesLauncherVersion(Metadata.VERSION);
     }
 
     /// Closes a dedicated plugin loader after preparation fails.
     ///
     /// @param plugin partially loaded plugin instance
     /// @param classLoader class loader that defined the plugin
-    private static void closeLoaderAfterFailure(Plugin plugin, ClassLoader classLoader) {
+    private void closeLoaderAfterFailure(Plugin plugin, ClassLoader classLoader) {
         try {
-            plugin.onUnload();
-        } catch (RuntimeException exception) {
+            runPluginCallback(classLoader, plugin::onUnload);
+        } catch (RuntimeException | Error exception) {
             LOG.warning("Plugin cleanup failed after preparation error", exception);
         }
         if (classLoader != PluginManager.class.getClassLoader()
@@ -468,13 +699,13 @@ public final class PluginManager {
         }
     }
 
-    /// Prepares a plugin on a background thread before JavaFX registration.
+    /// Runs one lifecycle callback with administrative APIs denied and the exact plugin loader installed as TCCL.
     ///
-    /// @param nplFile installed package path
-    /// @return prepared plugin
-    /// @throws IOException if preparation fails
-    public PreparedPlugin preparePlugin(Path nplFile) throws IOException {
-        return preparePluginInternal(nplFile);
+    /// @param classLoader loader that owns the plugin lifecycle and resources
+    /// @param callback plugin-owned lifecycle callback
+    private void runPluginCallback(ClassLoader classLoader, Runnable callback) {
+        administrativeGuard.runPluginCallback(() ->
+                JavaPluginLoader.runWithPluginContextClassLoader(classLoader, callback));
     }
 
     /// Registers a prepared plugin and invokes `onLoad` on the JavaFX thread.
@@ -482,21 +713,53 @@ public final class PluginManager {
     /// @param prepared prepared plugin value
     /// @return registered container
     public PluginContainer registerPreparedPlugin(PreparedPlugin prepared) {
+        FXUtils.checkFxUserThread();
+        administrativeGuard.checkTrustedCaller();
         String pluginId = prepared.manifest.getId();
-        if (pluginMap.containsKey(pluginId)) {
-            throw new IllegalStateException("Plugin already loaded: " + pluginId);
+        stateLock.readLock().lock();
+        try {
+            if (pluginMap.containsKey(pluginId)) {
+                IllegalStateException exception = new IllegalStateException("Plugin already loaded: " + pluginId);
+                closeLoaderAfterFailure(prepared.plugin, prepared.context.getClassLoader());
+                throw exception;
+            }
+        } finally {
+            stateLock.readLock().unlock();
         }
 
         PluginContainer container = new PluginContainer(prepared.plugin, prepared.context, prepared.nplFile);
-        plugins.add(container);
-        pluginMap.put(pluginId, container);
+        stateLock.writeLock().lock();
         try {
-            prepared.plugin.onLoad(prepared.context);
+            plugins.add(container);
+            pluginMap.put(pluginId, container);
+        } finally {
+            stateLock.writeLock().unlock();
+        }
+        try {
+            runPluginCallback(
+                    prepared.context.getClassLoader(),
+                    () -> prepared.plugin.onLoad(prepared.context)
+            );
             LOG.info("Loaded plugin: " + prepared.manifest.getName() + " v" + prepared.manifest.getVersion());
             return container;
         } catch (RuntimeException | Error exception) {
-            plugins.remove(container);
-            pluginMap.remove(pluginId);
+            stateLock.writeLock().lock();
+            try {
+                plugins.remove(container);
+                pluginMap.remove(pluginId);
+            } finally {
+                stateLock.writeLock().unlock();
+            }
+            try {
+                PluginUIRegistry.unregisterAll(pluginId);
+            } catch (RuntimeException | Error cleanupException) {
+                exception.addSuppressed(cleanupException);
+            }
+            try {
+                runPluginCallback(prepared.context.getClassLoader(), prepared.plugin::onUnload);
+            } catch (RuntimeException | Error unloadException) {
+                exception.addSuppressed(unloadException);
+            }
             try {
                 container.closeClassLoader();
             } catch (IOException closeException) {
@@ -509,9 +772,73 @@ public final class PluginManager {
     /// Enables a plugin and its dependencies, or records a restart-pending Mixin enablement.
     ///
     /// @param pluginId plugin ID
-    public void enablePlugin(String pluginId) {
-        enablePlugin(pluginId, new HashSet<>());
-        saveStates();
+    /// @return whether the plugin lifecycle is active now
+    public boolean enablePlugin(String pluginId) {
+        administrativeGuard.checkTrustedCaller();
+        try {
+            return mutationLock.call(() -> {
+                stateStore.load(enabledStates, pendingUninstall);
+                @Unmodifiable Map<String, PluginManifest> installedManifests =
+                        packageRepository.readInstalledManifests(plugins);
+                @Nullable PluginManifest requestedManifest = installedManifests.get(pluginId);
+                if (requestedManifest != null
+                        && requestedManifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
+                    enabledStates.remove(pluginId);
+                    @Nullable PluginArtifactIdentity identity = artifactResolver.resolveInstalledIdentity(pluginId);
+                    if (identity != null) {
+                        setRuntimeStatus(
+                                identity,
+                                PluginRuntimeStatus.BLOCKED_LEGACY,
+                                "Plugin " + pluginId + " uses legacy manifest schema "
+                                        + requestedManifest.getSchemaVersion() + " and cannot execute"
+                        );
+                    }
+                    saveStates();
+                    return false;
+                }
+                recordEnableIntent(pluginId, installedManifests, new HashSet<>());
+                boolean enabled = enablePlugin(pluginId, new HashSet<>());
+                saveStates();
+                return enabled;
+            });
+        } catch (IOException exception) {
+            LOG.warning("Cannot persist plugin enablement for " + pluginId, exception);
+            return false;
+        }
+    }
+
+    /// Records desired enablement for one installed plugin and its executable dependency closure.
+    ///
+    /// This operation does not claim that lifecycle activation succeeded. It only ensures that a restart-pending or
+    /// currently blocked dependency is not left persistently disabled when the user enables its dependent.
+    ///
+    /// @param pluginId plugin whose enablement was requested
+    /// @param installedManifests immutable installed manifests indexed by plugin ID
+    /// @param visited IDs whose dependency closure has already been recorded
+    private void recordEnableIntent(
+            String pluginId,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            Set<String> visited
+    ) {
+        if (!visited.add(pluginId)) {
+            return;
+        }
+        @Nullable PluginManifest manifest = installedManifests.get(pluginId);
+        if (manifest == null) {
+            return;
+        }
+        if (manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
+            return;
+        }
+        enabledStates.add(pluginId);
+        pendingUninstall.remove(pluginId);
+        for (PluginDependency dependency : manifest.getPluginDependencies()) {
+            @Nullable PluginManifest dependencyManifest = installedManifests.get(dependency.getId());
+            if (dependencyManifest != null
+                    && dependencyManifest.getSchemaVersion() >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
+                recordEnableIntent(dependency.getId(), installedManifests, visited);
+            }
+        }
     }
 
     /// Recursively enables one plugin while detecting unexpected runtime dependency cycles.
@@ -522,47 +849,126 @@ public final class PluginManager {
     private boolean enablePlugin(String pluginId, Set<String> visiting) {
         @Nullable PluginContainer container = pluginMap.get(pluginId);
         if (container == null) {
+            @Nullable PluginArtifactIdentity installedIdentity = artifactResolver.resolveInstalledIdentity(pluginId);
+            if (installedIdentity != null) {
+                enabledStates.add(pluginId);
+                pendingUninstall.remove(pluginId);
+                @Nullable PluginRuntimeStatus existingStatus = runtimeState.getStatus(installedIdentity);
+                if (existingStatus == null
+                        || existingStatus == PluginRuntimeStatus.INSTALLED_DISABLED
+                        || existingStatus == PluginRuntimeStatus.ENABLED) {
+                    setRuntimeStatus(installedIdentity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
+                }
+                LOG.info("Plugin " + pluginId + " will enable after restart");
+                return false;
+            }
             LOG.error("Cannot enable missing plugin: " + pluginId);
             return false;
         }
+        enabledStates.add(pluginId);
+        pendingUninstall.remove(pluginId);
         if (container.isEnabled()) {
             return true;
         }
         if (!visiting.add(pluginId)) {
-            LOG.error("Cyclic plugin enablement detected at " + pluginId);
+            String message = "Cyclic plugin enablement detected at " + pluginId;
+            setLoadedRuntimeStatus(container, PluginRuntimeStatus.LOAD_FAILED, message);
+            LOG.error(message);
             return false;
         }
 
-        for (String dependencyId : container.getManifest().getDependencies()) {
-            if (!enablePlugin(dependencyId, visiting)) {
-                enabledStates.add(pluginId);
-                container.setRestartRequired(true);
+        for (PluginDependency dependency : container.getManifest().getPluginDependencies()) {
+            @Nullable PluginContainer dependencyContainer = pluginMap.get(dependency.getId());
+            if (dependencyContainer == null
+                    || !dependency.matchesVersion(dependencyContainer.getManifest().getVersion())) {
+                String message = "Cannot enable plugin " + pluginId + " because dependency " + dependency.getId()
+                        + " does not satisfy " + dependency.getVersion();
+                setLoadedRuntimeStatus(container, PluginRuntimeStatus.LOAD_FAILED, message);
+                LOG.error(message);
+                visiting.remove(pluginId);
+                return false;
+            }
+            if (!enablePlugin(dependency.getId(), visiting)) {
+                PluginRuntimeStatus dependencyStatus = getPluginRuntimeStatus(dependency.getId());
+                @Nullable String dependencyDetail = getPluginRuntimeDetail(dependency.getId());
+                boolean waitingForRestart = dependencyStatus == PluginRuntimeStatus.WAITING_FOR_RESTART;
+                String message = "Cannot enable plugin " + pluginId + " because dependency " + dependency.getId()
+                        + " is " + dependencyStatus
+                        + (dependencyDetail == null || dependencyDetail.isBlank()
+                        ? ""
+                        : ": " + dependencyDetail);
+                setLoadedRuntimeStatus(
+                        container,
+                        waitingForRestart
+                                ? PluginRuntimeStatus.WAITING_FOR_RESTART
+                                : PluginRuntimeStatus.LOAD_FAILED,
+                        message
+                );
+                container.setRestartRequired(waitingForRestart);
+                LOG.error(message);
                 visiting.remove(pluginId);
                 return false;
             }
         }
 
-        if (container.getManifest().hasMixins() && !isMixinActive(pluginId)) {
+        if (container.getManifest().hasMixins()
+                && container.getContext().getGrantedPermissions().contains(PluginPermission.MIXIN)
+                && !isMixinActive(pluginId)) {
             enabledStates.add(pluginId);
             container.setRestartRequired(true);
+            setLoadedRuntimeStatus(
+                    container,
+                    PluginRuntimeStatus.WAITING_FOR_RESTART,
+                    "Plugin " + pluginId + " requires a restart before its Mixins can activate"
+            );
             LOG.info("Plugin " + pluginId + " will enable after restart so its Mixins can be applied");
             visiting.remove(pluginId);
             return false;
         }
 
         try {
-            container.getPlugin().onEnable();
+            runPluginCallback(
+                    container.getContext().getClassLoader(),
+                    container.getPlugin()::onEnable
+            );
             container.setEnabled(true);
             container.setRestartRequired(false);
             enabledStates.add(pluginId);
+            setLoadedRuntimeStatus(container, PluginRuntimeStatus.ENABLED, null);
             LOG.info("Enabled plugin: " + pluginId);
             visiting.remove(pluginId);
             return true;
-        } catch (RuntimeException exception) {
+        } catch (RuntimeException | Error exception) {
+            @Nullable String message = exception.getMessage();
+            setLoadedRuntimeStatus(
+                    container,
+                    PluginRuntimeStatus.LOAD_FAILED,
+                    message == null || message.isBlank() ? exception.toString() : message
+            );
             LOG.error("Failed to enable plugin: " + pluginId, exception);
             visiting.remove(pluginId);
             return false;
         }
+    }
+
+    /// Records one status and diagnostic against the exact artifact represented by a loaded container.
+    ///
+    /// @param container loaded lifecycle container
+    /// @param status authoritative runtime status
+    /// @param detail diagnostic detail or `null`
+    private void setLoadedRuntimeStatus(
+            PluginContainer container,
+            PluginRuntimeStatus status,
+            @Nullable String detail
+    ) {
+        setRuntimeStatus(
+                PluginArtifactIdentity.of(
+                        container.getManifest(),
+                        container.getContext().getArtifactSha256()
+                ),
+                status,
+                detail
+        );
     }
 
     /// Disables dependents first, then disables the requested plugin.
@@ -571,58 +977,170 @@ public final class PluginManager {
     ///
     /// @param pluginId plugin ID
     public void disablePlugin(String pluginId) {
-        for (PluginContainer dependent : List.copyOf(plugins)) {
-            if (dependent.isEnabled() && dependent.getManifest().getDependencies().contains(pluginId)) {
-                disablePlugin(dependent.getManifest().getId());
-            }
+        administrativeGuard.checkTrustedCaller();
+        try {
+            mutationLock.run(() -> {
+                stateStore.load(enabledStates, pendingUninstall);
+                disablePluginLocked(pluginId);
+            });
+        } catch (IOException exception) {
+            LOG.warning("Cannot persist plugin disablement for " + pluginId, exception);
+        }
+    }
+
+    /// Disables one plugin and its dependents while the shared mutation lock is held.
+    ///
+    /// @param pluginId plugin ID
+    /// @throws IOException if the installed dependency graph cannot be read
+    private void disablePluginLocked(String pluginId) throws IOException {
+        @Unmodifiable Map<String, PluginManifest> installedManifests =
+                packageRepository.readInstalledManifests(plugins);
+        disablePluginLocked(pluginId, installedManifests, new HashSet<>());
+        saveStates();
+    }
+
+    /// Disables one plugin after recursively clearing every executable dependent's desired enablement.
+    ///
+    /// The immutable installed graph covers plugins that failed before registration or are waiting for restart. Loaded
+    /// manifests are also considered so an updated package cannot hide a dependency edge still active in this process.
+    ///
+    /// @param pluginId plugin ID to disable
+    /// @param installedManifests immutable installed manifests indexed by plugin ID
+    /// @param visited IDs already processed during reverse traversal
+    private void disablePluginLocked(
+            String pluginId,
+            @Unmodifiable Map<String, PluginManifest> installedManifests,
+            Set<String> visited
+    ) {
+        if (!visited.add(pluginId)) {
+            return;
+        }
+        @Unmodifiable List<String> dependentIds = Stream.concat(
+                        installedManifests.values().stream(),
+                        plugins.stream().map(PluginContainer::getManifest)
+                )
+                .filter(manifest -> !manifest.getId().equals(pluginId))
+                .filter(manifest -> manifest.getSchemaVersion()
+                        >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION)
+                .filter(manifest -> manifest.getDependencies().contains(pluginId))
+                .map(PluginManifest::getId)
+                .distinct()
+                .sorted()
+                .toList();
+        for (String dependentId : dependentIds) {
+            disablePluginLocked(dependentId, installedManifests, visited);
         }
 
         @Nullable PluginContainer container = pluginMap.get(pluginId);
         if (container == null) {
+            if (enabledStates.remove(pluginId)) {
+                LOG.info("Disabled failed or restart-pending plugin: " + pluginId);
+            }
+            @Nullable PluginArtifactIdentity installedIdentity = artifactResolver.resolveInstalledIdentity(pluginId);
+            if (installedIdentity != null
+                    && runtimeState.getStatus(installedIdentity) == PluginRuntimeStatus.WAITING_FOR_RESTART) {
+                setRuntimeStatus(installedIdentity, PluginRuntimeStatus.INSTALLED_DISABLED, null);
+            }
             return;
         }
         if (container.isEnabled()) {
             try {
-                container.getPlugin().onDisable();
+                runPluginCallback(
+                        container.getContext().getClassLoader(),
+                        container.getPlugin()::onDisable
+                );
+                LOG.info("Disabled plugin: " + pluginId);
+            } catch (RuntimeException | Error exception) {
+                LOG.error("Failed to disable plugin: " + pluginId, exception);
+            } finally {
                 container.setEnabled(false);
                 PluginUIRegistry.unregisterAll(pluginId);
-                LOG.info("Disabled plugin: " + pluginId);
-            } catch (RuntimeException exception) {
-                LOG.error("Failed to disable plugin: " + pluginId, exception);
-                return;
             }
         }
 
         enabledStates.remove(pluginId);
-        container.setRestartRequired(container.getManifest().hasMixins() && isMixinActive(pluginId));
-        saveStates();
+        boolean restartRequired = container.getManifest().hasMixins() && isMixinActive(pluginId);
+        container.setRestartRequired(restartRequired);
+        setRuntimeStatus(
+                PluginArtifactIdentity.of(
+                        container.getManifest(),
+                        container.getContext().getArtifactSha256()
+                ),
+                restartRequired
+                        ? PluginRuntimeStatus.WAITING_FOR_RESTART
+                        : PluginRuntimeStatus.INSTALLED_DISABLED,
+                null
+        );
     }
 
     /// Unloads dependents first, invokes lifecycle cleanup, and closes a dedicated class loader.
     ///
     /// @param pluginId plugin ID
     public void unloadPlugin(String pluginId) {
-        for (PluginContainer dependent : List.copyOf(plugins)) {
+        administrativeGuard.checkTrustedCaller();
+        try {
+            mutationLock.run(() -> {
+                stateStore.load(enabledStates, pendingUninstall);
+                unloadPluginLocked(pluginId);
+            });
+        } catch (IOException exception) {
+            LOG.warning("Cannot persist plugin unload state for " + pluginId, exception);
+        }
+    }
+
+    /// Unloads one plugin and its dependents while the shared mutation lock is held.
+    ///
+    /// IMPORTANT: This method modifies JavaFX ObservableList and must execute on the JavaFX application thread.
+    /// Background permission/uninstall operations should schedule lifecycle teardown via Schedulers.javafx().
+    ///
+    /// @param pluginId plugin ID
+    /// @throws IOException if disabling an active lifecycle requires an unreadable installed dependency graph
+    private void unloadPluginLocked(String pluginId) throws IOException {
+        // TODO: Add FXUtils.checkFxUserThread() once background callers are refactored to schedule on FX thread
+        stateLock.readLock().lock();
+        List<PluginContainer> pluginsCopy;
+        try {
+            pluginsCopy = List.copyOf(plugins);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+        
+        for (PluginContainer dependent : pluginsCopy) {
             if (dependent.getManifest().getDependencies().contains(pluginId)) {
-                unloadPlugin(dependent.getManifest().getId());
+                unloadPluginLocked(dependent.getManifest().getId());
             }
         }
 
-        @Nullable PluginContainer container = pluginMap.get(pluginId);
+        stateLock.readLock().lock();
+        @Nullable PluginContainer container;
+        try {
+            container = pluginMap.get(pluginId);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+        
         if (container == null) {
             return;
         }
         if (container.isEnabled()) {
-            disablePlugin(pluginId);
+            disablePluginLocked(pluginId);
         }
 
         try {
-            container.getPlugin().onUnload();
-        } catch (RuntimeException exception) {
+            runPluginCallback(
+                    container.getContext().getClassLoader(),
+                    container.getPlugin()::onUnload
+            );
+        } catch (RuntimeException | Error exception) {
             LOG.warning("Plugin onUnload failed: " + pluginId, exception);
         } finally {
-            plugins.remove(container);
-            pluginMap.remove(pluginId);
+            stateLock.writeLock().lock();
+            try {
+                plugins.remove(container);
+                pluginMap.remove(pluginId);
+            } finally {
+                stateLock.writeLock().unlock();
+            }
             PluginUIRegistry.unregisterAll(pluginId);
             try {
                 container.closeClassLoader();
@@ -633,197 +1151,649 @@ public final class PluginManager {
         LOG.info("Unloaded plugin: " + pluginId);
     }
 
-    /// Validates and prepares a user-selected local plugin package for installation.
+    /// Inspects a local package without copying, extracting, loading, or otherwise modifying launcher state.
     ///
-    /// New plugin IDs are copied into the plugin directory and prepared for JavaFX registration. If the same
-    /// plugin ID is already installed or loaded, the replacement is staged for the next restart instead; the
-    /// currently loaded classes are never registered a second time.
+    /// The returned SHA-256 digest binds the displayed manifest and permission confirmation to subsequent
+    /// preparation. The old manifest is present when the same plugin ID is already installed or loaded.
     ///
     /// @param sourcePackage user-selected `.npl` package
-    /// @return prepared new installation or restart-staged update
-    /// @throws IOException if validation, copying, preparation, or staging fails
-    public LocalPluginInstallation prepareLocalPluginInstallation(Path sourcePackage) throws IOException {
+    /// @return immutable package inspection
+    /// @throws IOException if the package, manifest, compatibility, or digest is invalid
+    public LocalPluginInspection inspectLocalPluginPackage(Path sourcePackage) throws IOException {
         Path source = sourcePackage.toAbsolutePath().normalize();
-        validateLocalPluginPackage(source);
+        PluginPackageRepository.validateLocalPackage(source);
 
-        PluginManifest manifest = readManifest(source);
-        String pluginId = manifest.getId();
-        if (!isLauncherCompatible(manifest.getMinLauncherVersion())) {
-            throw new IOException("Plugin " + pluginId + " requires HMCL "
-                    + manifest.getMinLauncherVersion() + " or newer");
+        String initialSha256 = PluginPackageVersions.calculateSha256(source);
+        PluginManifest manifest = packageRepository.readManifest(source);
+        String verifiedSha256 = PluginPackageVersions.calculateSha256(source);
+        if (!initialSha256.equals(verifiedSha256)) {
+            throw new IOException("Plugin package changed while it was being inspected: " + source);
         }
-
-        boolean restartUpdate = pluginMap.containsKey(pluginId)
-                || !findInstalledPackages(pluginId).isEmpty();
-        Path installedPackage = source;
-        boolean copied = false;
-        if (!Objects.equals(source.getParent(), pluginsDirectory.toAbsolutePath().normalize())) {
-            installedPackage = copyLocalPluginPackage(source, manifest, restartUpdate);
-            copied = true;
+        if (manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
+            throw new IOException("Only plugin API v" + PluginManifest.CURRENT_SCHEMA_VERSION
+                    + " packages can be installed; found schema " + manifest.getSchemaVersion());
         }
-
-        try {
-            if (restartUpdate) {
-                stagePluginUpdate(pluginId, installedPackage);
-                return LocalPluginInstallation.staged(manifest);
-            }
-            return LocalPluginInstallation.prepared(preparePluginInternal(installedPackage));
-        } catch (IOException | RuntimeException | Error exception) {
-            if (copied) {
-                try {
-                    Files.deleteIfExists(installedPackage);
-                } catch (IOException cleanupException) {
-                    exception.addSuppressed(cleanupException);
-                }
-            }
-            throw exception;
+        if (!isLauncherCompatible(manifest)) {
+            throw new IOException("Plugin " + manifest.getId() + " requires launcher version "
+                    + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION);
         }
-    }
-
-    /// Rejects missing, unreadable, non-regular, or incorrectly named local packages.
-    ///
-    /// @param packageFile candidate local package
-    /// @throws IOException if the package cannot be safely consumed
-    private static void validateLocalPluginPackage(Path packageFile) throws IOException {
-        @Nullable Path fileName = packageFile.getFileName();
-        if (fileName == null
-                || !fileName.toString().toLowerCase(Locale.ROOT).endsWith(".npl")
-                || !Files.isRegularFile(packageFile)
-                || !Files.isReadable(packageFile)) {
-            throw new IOException("Plugin package is not a readable .npl file: " + packageFile);
+        if (manifest.getSchemaVersion() >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
+                && !PluginManifest.isCanonicalExecutableId(manifest.getId())) {
+            throw new IOException("Executable plugin ID must be portable canonical lower-case text: "
+                    + manifest.getId());
         }
-    }
-
-    /// Copies an external local package into the plugin directory without overwriting any live package.
-    ///
-    /// Updates always use a unique path so validation or staging failure leaves the old package untouched.
-    /// New installations use the stable `<plugin-id>.npl` name when it is available.
-    ///
-    /// @param source validated source package
-    /// @param manifest validated source manifest
-    /// @param restartUpdate whether an existing package will be replaced at restart
-    /// @return copied package path inside the plugin directory
-    /// @throws IOException if copying, validation, or atomic publication fails
-    private Path copyLocalPluginPackage(
-            Path source,
-            PluginManifest manifest,
-            boolean restartUpdate
-    ) throws IOException {
-        String pluginId = manifest.getId();
-        Path target = pluginsDirectory.resolve(pluginId + ".npl");
-        if (restartUpdate || Files.exists(target)) {
-            target = pluginsDirectory.resolve(pluginId + "-" + UUID.randomUUID() + ".npl");
-        }
-
-        Path temporaryFile = pluginsDirectory.resolve(
-                "." + pluginId + "-" + UUID.randomUUID() + ".installing"
+        @Nullable PluginPermissionService.ResolvedArtifact priorArtifact = mutationLock.call(
+                () -> artifactResolver.findCurrentPermissionArtifact(manifest.getId())
         );
-        try {
-            Files.copy(source, temporaryFile);
-            PluginManifest copiedManifest = readManifest(temporaryFile);
-            if (!pluginId.equals(copiedManifest.getId())) {
-                throw new IOException("Plugin package changed while it was being copied: " + source);
-            }
-            if (!isLauncherCompatible(copiedManifest.getMinLauncherVersion())) {
-                throw new IOException("Plugin " + pluginId + " requires HMCL "
-                        + copiedManifest.getMinLauncherVersion() + " or newer");
-            }
-            try {
-                Files.move(temporaryFile, target, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporaryFile, target);
-            }
-            return target;
-        } finally {
-            Files.deleteIfExists(temporaryFile);
-        }
+        @Nullable PluginManifest oldManifest = priorArtifact == null ? null : priorArtifact.getManifest();
+        @Nullable PluginArtifactIdentity priorIdentity = priorArtifact == null
+                ? null
+                : PluginArtifactIdentity.of(oldManifest, priorArtifact.getArtifact().getSha256());
+        return new LocalPluginInspection(
+                source,
+                manifest,
+                verifiedSha256,
+                oldManifest,
+                priorIdentity
+        );
     }
 
-    /// Finds readable installed packages that declare the supplied plugin ID.
+    /// Returns the capabilities requested by the artifact published for the next launch.
+    /// @param pluginId plugin ID to query
+    /// @return immutable declared permission set
+    /// @throws IOException if the plugin is absent or its installed package cannot be read
+    public @Unmodifiable Set<PluginPermission> getDeclaredPermissions(String pluginId) throws IOException {
+        return permissionService.getDeclaredPermissions(pluginId);
+    }
+
+    /// Returns the user grants stored for the artifact published for the next launch.
+    /// When an update is waiting for restart, this returns the pending artifact decision. Already loaded plugin code
+    /// continues querying its own exact artifact through [PluginContext].
+    /// @param pluginId plugin ID to query
+    /// @return immutable granted permission set
+    /// @throws IOException if the plugin is absent or its installed package cannot be read
+    public @Unmodifiable Set<PluginPermission> getGrantedPermissions(String pluginId) throws IOException {
+        return permissionService.getGrantedPermissions(pluginId);
+    }
+
+    /// Replaces grants for the artifact published for restart and synchronizes any older loaded artifact.
+    /// The published artifact receives the user's complete decision. If older code remains loaded, only revocations
+    /// propagate to its existing grants; a newly granted capability never authorizes different bytes in the current
+    /// process. Both exact records are persisted in one atomic document replacement.
+    /// @param pluginId plugin ID to update
+    /// @param grantedPermissions permissions explicitly granted from the developer's requests; schema-v4 required
+    /// permissions must remain present
+    /// @throws IOException if the plugin is absent or the decision cannot be persisted atomically
+    public void setGrantedPermissions(
+            String pluginId,
+            Set<PluginPermission> grantedPermissions
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        mutationLock.run(() -> setGrantedPermissionsLocked(pluginId, grantedPermissions));
+    }
+
+    /// Applies one permission decision while holding the shared mutation lock.
     ///
-    /// @param pluginId validated plugin ID
-    /// @return sorted matching paths
-    /// @throws IOException if the installed plugin directory cannot be listed
-    private List<Path> findInstalledPackages(String pluginId) throws IOException {
-        List<Path> matches = new ArrayList<>();
-        try (Stream<Path> files = Files.list(pluginsDirectory)) {
-            for (Path packageFile : files
-                    .filter(Files::isRegularFile)
-                    .filter(Files::isReadable)
-                    .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".npl"))
-                    .sorted()
-                    .toList()) {
-                try {
-                    if (pluginId.equals(readManifest(packageFile).getId())) {
-                        matches.add(packageFile.toAbsolutePath().normalize());
-                    }
-                } catch (IOException | RuntimeException ignored) {
-                    // Invalid packages are handled by normal discovery and must not block a local install.
+    /// @param pluginId plugin ID to update
+    /// @param grantedPermissions permissions explicitly granted from the developer's requests; schema-v4 required
+    /// permissions must remain present
+    /// @throws IOException if the plugin is absent or persistence fails
+    private void setGrantedPermissionsLocked(
+            String pluginId,
+            Set<PluginPermission> grantedPermissions
+    ) throws IOException {
+        stateStore.load(enabledStates, pendingUninstall);
+        Objects.requireNonNull(grantedPermissions, "Granted permissions");
+        @Nullable PluginPermissionService.ResolvedArtifact published =
+                artifactResolver.findCurrentPermissionArtifact(pluginId);
+        if (published == null) {
+            throw new IOException("Plugin is not installed: " + pluginId);
+        }
+        @Nullable PluginPermissionService.ResolvedArtifact loaded =
+                artifactResolver.findLoadedPermissionArtifact(pluginId);
+        @Unmodifiable Set<PluginPermission> loadedBefore = loaded == null
+                ? Set.of()
+                : permissionService.getGrantedPermissions(
+                        loaded.getManifest(),
+                        loaded.getArtifact().getSha256()
+                );
+        boolean launcherUiBefore = loadedBefore.contains(PluginPermission.LAUNCHER_UI);
+        @Unmodifiable Set<PluginPermission> loadedRequired = loaded == null
+                ? Set.of()
+                : Set.copyOf(loaded.getManifest().getRequiredPermissions());
+        boolean activeArtifactHadRequiredPermissions = loaded != null
+                && loadedBefore.containsAll(loadedRequired);
+        boolean activeMixinRequiresRestart = loaded != null
+                && loaded.getManifest().hasMixins()
+                && isMixinActive(pluginId);
+
+        Map<PluginPermissionService.ResolvedArtifact, Set<PluginPermission>> decisions = new LinkedHashMap<>();
+        decisions.put(published, grantedPermissions);
+        @Unmodifiable Set<PluginPermission> loadedDecision = Set.of();
+        if (loaded != null && !loaded.getArtifact().equals(published.getArtifact())) {
+            EnumSet<PluginPermission> compatibleDecision = EnumSet.noneOf(PluginPermission.class);
+            if (loaded.getManifest().getSchemaVersion() >= 4) {
+                compatibleDecision.addAll(loaded.getManifest().getRequiredPermissions());
+            }
+            for (PluginPermission permission : loadedBefore) {
+                if (grantedPermissions.contains(permission)
+                        && loaded.getManifest().declaresPermission(permission)) {
+                    compatibleDecision.add(permission);
                 }
             }
+            loadedDecision = compatibleDecision.isEmpty()
+                    ? Set.of()
+                    : java.util.Collections.unmodifiableSet(compatibleDecision);
+            decisions.put(loaded, loadedDecision);
         }
-        return matches;
-    }
+        permissionService.setGrantedPermissions(Map.copyOf(decisions));
 
-    /// Copies, loads, and enables a local plugin package.
-    ///
-    /// @param nplFile source package
-    /// @return installed container
-    /// @throws IOException if copying or loading fails
-    public PluginContainer installPlugin(Path nplFile) throws IOException {
-        Path targetPath = pluginsDirectory.resolve(nplFile.getFileName());
-        if (!nplFile.toAbsolutePath().normalize().equals(targetPath.toAbsolutePath().normalize())) {
-            Files.copy(nplFile, targetPath, StandardCopyOption.REPLACE_EXISTING);
+        @Unmodifiable Set<PluginPermission> loadedAfter = loaded == null
+                ? Set.of()
+                : permissionService.getGrantedPermissions(
+                        loaded.getManifest(),
+                        loaded.getArtifact().getSha256()
+                );
+        @Unmodifiable Set<PluginPermission> publishedAfter = permissionService.getGrantedPermissions(
+                published.getManifest(),
+                published.getArtifact().getSha256()
+        );
+        PluginArtifactIdentity publishedIdentity = PluginArtifactIdentity.of(
+                published.getManifest(),
+                published.getArtifact().getSha256()
+        );
+        if (!publishedAfter.containsAll(published.getManifest().getRequiredPermissions())) {
+            setRuntimeStatus(
+                    publishedIdentity,
+                    PluginRuntimeStatus.BLOCKED_PERMISSION,
+                    "Every required plugin permission must be granted"
+            );
+        } else if (runtimeState.getStatus(publishedIdentity) == PluginRuntimeStatus.BLOCKED_PERMISSION) {
+            setRuntimeStatus(publishedIdentity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
         }
-        PluginContainer container = loadPlugin(targetPath);
-        enablePlugin(container.getManifest().getId());
-        return container;
-    }
-
-    /// Validates a replacement package and makes it the installed package for the next restart.
-    ///
-    /// The currently loaded classes remain untouched; this is used to update an active Mixin plugin safely.
-    ///
-    /// @param pluginId expected plugin ID
-    /// @param replacementPackage downloaded replacement package already stored in the plugin directory
-    /// @throws IOException if the replacement is invalid or file replacement fails
-    public void stagePluginUpdate(String pluginId, Path replacementPackage) throws IOException {
-        Path replacement = replacementPackage.toAbsolutePath().normalize();
-        Path pluginRoot = pluginsDirectory.toAbsolutePath().normalize();
-        validateLocalPluginPackage(replacement);
-        if (!Objects.equals(replacement.getParent(), pluginRoot)) {
-            throw new IOException("Staged plugin package must be stored directly in " + pluginRoot);
-        }
-
-        PluginManifest replacementManifest = readManifest(replacement);
-        if (!pluginId.equals(replacementManifest.getId())) {
-            throw new IOException("Downloaded package ID " + replacementManifest.getId()
-                    + " does not match store entry " + pluginId);
-        }
-        if (!isLauncherCompatible(replacementManifest.getMinLauncherVersion())) {
-            throw new IOException("Plugin " + pluginId + " requires HMCL "
-                    + replacementManifest.getMinLauncherVersion() + " or newer");
-        }
-
-        for (Path installedPackage : findInstalledPackages(pluginId)) {
-            if (!installedPackage.equals(replacement)) {
-                Files.deleteIfExists(installedPackage);
+        boolean launcherUiAfter = loadedAfter.contains(PluginPermission.LAUNCHER_UI);
+        if (activeArtifactHadRequiredPermissions
+                && loaded != null
+                && !loadedAfter.containsAll(loadedRequired)) {
+            @Unmodifiable Set<String> desiredEnablement = Set.copyOf(enabledStates);
+            PluginArtifactIdentity loadedIdentity = PluginArtifactIdentity.of(
+                    loaded.getManifest(),
+                    loaded.getArtifact().getSha256()
+            );
+            unloadPluginLocked(pluginId);
+            enabledStates.addAll(desiredEnablement);
+            String detail = activeMixinRequiresRestart
+                    ? "An active plugin required permission was revoked; lifecycle execution stopped, and a launcher "
+                    + "restart is required to remove transformed bytecode"
+                    : "An active plugin required permission was revoked; lifecycle execution stopped";
+            setRuntimeStatus(loadedIdentity, PluginRuntimeStatus.BLOCKED_PERMISSION, detail);
+            if (!publishedAfter.containsAll(published.getManifest().getRequiredPermissions())) {
+                setRuntimeStatus(publishedIdentity, PluginRuntimeStatus.BLOCKED_PERMISSION, detail);
+            } else if (!publishedIdentity.equals(loadedIdentity)) {
+                setRuntimeStatus(publishedIdentity, PluginRuntimeStatus.WAITING_FOR_RESTART, detail);
             }
-        }
-
-        @Nullable PluginContainer container = pluginMap.get(pluginId);
-        if (container != null) {
-            Path oldPackage = container.getNplFile().toAbsolutePath().normalize();
-            if (!oldPackage.equals(replacement)) {
-                Files.deleteIfExists(oldPackage);
-            }
-            container.setNplFile(replacement);
-            container.setRestartRequired(true);
-        }
-        if (pendingUninstall.remove(pluginId)) {
             saveStates();
+            return;
         }
-        LOG.info("Staged plugin update for next restart: " + pluginId);
+        if (launcherUiBefore && !launcherUiAfter) {
+            PluginUIRegistry.unregisterAll(pluginId);
+        }
+    }
+
+    /// Returns the stored user decision for the exact artifact represented by an inspection.
+    /// @param inspection inspected package artifact
+    /// @return immutable effective permission set, or an empty set when no decision exists
+    public @Unmodifiable Set<PluginPermission> getGrantedPermissions(LocalPluginInspection inspection) {
+        return permissionService.getGrantedPermissions(
+                inspection.manifest,
+                inspection.sha256
+        );
+    }
+
+    /// Suggests initial toggle values for an installation permission prompt.
+    /// New schema-v4 plugin IDs include their required permissions and deny every optional request; schema-v3 IDs
+    /// still default to no grants. Every update carries forward only compatible optional grants from the currently
+    /// installed artifact and includes target required permissions. Historical decisions belonging to the target
+    /// artifact are deliberately ignored so an abandoned installation cannot pre-authorize a later prompt.
+    /// @param inspection inspected target artifact
+    /// @return immutable suggested grant set
+    /// @throws IOException if the currently installed artifact cannot be inspected
+    public @Unmodifiable Set<PluginPermission> getSuggestedGrantedPermissions(
+            LocalPluginInspection inspection
+    ) throws IOException {
+        return permissionService.getSuggestedGrantedPermissions(
+                inspection.manifest,
+                inspection.oldManifest != null
+        );
+    }
+
+    /// Validates and stages a user-selected local plugin package without caller-supplied grants.
+    /// Every new installation and replacement is published for the next restart; no lifecycle class is loaded or
+    /// registered in the current process.
+    /// This package-private compatibility overload is fail-closed, never carries an old decision into an update, and
+    /// rejects schema-v4 packages that require any capability.
+    /// Production UI must use an overload accepting an explicit user decision.
+    /// @param sourcePackage user-selected `.npl` package
+    /// @return restart-staged installation result
+    /// @throws IOException if validation, copying, permission persistence, or staging fails
+    LocalPluginInstallation prepareLocalPluginInstallation(Path sourcePackage) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        LocalPluginInspection inspection = inspectLocalPluginPackage(sourcePackage);
+        return prepareLocalPluginInstallation(inspection, Set.of());
+    }
+
+    /// Validates and prepares a local package with the user's explicit capability decisions.
+    /// @param sourcePackage user-selected `.npl` package
+    /// @param grantedPermissions permissions explicitly granted from the package's declared requests
+    /// @return restart-staged installation result
+    /// @throws IOException if validation, permission persistence, copying, or staging fails
+    public LocalPluginInstallation prepareLocalPluginInstallation(
+            Path sourcePackage,
+            Set<PluginPermission> grantedPermissions
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        return prepareLocalPluginInstallation(inspectLocalPluginPackage(sourcePackage), grantedPermissions);
+    }
+
+    /// Prepares a previously inspected package without caller-supplied grants.
+    /// This package-private compatibility overload is fail-closed, never carries an old decision into an update, and
+    /// rejects schema-v4 packages that require any capability.
+    /// Production UI must use the overload accepting an explicit user decision.
+    /// @param inspection read-only package inspection previously returned by [inspectLocalPluginPackage]
+    /// @return restart-staged installation result
+    /// @throws IOException if the package changed or installation validation fails
+    LocalPluginInstallation prepareLocalPluginInstallation(LocalPluginInspection inspection) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        return prepareLocalPluginInstallation(inspection, Set.of());
+    }
+
+    /// Prepares a previously inspected package with the user's explicit capability decisions.
+    /// Only permissions requested by the inspected manifest are accepted. The decision is bound to the inspected
+    /// package version and SHA-256 before package publication, so the currently loaded artifact never receives a
+    /// replacement artifact's grants.
+    /// @param inspection read-only package inspection previously returned by [inspectLocalPluginPackage]
+    /// @param grantedPermissions permissions explicitly granted from the package's declared requests
+    /// @return restart-staged installation result
+    /// @throws IOException if the package changed or installation and permission persistence fail
+    public LocalPluginInstallation prepareLocalPluginInstallation(
+            LocalPluginInspection inspection,
+            Set<PluginPermission> grantedPermissions
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        stagePluginInstallations(
+                List.of(inspection),
+                Map.of(inspection.manifest.getId(), Set.copyOf(grantedPermissions))
+        );
+        return LocalPluginInstallation.staged(inspection.manifest);
+    }
+
+    /// Returns every readable installed package manifest, including packages that failed or have not yet loaded.
+    ///
+    /// A replacement package waiting for restart takes precedence over old loaded classes so management and future
+    /// installation planning consistently describe the artifact that will run next.
+    ///
+    /// @return immutable installed manifests indexed by plugin ID
+    /// @throws IOException if the plugin directory cannot be listed
+    public @Unmodifiable Map<String, PluginManifest> getInstalledManifests() throws IOException {
+        return Map.copyOf(dependencyPlanner.readInstallPlanningManifests(List.copyOf(plugins), pendingUninstall));
+    }
+
+    /// Captures one atomic plugin-store planning snapshot under the shared mutation lock.
+    ///
+    /// The snapshot binds every planning manifest to the exact currently published or active artifact, and separately
+    /// marks the subset eligible for dependency reuse. Installation confirmation and final publication must preserve
+    /// this object so both replacement prior state and reused dependencies can be revalidated byte-for-byte.
+    ///
+    /// @return immutable manifests, exact current identities, and reusable identities from one locked snapshot
+    /// @throws IOException if package, state, permission, manifest, or digest inspection fails
+    public PluginInstallationPlanningSnapshot getInstallationPlanningSnapshot() throws IOException {
+        return mutationLock.call(() -> {
+            stateStore.load(enabledStates, pendingUninstall);
+            @Unmodifiable Map<String, PluginManifest> manifests = Map.copyOf(
+                    dependencyPlanner.readInstallPlanningManifests(plugins, pendingUninstall)
+            );
+            @Unmodifiable Map<String, PluginArtifactIdentity> artifacts =
+                    installationStateGuard.resolvePlanningArtifactIdentities(manifests);
+            Map<String, PluginArtifactIdentity> reusable = new LinkedHashMap<>();
+            for (Map.Entry<String, PluginManifest> entry : manifests.entrySet()) {
+                @Nullable PluginArtifactIdentity reusableIdentity = reusePolicy.resolveReusableIdentity(
+                        entry.getKey(),
+                        entry.getValue(),
+                        enabledStates
+                );
+                if (reusableIdentity != null) {
+                    PluginArtifactIdentity plannedIdentity = Objects.requireNonNull(artifacts.get(entry.getKey()));
+                    if (!plannedIdentity.equals(reusableIdentity)) {
+                        throw new IOException("Plugin artifact changed while the installation plan was captured: "
+                                + entry.getKey());
+                    }
+                    reusable.put(entry.getKey(), reusableIdentity);
+                }
+            }
+            return new PluginInstallationPlanningSnapshot(manifests, artifacts, Map.copyOf(reusable));
+        });
+    }
+
+    /// Returns IDs from one installation-planning manifest snapshot whose exact current artifacts are safe to reuse.
+    ///
+    /// Reuse requires a non-pending, canonical executable and launcher-compatible manifest, byte-for-byte
+    /// correspondence with the currently published artifact, and every required permission granted to that artifact's
+    /// exact SHA-256 identity. The calculation runs under the shared package and permission lock so a store resolver
+    /// never treats a version-only match as authorization.
+    ///
+    /// @param installedManifests immutable installation-planning manifest snapshot
+    /// @return immutable IDs eligible for dependency reuse
+    /// @throws IOException if package identity or permission state cannot be inspected
+    public @Unmodifiable Set<String> getReusableInstalledPluginIds(
+            @Unmodifiable Map<String, PluginManifest> installedManifests
+    ) throws IOException {
+        return Set.copyOf(getReusableInstalledPluginArtifacts(installedManifests).keySet());
+    }
+
+    /// Returns exact identities from one installation-planning snapshot that are currently safe to reuse.
+    ///
+    /// The returned map is the authorization snapshot that a store installation plan must preserve until final
+    /// publication. Final staging compares every unreplaced dependency against the same ID, version, and complete
+    /// package SHA-256 while holding the shared mutation lock.
+    ///
+    /// @param installedManifests immutable installation-planning manifest snapshot
+    /// @return immutable reusable artifact identities indexed by plugin ID
+    /// @throws IOException if package identity or permission state cannot be inspected
+    public @Unmodifiable Map<String, PluginArtifactIdentity> getReusableInstalledPluginArtifacts(
+            @Unmodifiable Map<String, PluginManifest> installedManifests
+    ) throws IOException {
+        @Unmodifiable Map<String, PluginManifest> snapshot = Map.copyOf(installedManifests);
+        return mutationLock.call(() -> {
+            stateStore.load(enabledStates, pendingUninstall);
+            Map<String, PluginArtifactIdentity> reusable = new LinkedHashMap<>();
+            for (Map.Entry<String, PluginManifest> entry : snapshot.entrySet()) {
+                if (pendingUninstall.contains(entry.getKey())) {
+                    continue;
+                }
+                @Nullable PluginArtifactIdentity identity = reusePolicy.resolveReusableIdentity(
+                        entry.getKey(),
+                        entry.getValue(),
+                        enabledStates
+                );
+                if (identity != null) {
+                    reusable.put(entry.getKey(), identity);
+                }
+            }
+            return Map.copyOf(reusable);
+        });
+    }
+
+    /// Returns every readable package currently published on disk, including artifacts pending uninstallation.
+    ///
+    /// Loaded lifecycle manifests are used only when their package is absent. This view is intended for management
+    /// and status presentation; dependency planning should continue to use [getInstalledManifests].
+    ///
+    /// @return immutable published manifests indexed by plugin ID
+    /// @throws IOException if the plugin directory cannot be listed
+    public @Unmodifiable Map<String, PluginManifest> getPublishedPluginManifests() throws IOException {
+        return packageRepository.readInstalledManifests(List.copyOf(plugins));
+    }
+
+    /// Validates and atomically publishes multiple inspected packages without caller-supplied grants.
+    ///
+    /// The complete future dependency graph is checked before any installed file changes. Every source is copied and
+    /// hash-verified first; existing packages are then backed up and all replacements are published as one transaction.
+    /// A publication failure restores every previous package. New plugin IDs are enabled for their first startup,
+    /// while existing enablement state is preserved.
+    ///
+    /// This package-private compatibility overload is fail-closed, never carries old decisions into updates, and
+    /// rejects schema-v4 packages that require any capability. Production UI must supply one explicit decision set
+    /// for every package.
+    ///
+    /// @param inspections immutable inspected packages in dependency-first order
+    /// @return immutable replacement manifests in the supplied order
+    /// @throws IOException if validation, copying, publication, or rollback fails
+    @Unmodifiable List<PluginManifest> stagePluginInstallations(
+            @Unmodifiable List<LocalPluginInspection> inspections
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        Map<String, @Unmodifiable Set<PluginPermission>> deniedGrants = new LinkedHashMap<>();
+        for (LocalPluginInspection inspection : inspections) {
+            deniedGrants.put(inspection.manifest.getId(), Set.of());
+        }
+        return stagePluginInstallations(inspections, Map.copyOf(deniedGrants));
+    }
+
+    /// Validates and atomically publishes multiple inspected packages with explicit per-plugin permission decisions.
+    ///
+    /// Every inspected plugin ID must have one decision set, including an empty set when the user denies every
+    /// requested capability. Permission decisions are artifact-bound and restored when package publication fails.
+    ///
+    /// @param inspections immutable inspected packages in dependency-first order
+    /// @param grantsByPluginId explicit user decisions indexed by inspected plugin ID
+    /// @return immutable replacement manifests in the supplied order
+    /// @throws IOException if validation, permission persistence, copying, publication, or rollback fails
+    public @Unmodifiable List<PluginManifest> stagePluginInstallations(
+            @Unmodifiable List<LocalPluginInspection> inspections,
+            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts =
+                PluginInstallationStateGuard.expectedPriorArtifactsFromInspections(inspections);
+        return mutationLock.call(() -> stagePluginInstallationsLocked(
+                inspections,
+                grantsByPluginId,
+                Map.of(),
+                false,
+                expectedPriorArtifacts
+        ));
+    }
+
+    /// Validates and atomically publishes a confirmed store plan with exact reusable dependency identities.
+    ///
+    /// Every unreplaced dependency in the final replacement closure must have an identity in
+    /// `expectedReusableArtifacts`, and its current ID, version, and complete package SHA-256 must still match. The
+    /// check occurs under the shared mutation lock before any package, state, or permission file is changed.
+    ///
+    /// @param inspections immutable inspected packages in dependency-first order
+    /// @param grantsByPluginId explicit user decisions indexed by inspected plugin ID
+    /// @param expectedReusableArtifacts exact dependency identities captured by the confirmed store plan
+    /// @return immutable replacement manifests in the supplied order
+    /// @throws IOException if validation, identity comparison, persistence, publication, or rollback fails
+    public @Unmodifiable List<PluginManifest> stagePluginInstallations(
+            @Unmodifiable List<LocalPluginInspection> inspections,
+            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
+            @Unmodifiable Map<String, PluginArtifactIdentity> expectedReusableArtifacts
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        @Unmodifiable Map<String, PluginArtifactIdentity> expectedSnapshot =
+                Map.copyOf(expectedReusableArtifacts);
+        @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts =
+                PluginInstallationStateGuard.expectedPriorArtifactsFromInspections(inspections);
+        return mutationLock.call(() -> stagePluginInstallationsLocked(
+                inspections,
+                grantsByPluginId,
+                expectedSnapshot,
+                true,
+                expectedPriorArtifacts
+        ));
+    }
+
+    /// Publishes a confirmed store plan with exact reusable dependencies and exact replacement prior state.
+    ///
+    /// `expectedPriorArtifacts` must contain every replacement ID. An empty optional means the plugin was absent when
+    /// the user confirmed an installation; a present identity means the user confirmed replacement of exactly those
+    /// package bytes. Both replacement and reuse expectations are re-read under the mutation lock before publication.
+    ///
+    /// @param inspections immutable inspected packages in dependency-first order
+    /// @param grantsByPluginId explicit user decisions indexed by inspected plugin ID
+    /// @param expectedReusableArtifacts exact identities for dependencies selected as `REUSE`
+    /// @param expectedPriorArtifacts exact prior state for every installation or update
+    /// @return immutable replacement manifests in the supplied order
+    /// @throws IOException if current package state differs from the confirmed plan or publication fails
+    public @Unmodifiable List<PluginManifest> stagePluginInstallations(
+            @Unmodifiable List<LocalPluginInspection> inspections,
+            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
+            @Unmodifiable Map<String, PluginArtifactIdentity> expectedReusableArtifacts,
+            @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts
+    ) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        @Unmodifiable Map<String, PluginArtifactIdentity> reusableSnapshot =
+                Map.copyOf(expectedReusableArtifacts);
+        @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> priorSnapshot =
+                Map.copyOf(expectedPriorArtifacts);
+        return mutationLock.call(() -> stagePluginInstallationsLocked(
+                inspections,
+                grantsByPluginId,
+                reusableSnapshot,
+                true,
+                priorSnapshot
+        ));
+    }
+
+    /// Publishes an installation batch while the shared package, state, and permission lock is held.
+    ///
+    /// @param inspections immutable inspected packages in dependency-first order
+    /// @param grantsByPluginId explicit user decisions indexed by inspected plugin ID
+    /// @param expectedReusableArtifacts exact dependency identities captured during planning
+    /// @param requireExpectedReusableArtifacts whether every reused dependency must match the planning snapshot
+    /// @param expectedPriorArtifacts exact prior state for every replacement ID
+    /// @return immutable replacement manifests in the supplied order
+    /// @throws IOException if validation, persistence, publication, or rollback fails
+    private @Unmodifiable List<PluginManifest> stagePluginInstallationsLocked(
+            @Unmodifiable List<LocalPluginInspection> inspections,
+            @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId,
+            @Unmodifiable Map<String, PluginArtifactIdentity> expectedReusableArtifacts,
+            boolean requireExpectedReusableArtifacts,
+            @Unmodifiable Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts
+    ) throws IOException {
+        stateStore.load(enabledStates, pendingUninstall);
+        if (inspections.isEmpty()) {
+            if (!grantsByPluginId.isEmpty()
+                    || !expectedReusableArtifacts.isEmpty()
+                    || !expectedPriorArtifacts.isEmpty()) {
+                throw new IllegalArgumentException("State expectations were supplied for an empty installation");
+            }
+            return List.of();
+        }
+        if (!packageMutationService.recover()) {
+            throw new IOException("A previous plugin installation transaction could not be recovered");
+        }
+        Map<String, LocalPluginInspection> inspectionsById = new LinkedHashMap<>();
+        Map<String, PluginManifest> replacements = new LinkedHashMap<>();
+        for (LocalPluginInspection inspection : inspections) {
+            Path source = inspection.sourcePackage;
+            PluginPackageRepository.validateLocalPackage(source);
+            PluginPackageMutationService.verifyPackageHash(source, inspection.sha256);
+            PluginManifest manifest = inspection.manifest;
+            if (manifest.getSchemaVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
+                throw new IOException("Only plugin API v" + PluginManifest.CURRENT_SCHEMA_VERSION
+                        + " packages can be installed; found schema " + manifest.getSchemaVersion()
+                        + " for " + manifest.getId());
+            }
+            if (!isLauncherCompatible(manifest)) {
+                throw new IOException("Plugin " + manifest.getId() + " requires launcher version "
+                        + manifest.getLauncherVersion() + " but this launcher is " + Metadata.VERSION);
+            }
+            if (inspectionsById.putIfAbsent(manifest.getId(), inspection) != null) {
+                throw new IOException("Plugin installation batch contains duplicate ID: " + manifest.getId());
+            }
+            replacements.put(manifest.getId(), manifest);
+        }
+
+        if (grantsByPluginId.size() != replacements.size()
+                || !grantsByPluginId.keySet().containsAll(replacements.keySet())) {
+            throw new IllegalArgumentException("Every inspected plugin must have exactly one permission decision");
+        }
+        for (String pluginId : replacements.keySet()) {
+            if (grantsByPluginId.get(pluginId) == null) {
+                throw new IllegalArgumentException("Missing permission decision for plugin " + pluginId);
+            }
+        }
+        installationStateGuard.validateReplacementPriorArtifacts(
+                Set.copyOf(replacements.keySet()),
+                expectedPriorArtifacts
+        );
+
+        Map<String, PluginManifest> installedBefore =
+                dependencyPlanner.readInstallPlanningManifests(plugins, pendingUninstall);
+        Map<String, PluginManifest> effectiveManifests = new LinkedHashMap<>(installedBefore);
+        effectiveManifests.putAll(replacements);
+        dependencyPlanner.validateReplacementGraph(effectiveManifests, replacements.keySet());
+        @Unmodifiable Set<String> plannedDependencyIds = requireExpectedReusableArtifacts
+                ? reusePolicy.validateDependencyClosure(
+                        Map.copyOf(effectiveManifests),
+                        Set.copyOf(replacements.keySet()),
+                        Set.copyOf(enabledStates),
+                        expectedReusableArtifacts
+                )
+                : reusePolicy.validateDependencyClosure(
+                        Map.copyOf(effectiveManifests),
+                        Set.copyOf(replacements.keySet()),
+                        Set.copyOf(enabledStates)
+                );
+
+        Set<String> nextEnabledStates = new HashSet<>(enabledStates);
+        nextEnabledStates.addAll(plannedDependencyIds);
+        Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        for (String pluginId : replacements.keySet()) {
+            if (!installedBefore.containsKey(pluginId)) {
+                nextEnabledStates.add(pluginId);
+            }
+            nextPendingUninstall.remove(pluginId);
+        }
+        Map<String, PluginPackageMutationService.InstallArtifact> installArtifacts = new LinkedHashMap<>();
+        for (Map.Entry<String, LocalPluginInspection> entry : inspectionsById.entrySet()) {
+            LocalPluginInspection inspection = entry.getValue();
+            installArtifacts.put(entry.getKey(), new PluginPackageMutationService.InstallArtifact(
+                    inspection.sourcePackage,
+                    inspection.manifest,
+                    inspection.sha256
+            ));
+        }
+        packageMutationService.publishInstallations(
+                installArtifacts,
+                () -> {
+                    for (Map.Entry<String, LocalPluginInspection> entry : inspectionsById.entrySet()) {
+                        permissionService.setGrantedPermissions(
+                                entry.getValue().manifest,
+                                entry.getValue().sha256,
+                                Objects.requireNonNull(grantsByPluginId.get(entry.getKey()))
+                        );
+                    }
+                },
+                () -> stateStore.saveStrict(nextEnabledStates, nextPendingUninstall),
+                permissionService::reload
+        );
+
+        enabledStates.clear();
+        enabledStates.addAll(nextEnabledStates);
+        pendingUninstall.clear();
+        pendingUninstall.addAll(nextPendingUninstall);
+        for (Map.Entry<String, PluginManifest> replacement : replacements.entrySet()) {
+            String pluginId = replacement.getKey();
+            LocalPluginInspection inspection = Objects.requireNonNull(inspectionsById.get(pluginId));
+            PluginArtifactIdentity identity = PluginArtifactIdentity.of(
+                    inspection.manifest,
+                    inspection.sha256
+            );
+            clearArtifactState(pluginId);
+            runtimeState.remember(identity);
+            setRuntimeStatus(identity, PluginRuntimeStatus.WAITING_FOR_RESTART, null);
+            Path installedPackage = pluginsDirectory.resolve(pluginId + ".npl").toAbsolutePath().normalize();
+            @Nullable PluginContainer container = pluginMap.get(pluginId);
+            if (container != null) {
+                container.setNplFile(installedPackage);
+                container.setRestartRequired(true);
+            }
+            LOG.info("Staged plugin for next restart: " + pluginId + " " + replacement.getValue().getVersion());
+        }
+        return List.copyOf(replacements.values());
+    }
+
+    /// Best-effort removes hidden staging files without changing transaction success or permission decisions.
+    ///
+    /// A committed journal owns any file that could not be removed and retries cleanup during the next startup.
+    /// Cleanup failure after publication must never restore old permissions while retaining new packages.
+    ///
+    /// @param preparedPackages hidden staging paths to remove when still present
+    static void cleanupPreparedPackages(@Unmodifiable List<Path> preparedPackages) {
+        PluginPackageMutationService.cleanupPreparedPackages(preparedPackages);
     }
 
     /// Uninstalls a plugin immediately when safe, otherwise marks it for restart-time removal.
@@ -831,22 +1801,62 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @throws IOException if package or directory deletion fails
     public void uninstallPlugin(String pluginId) throws IOException {
+        administrativeGuard.checkTrustedCaller();
+        mutationLock.run(() -> uninstallPluginLocked(pluginId));
+    }
+
+    /// Uninstalls one plugin while the shared mutation lock is held.
+    ///
+    /// @param pluginId plugin ID
+    /// @throws IOException if package, state, or permission mutation fails
+    private void uninstallPluginLocked(String pluginId) throws IOException {
+        stateStore.load(enabledStates, pendingUninstall);
         @Nullable PluginContainer container = pluginMap.get(pluginId);
-        if (container == null) {
+        @Unmodifiable List<Path> installedPackages = packageRepository.findInstalledPackages(pluginId);
+        if (container == null && installedPackages.isEmpty()) {
             return;
+        }
+        @Unmodifiable List<String> blockingDependents = dependencyPlanner.findBlockingDependents(
+                pluginId,
+                plugins,
+                pendingUninstall
+        );
+        if (!blockingDependents.isEmpty()) {
+            throw new IOException("Cannot uninstall plugin " + pluginId
+                    + " because installed plugins depend on it: " + blockingDependents);
         }
         if (requiresRestartForUninstall(pluginId)) {
-            markForUninstall(pluginId);
+            markForUninstallLocked(pluginId);
             return;
         }
-
-        Path nplFile = container.getNplFile();
-        unloadPlugin(pluginId);
-        Files.deleteIfExists(nplFile);
-        deletePluginDirectories(pluginId);
-        enabledStates.remove(pluginId);
-        pendingUninstall.remove(pluginId);
-        saveStates();
+        if (container != null) {
+            unloadPluginLocked(pluginId);
+        }
+        List<Path> packagesToRemove = new ArrayList<>(installedPackages);
+        if (container != null) {
+            packagesToRemove.add(container.getNplFile());
+        }
+        Set<String> nextEnabledStates = new HashSet<>(enabledStates);
+        Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        nextEnabledStates.remove(pluginId);
+        nextPendingUninstall.remove(pluginId);
+        packageMutationService.publishRemoval(
+                List.copyOf(packagesToRemove),
+                pluginId,
+                () -> {
+                    permissionService.removePlugin(pluginId);
+                    stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
+                },
+                () -> {
+                    permissionService.reload();
+                    stateStore.load(enabledStates, pendingUninstall);
+                }
+        );
+        enabledStates.clear();
+        enabledStates.addAll(nextEnabledStates);
+        pendingUninstall.clear();
+        pendingUninstall.addAll(nextPendingUninstall);
+        clearArtifactState(pluginId);
         LOG.info("Uninstalled plugin: " + pluginId);
     }
 
@@ -856,25 +1866,64 @@ public final class PluginManager {
     /// @return whether restart-time removal is required
     public boolean requiresRestartForUninstall(String pluginId) {
         @Nullable PluginContainer container = pluginMap.get(pluginId);
-        return container != null
-                && (container.isEnabled()
-                || container.getManifest().hasMixins() && isMixinActive(pluginId));
+        return isMixinActive(pluginId) || container != null && container.isEnabled();
     }
 
     /// Marks a plugin for removal before the next Mixin bootstrap and launcher load.
     ///
     /// @param pluginId plugin ID
     public void markForUninstall(String pluginId) {
+        administrativeGuard.checkTrustedCaller();
+        try {
+            mutationLock.run(() -> markForUninstallLocked(pluginId));
+        } catch (IOException exception) {
+            LOG.warning("Cannot durably mark plugin for uninstall: " + pluginId, exception);
+        }
+    }
+
+    /// Marks one plugin for restart-time removal while the shared mutation lock is held.
+    ///
+    /// @param pluginId plugin ID
+    /// @throws IOException if dependency inspection or durable state publication fails
+    private void markForUninstallLocked(String pluginId) throws IOException {
+        stateStore.load(enabledStates, pendingUninstall);
+        @Unmodifiable List<String> blockingDependents = dependencyPlanner.findBlockingDependents(
+                pluginId,
+                plugins,
+                pendingUninstall
+        );
+        if (!blockingDependents.isEmpty()) {
+            LOG.warning("Cannot mark plugin " + pluginId
+                    + " for uninstall because installed plugins depend on it: " + blockingDependents);
+            return;
+        }
+        Set<String> nextEnabledStates = new HashSet<>(enabledStates);
+        Set<String> nextPendingUninstall = new HashSet<>(pendingUninstall);
+        nextPendingUninstall.add(pluginId);
+        nextEnabledStates.remove(pluginId);
+        packageMutationService.publishDocuments(
+                () -> {
+                    permissionService.removePlugin(pluginId);
+                    stateStore.saveStrict(nextEnabledStates, nextPendingUninstall);
+                },
+                () -> {
+                    permissionService.reload();
+                    stateStore.load(enabledStates, pendingUninstall);
+                }
+        );
+
+        enabledStates.clear();
+        enabledStates.addAll(nextEnabledStates);
+        pendingUninstall.clear();
+        pendingUninstall.addAll(nextPendingUninstall);
         @Nullable PluginContainer container = pluginMap.get(pluginId);
         if (container != null && container.isEnabled()) {
-            disablePlugin(pluginId);
+            disablePluginLocked(pluginId);
         }
-        pendingUninstall.add(pluginId);
-        enabledStates.remove(pluginId);
+        clearArtifactState(pluginId);
         if (container != null) {
             container.setRestartRequired(true);
         }
-        saveStates();
         LOG.info("Marked plugin for uninstall on next restart: " + pluginId);
     }
 
@@ -883,7 +1932,49 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @return pending-uninstall state
     public boolean isMarkedForUninstall(String pluginId) {
-        return pendingUninstall.contains(pluginId);
+        stateLock.readLock().lock();
+        try {
+            return pendingUninstall.contains(pluginId);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+    }
+
+    /// Returns whether the plugin is configured to enable during this or the next launcher start.
+    ///
+    /// @param pluginId plugin ID
+    /// @return persisted desired enablement state
+    public boolean isPluginEnabled(String pluginId) {
+        stateLock.readLock().lock();
+        try {
+            return enabledStates.contains(pluginId);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+    }
+
+    /// Returns the authoritative state of the artifact currently published for one plugin ID.
+    ///
+    /// @param pluginId plugin ID
+    /// @return artifact-bound runtime state
+    public PluginRuntimeStatus getPluginRuntimeStatus(String pluginId) {
+        return artifactResolver.getRuntimeStatus(pluginId, enabledStates, pendingUninstall);
+    }
+
+    /// Returns the current artifact's policy, dependency, loading, or lifecycle diagnostic.
+    ///
+    /// @param pluginId plugin ID
+    /// @return artifact-bound detail or `null` when no diagnostic is present
+    public @Nullable String getPluginRuntimeDetail(String pluginId) {
+        return artifactResolver.getRuntimeDetail(pluginId);
+    }
+
+    /// Returns the current artifact's runtime diagnostic for compatibility with existing management UI.
+    ///
+    /// @param pluginId plugin ID
+    /// @return artifact-bound detail or `null`
+    public @Nullable String getPluginLoadFailure(String pluginId) {
+        return getPluginRuntimeDetail(pluginId);
     }
 
     /// Returns whether a plugin's Mixin configurations were registered before this launcher instance loaded.
@@ -891,16 +1982,7 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @return whether the plugin's Mixins are active
     public boolean isMixinActive(String pluginId) {
-        @Nullable String active = System.getProperty(HmclMixinBootstrap.ACTIVE_PROPERTY);
-        if (active == null || active.isBlank()) {
-            return false;
-        }
-        for (String activeId : active.split(",")) {
-            if (pluginId.equals(activeId)) {
-                return true;
-            }
-        }
-        return false;
+        return artifactResolver.isMixinActive(pluginId);
     }
 
     /// Returns an unmodifiable observable view of loaded plugins.
@@ -915,184 +1997,20 @@ public final class PluginManager {
     /// @param pluginId plugin ID
     /// @return loaded container or `null`
     public @Nullable PluginContainer getPlugin(String pluginId) {
-        return pluginMap.get(pluginId);
+        stateLock.readLock().lock();
+        try {
+            return pluginMap.get(pluginId);
+        } finally {
+            stateLock.readLock().unlock();
+        }
     }
 
     /// Returns the installed package directory.
     ///
     /// @return plugin package directory
     public Path getPluginsDirectory() {
+        administrativeGuard.checkTrustedCaller();
         return pluginsDirectory;
     }
 
-    /// Deletes extracted package, persistent storage, and Mixin cache directories for one plugin ID.
-    ///
-    /// @param pluginId plugin ID
-    /// @throws IOException if deletion fails
-    private void deletePluginDirectories(String pluginId) throws IOException {
-        FileUtils.deleteDirectory(pluginPackageDirectory.resolve(pluginId));
-        FileUtils.deleteDirectory(PluginPackageVersions.getPluginVersionsDirectory(
-                pluginPackageDirectory,
-                pluginId
-        ));
-        FileUtils.deleteDirectory(pluginStorageDirectory.resolve(pluginId));
-        FileUtils.deleteDirectory(pluginMixinCacheDirectory.resolve(pluginId));
-        FileUtils.deleteDirectory(PluginPackageVersions.getPluginVersionsDirectory(
-                pluginMixinCacheDirectory,
-                pluginId
-        ));
-    }
-
-    /// Lazily initialized singleton holder.
-    @NotNullByDefault
-    private static final class Holder {
-        /// Plugin manager singleton.
-        private static final PluginManager INSTANCE = new PluginManager();
-
-        /// Prevents construction of the holder.
-        private Holder() {
-        }
-    }
-
-    /// JSON representation persisted in `plugin-states.json`.
-    @NotNullByDefault
-    private static final class PluginStates {
-        /// IDs requested to be enabled, or `null` in malformed legacy files.
-        private @Nullable List<@Nullable String> enabled;
-
-        /// IDs awaiting uninstall, or `null` in malformed legacy files.
-        private @Nullable List<@Nullable String> pendingUninstall;
-
-        /// Creates an empty state object for Gson and saving.
-        private PluginStates() {
-        }
-    }
-
-    /// Package path and validated manifest discovered before dependency traversal.
-    @NotNullByDefault
-    private static final class PluginCandidate {
-        /// Installed package path.
-        private final Path nplFile;
-
-        /// Validated package manifest.
-        private final PluginManifest manifest;
-
-        /// Creates a package candidate.
-        ///
-        /// @param nplFile installed package path
-        /// @param manifest validated manifest
-        private PluginCandidate(Path nplFile, PluginManifest manifest) {
-            this.nplFile = nplFile;
-            this.manifest = manifest;
-        }
-    }
-
-    /// Dependency traversal state for one plugin ID.
-    @NotNullByDefault
-    private enum VisitState {
-        /// Candidate is currently being traversed.
-        VISITING,
-
-        /// Candidate traversal has completed successfully or unsuccessfully.
-        VISITED
-    }
-
-    /// Describes the background portion of a user-selected local plugin installation.
-    @NotNullByDefault
-    public static final class LocalPluginInstallation {
-        /// Validated package manifest.
-        private final PluginManifest manifest;
-
-        /// Prepared lifecycle value for a new plugin, or `null` for a restart-staged update.
-        private final @Nullable PreparedPlugin preparedPlugin;
-
-        /// Creates a local installation result.
-        ///
-        /// @param manifest validated package manifest
-        /// @param preparedPlugin prepared new plugin or `null` for an update
-        private LocalPluginInstallation(
-                PluginManifest manifest,
-                @Nullable PreparedPlugin preparedPlugin
-        ) {
-            this.manifest = manifest;
-            this.preparedPlugin = preparedPlugin;
-        }
-
-        /// Creates a result for a new plugin that is ready for JavaFX registration.
-        ///
-        /// @param preparedPlugin prepared plugin
-        /// @return prepared installation result
-        private static LocalPluginInstallation prepared(PreparedPlugin preparedPlugin) {
-            return new LocalPluginInstallation(preparedPlugin.getManifest(), preparedPlugin);
-        }
-
-        /// Creates a result for an existing plugin whose package is staged for restart.
-        ///
-        /// @param manifest replacement package manifest
-        /// @return restart-staged update result
-        private static LocalPluginInstallation staged(PluginManifest manifest) {
-            return new LocalPluginInstallation(manifest, null);
-        }
-
-        /// Returns the validated replacement or installation manifest.
-        ///
-        /// @return package manifest
-        public PluginManifest getManifest() {
-            return manifest;
-        }
-
-        /// Returns whether this update must wait for a launcher restart.
-        ///
-        /// @return whether no runtime registration should be attempted
-        public boolean isRestartRequired() {
-            return preparedPlugin == null;
-        }
-
-        /// Returns the prepared new plugin for JavaFX registration.
-        ///
-        /// @return prepared plugin
-        /// @throws IllegalStateException if this result represents a restart-staged update
-        public PreparedPlugin getPreparedPlugin() {
-            if (preparedPlugin == null) {
-                throw new IllegalStateException("Plugin update is staged for restart");
-            }
-            return preparedPlugin;
-        }
-    }
-
-    /// Holds a package whose I/O preparation is complete but whose JavaFX lifecycle registration is pending.
-    @NotNullByDefault
-    public static final class PreparedPlugin {
-        /// Loaded lifecycle implementation.
-        private final Plugin plugin;
-
-        /// Context prepared for the lifecycle implementation.
-        private final PluginContext context;
-
-        /// Validated package manifest.
-        private final PluginManifest manifest;
-
-        /// Installed package path.
-        private final Path nplFile;
-
-        /// Creates a prepared plugin value.
-        ///
-        /// @param plugin lifecycle implementation
-        /// @param context plugin context
-        /// @param manifest validated manifest
-        /// @param nplFile installed package path
-        private PreparedPlugin(Plugin plugin, PluginContext context, PluginManifest manifest, Path nplFile) {
-            this.plugin = plugin;
-            this.context = context;
-            this.manifest = manifest;
-            this.nplFile = nplFile;
-        }
-
-        /// Returns the validated manifest for installation UI decisions.
-        ///
-        /// @return plugin manifest
-        public PluginManifest getManifest() {
-            return manifest;
-        }
-    }
 }

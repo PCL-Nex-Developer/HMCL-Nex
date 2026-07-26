@@ -101,6 +101,17 @@ public final class PluginStoreRegistry {
         return values.stream().map(Objects::requireNonNull).toList();
     }
 
+    /// Finds a registry entry by its exact plugin ID.
+    ///
+    /// @param pluginId plugin ID
+    /// @return matching entry or `null`
+    public @Nullable PluginStoreEntry findPlugin(String pluginId) {
+        return getPlugins().stream()
+                .filter(entry -> entry.getId().equals(pluginId))
+                .findFirst()
+                .orElse(null);
+    }
+
     /// Validates registry structure, entry IDs, and duplicates.
     ///
     /// @throws IOException if the registry is malformed or unsupported

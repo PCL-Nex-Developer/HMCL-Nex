@@ -17,46 +17,80 @@
  */
 package org.jackhuang.hmcl.ui.main;
 
-import com.jfoenix.controls.JFXButton;
 import javafx.beans.property.ReadOnlyObjectProperty;
 import javafx.beans.property.ReadOnlyObjectWrapper;
-import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.Node;
 import javafx.scene.control.*;
 import javafx.scene.layout.*;
+import javafx.scene.text.TextAlignment;
 import javafx.stage.FileChooser;
+import org.jackhuang.hmcl.plugin.LocalPluginInspection;
 import org.jackhuang.hmcl.plugin.PluginContainer;
+import org.jackhuang.hmcl.plugin.PluginDependency;
 import org.jackhuang.hmcl.plugin.PluginManager;
+import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.PluginPermission;
+import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.plugin.loader.JavaScriptPluginLoader;
 import org.jackhuang.hmcl.task.Schedulers;
 import org.jackhuang.hmcl.task.Task;
 import org.jackhuang.hmcl.ui.Controllers;
 import org.jackhuang.hmcl.ui.FXUtils;
+import org.jackhuang.hmcl.ui.SVG;
 import org.jackhuang.hmcl.ui.construct.ComponentList;
+import org.jackhuang.hmcl.ui.construct.LineButton;
 import org.jackhuang.hmcl.ui.decorator.DecoratorPage;
+import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
+import java.util.Map;
+import java.util.Set;
 
 import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
+import static org.jackhuang.hmcl.ui.ToolbarListPageSkin.createToolbarButton2;
 
+/// Lists installed plugins and provides lifecycle, local installation, and JavaScript runtime actions.
+@NotNullByDefault
 public class PluginManagementPage extends VBox implements DecoratorPage {
+    /// Maximum weighted width of a plugin name before the installed list replaces its tail with an ellipsis.
+    private static final int ROW_TITLE_DISPLAY_UNITS = 40;
 
+    /// Maximum weighted width of a plugin description before the installed list replaces its tail with an ellipsis.
+    private static final int ROW_DESCRIPTION_DISPLAY_UNITS = 52;
+
+    /// Stable width reserved for the complete version and runtime status at the minimum launcher window size.
+    private static final double ROW_STATUS_WIDTH = 176;
+
+    /// Stable installed-plugin row height with room for two summary and two status lines.
+    private static final double PLUGIN_ROW_HEIGHT = 96;
+
+    /// Decorator navigation state for the plugin management page.
     private final ReadOnlyObjectWrapper<State> state = new ReadOnlyObjectWrapper<>(State.fromTitle(i18n("plugin.manage")));
 
+    /// Process-wide plugin lifecycle manager.
     private final PluginManager pluginManager = PluginManager.getInstance();
-    private final ComponentList pluginList = new ComponentList();
-    private final Label emptyHint = new Label();
-    private final Label jsEngineStatus = new Label();
 
+    /// Visual list containing installed plugin rows.
+    private final ComponentList pluginList = new ComponentList();
+
+    /// Current JavaScript runtime availability and related action.
+    private final LineButton jsEngineStatus = new LineButton();
+
+    /// Creates and populates the plugin management page.
     public PluginManagementPage() {
-        setSpacing(10);
+        getStyleClass().add("gray-background");
+        setSpacing(8);
         setPadding(new Insets(10));
 
         // JavaFX exposes desktop file drops consistently on Windows, macOS,
@@ -69,286 +103,316 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
                         && path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".npl"),
                 paths -> installPlugin(paths.get(0).toFile()));
 
-        // Top bar with buttons
         HBox topBar = new HBox(10);
         topBar.setAlignment(Pos.CENTER_LEFT);
 
-        JFXButton installButton = new JFXButton(i18n("plugin.install"));
-        installButton.getStyleClass().add("jfx-button-raised");
-        installButton.setOnAction(e -> installPlugin());
+        topBar.getChildren().addAll(
+                createToolbarButton2(i18n("plugin.install"), SVG.ADD, this::installPlugin),
+                createToolbarButton2(i18n("plugin.refresh"), SVG.REFRESH, this::refresh),
+                createToolbarButton2(
+                        i18n("plugin.open_folder"),
+                        SVG.FOLDER_OPEN,
+                        () -> FXUtils.openFolder(pluginManager.getPluginsDirectory())
+                )
+        );
 
-        JFXButton refreshButton = new JFXButton(i18n("plugin.refresh"));
-        refreshButton.setOnAction(e -> refresh());
-
-        JFXButton openFolderButton = new JFXButton(i18n("plugin.open_folder"));
-        openFolderButton.setOnAction(e -> FXUtils.openFolder(pluginManager.getPluginsDirectory()));
-
-        topBar.getChildren().addAll(installButton, refreshButton, openFolderButton);
-
-        // JavaScript engine status
         updateJsEngineStatus();
-        jsEngineStatus.setWrapText(true);
-        jsEngineStatus.setStyle("-fx-padding: 10; -fx-background-color: #f0f0f0; -fx-background-radius: 5;");
 
-        // Empty hint
-        emptyHint.setText(i18n("plugin.empty"));
-        emptyHint.setStyle("-fx-text-fill: gray; -fx-font-size: 14px;");
+        ComponentList runtimeList = new ComponentList();
+        runtimeList.getStyleClass().add("no-padding");
+        runtimeList.getContent().add(jsEngineStatus);
+        pluginList.getStyleClass().add("no-padding");
 
-        // Plugin list
-        ScrollPane scrollPane = new ScrollPane(pluginList);
+        VBox content = new VBox(8);
+        content.getChildren().addAll(
+                ComponentList.createComponentListTitle(i18n("plugin.runtime")),
+                runtimeList,
+                ComponentList.createComponentListTitle(i18n("plugin.installed")),
+                pluginList
+        );
+
+        ScrollPane scrollPane = new ScrollPane(content);
         scrollPane.setFitToWidth(true);
         scrollPane.setFitToHeight(true);
         VBox.setVgrow(scrollPane, Priority.ALWAYS);
+        FXUtils.smoothScrolling(scrollPane);
+        FXUtils.setOverflowHidden(scrollPane, 8);
 
-        getChildren().addAll(topBar, jsEngineStatus, scrollPane);
+        getChildren().addAll(topBar, scrollPane);
 
         refresh();
     }
 
+    /// Refreshes the JavaScript runtime status and its install or uninstall action.
     private void updateJsEngineStatus() {
+        jsEngineStatus.setLeading(SVG.EXTENSION);
         if (JavaScriptPluginLoader.isEngineAvailable()) {
-            jsEngineStatus.setText(i18n("plugin.js_engine_available") + ": " + JavaScriptPluginLoader.getEngineName());
-            jsEngineStatus.setStyle("-fx-padding: 10; -fx-background-color: #d4edda; -fx-background-radius: 5; -fx-text-fill: #155724;");
-            jsEngineStatus.setGraphic(null);
+            jsEngineStatus.setTitle(i18n("plugin.js_engine_available"));
+            jsEngineStatus.setSubtitle(JavaScriptPluginLoader.getEngineName());
+            jsEngineStatus.setTrailingText(null);
+            jsEngineStatus.setMouseTransparent(true);
         } else if (org.jackhuang.hmcl.plugin.loader.NodeJSManager.isNodeInstalled()) {
-            jsEngineStatus.setText(i18n("plugin.nodejs_installed") + ": Node.js " + org.jackhuang.hmcl.plugin.loader.NodeJSManager.NODE_VERSION);
-            jsEngineStatus.setStyle("-fx-padding: 10; -fx-background-color: #d4edda; -fx-background-radius: 5; -fx-text-fill: #155724;");
-
-            JFXButton uninstallBtn = new JFXButton(i18n("plugin.nodejs_uninstall"));
-            uninstallBtn.setOnAction(e -> uninstallNodeJS());
-            jsEngineStatus.setGraphic(uninstallBtn);
+            jsEngineStatus.setTitle(i18n("plugin.nodejs_installed"));
+            jsEngineStatus.setSubtitle("Node.js " + org.jackhuang.hmcl.plugin.loader.NodeJSManager.NODE_VERSION);
+            jsEngineStatus.setTrailingText(i18n("plugin.nodejs_uninstall"));
+            jsEngineStatus.setMouseTransparent(false);
+            jsEngineStatus.setOnAction(event -> uninstallNodeJS());
         } else {
-            jsEngineStatus.setText(i18n("plugin.js_engine_unavailable") + "\n" +
-                    i18n("plugin.js_engine_info") + ": " + JavaScriptPluginLoader.getSystemInfo());
-            jsEngineStatus.setStyle("-fx-padding: 10; -fx-background-color: #fff3cd; -fx-background-radius: 5; -fx-text-fill: #856404;");
-
-            JFXButton downloadLink = new JFXButton(i18n("plugin.js_engine_download"));
-            downloadLink.getStyleClass().add("jfx-button-raised");
-            downloadLink.setOnAction(e -> downloadNodeJS());
-            jsEngineStatus.setGraphic(downloadLink);
+            jsEngineStatus.setTitle(i18n("plugin.js_engine_unavailable"));
+            jsEngineStatus.setSubtitle(i18n("plugin.js_engine_info") + ": " + JavaScriptPluginLoader.getSystemInfo());
+            jsEngineStatus.setTrailingText(i18n("plugin.js_engine_download"));
+            jsEngineStatus.setMouseTransparent(false);
+            jsEngineStatus.setOnAction(event -> downloadNodeJS());
         }
     }
 
+    /// Confirms, downloads, and installs the managed Node.js runtime.
     private void downloadNodeJS() {
-        String downloadUrl = org.jackhuang.hmcl.plugin.loader.NodeJSManager.getDownloadUrl();
+        @Nullable String downloadUrl = org.jackhuang.hmcl.plugin.loader.NodeJSManager.getDownloadUrl();
         if (downloadUrl == null) {
-            Alert alert = new Alert(Alert.AlertType.ERROR);
-            alert.setTitle(i18n("plugin.js_engine_download"));
-            alert.setHeaderText(i18n("plugin.js_engine_unsupported_platform"));
-            alert.setContentText(org.jackhuang.hmcl.plugin.loader.NodeJSManager.getPlatformDescription());
-            alert.initOwner(Controllers.getStage());
-            alert.showAndWait();
+            PluginDialogs.showError(
+                    i18n("plugin.js_engine_unsupported_platform"),
+                    org.jackhuang.hmcl.plugin.loader.NodeJSManager.getPlatformDescription()
+            );
             return;
         }
 
-        Alert confirmation = new Alert(Alert.AlertType.CONFIRMATION);
-        confirmation.setTitle(i18n("plugin.js_engine_download_header"));
-        confirmation.setHeaderText(null);
-        confirmation.setContentText(i18n("plugin.js_engine_download_prompt",
-                org.jackhuang.hmcl.plugin.loader.NodeJSManager.NODE_VERSION,
-                org.jackhuang.hmcl.plugin.loader.NodeJSManager.getPlatformDescription()));
-        confirmation.initOwner(Controllers.getStage());
-
-        Optional<ButtonType> result = confirmation.showAndWait();
-        if (result.isPresent() && result.get() == ButtonType.OK) {
-            Alert progressAlert = new Alert(Alert.AlertType.INFORMATION);
-            progressAlert.setTitle(i18n("plugin.js_engine_downloading"));
-            progressAlert.setHeaderText(i18n("plugin.js_engine_downloading"));
-            progressAlert.setContentText(i18n("plugin.js_engine_extracting"));
-            progressAlert.initOwner(Controllers.getStage());
-            progressAlert.show();
-
-            Task.runAsync(() -> {
-                try {
-                    org.jackhuang.hmcl.plugin.loader.NodeJSManager.downloadAndInstall();
-                } catch (IOException e) {
-                    LOG.error("Failed to download Node.js", e);
-                    throw new RuntimeException(e);
-                }
-            }).whenComplete(Schedulers.javafx(), (r, exception) -> {
-                progressAlert.close();
-                if (exception != null) {
-                    Alert alert = new Alert(Alert.AlertType.ERROR);
-                    alert.setTitle(i18n("plugin.js_engine_download"));
-                    alert.setHeaderText(i18n("plugin.js_engine_install_failed"));
-                    alert.setContentText(exception.getMessage());
-                    alert.initOwner(Controllers.getStage());
-                    alert.showAndWait();
-                } else {
-                    Alert alert = new Alert(Alert.AlertType.INFORMATION);
-                    alert.setTitle(i18n("plugin.js_engine_download"));
-                    alert.setHeaderText(i18n("plugin.js_engine_installed"));
-                    alert.setContentText(i18n("plugin.js_engine_installed"));
-                    alert.initOwner(Controllers.getStage());
-                    alert.showAndWait();
-                    updateJsEngineStatus();
-                }
-            }).start();
-        }
+        PluginDialogs.confirmAction(
+                i18n("plugin.js_engine_download_header"),
+                i18n(
+                        "plugin.js_engine_download_prompt",
+                        org.jackhuang.hmcl.plugin.loader.NodeJSManager.NODE_VERSION,
+                        org.jackhuang.hmcl.plugin.loader.NodeJSManager.getPlatformDescription()
+                ),
+                i18n("plugin.js_engine_download"),
+                this::installNodeJS
+        );
     }
 
+    /// Downloads and extracts the managed Node.js runtime with an HMCL progress pane.
+    private void installNodeJS() {
+        PluginDialogs.ProgressDialog progressDialog = PluginDialogs.showProgress(
+                i18n("plugin.js_engine_downloading"),
+                i18n("plugin.js_engine_extracting")
+        );
+        Task.runAsync(() -> {
+            try {
+                org.jackhuang.hmcl.plugin.loader.NodeJSManager.downloadAndInstall();
+            } catch (IOException exception) {
+                LOG.error("Failed to download Node.js", exception);
+                throw new RuntimeException(exception);
+            }
+        }).whenComplete(Schedulers.javafx(), (@Nullable var result, @Nullable var exception) -> {
+            progressDialog.close();
+            if (exception != null) {
+                PluginDialogs.showError(i18n("plugin.js_engine_install_failed"), failureMessage(exception));
+                return;
+            }
+            updateJsEngineStatus();
+            Controllers.dialog(
+                    i18n("plugin.js_engine_installed"),
+                    i18n("plugin.js_engine_download"),
+                    org.jackhuang.hmcl.ui.construct.MessageDialogPane.MessageType.SUCCESS
+            );
+        }).start();
+    }
+
+    /// Confirms and removes the managed Node.js runtime.
     private void uninstallNodeJS() {
-        Alert confirmation = new Alert(Alert.AlertType.CONFIRMATION);
-        confirmation.setTitle(i18n("plugin.nodejs_uninstall"));
-        confirmation.setHeaderText(null);
-        confirmation.setContentText(i18n("plugin.nodejs_uninstall") + "?");
-        confirmation.initOwner(Controllers.getStage());
-
-        Optional<ButtonType> result = confirmation.showAndWait();
-        if (result.isPresent() && result.get() == ButtonType.OK) {
-            Task.runAsync(() -> {
-                try {
-                    org.jackhuang.hmcl.plugin.loader.NodeJSManager.uninstall();
-                } catch (IOException e) {
-                    LOG.error("Failed to uninstall Node.js", e);
-                    throw new RuntimeException(e);
-                }
-            }).whenComplete(Schedulers.javafx(), (r, exception) -> {
-                if (exception != null) {
-                    Alert alert = new Alert(Alert.AlertType.ERROR);
-                    alert.setTitle(i18n("plugin.nodejs_uninstall"));
-                    alert.setHeaderText(i18n("plugin.uninstall_failed"));
-                    alert.setContentText(exception.getMessage());
-                    alert.initOwner(Controllers.getStage());
-                    alert.showAndWait();
-                } else {
-                    updateJsEngineStatus();
-                }
-            }).start();
-        }
+        PluginDialogs.confirmAction(
+                i18n("plugin.nodejs_uninstall"),
+                i18n("plugin.nodejs_uninstall") + "?",
+                i18n("plugin.nodejs_uninstall"),
+                this::removeNodeJS
+        );
     }
 
-    private void showJsDownloadInfo() {
-        downloadNodeJS();
+    /// Removes the managed Node.js runtime asynchronously.
+    private void removeNodeJS() {
+        PluginDialogs.ProgressDialog progressDialog = PluginDialogs.showProgress(
+                i18n("plugin.nodejs_uninstall"),
+                i18n("plugin.nodejs_uninstall")
+        );
+        Task.runAsync(() -> {
+            try {
+                org.jackhuang.hmcl.plugin.loader.NodeJSManager.uninstall();
+            } catch (IOException exception) {
+                LOG.error("Failed to uninstall Node.js", exception);
+                throw new RuntimeException(exception);
+            }
+        }).whenComplete(Schedulers.javafx(), (@Nullable var result, @Nullable var exception) -> {
+            progressDialog.close();
+            if (exception != null) {
+                PluginDialogs.showError(i18n("plugin.uninstall_failed"), failureMessage(exception));
+                return;
+            }
+            updateJsEngineStatus();
+        }).start();
     }
 
+    /// Rebuilds the installed plugin list from the manager's observable state.
+    @Override
     public void refresh() {
         pluginList.getContent().clear();
 
-        if (pluginManager.getPlugins().isEmpty()) {
-            pluginList.getContent().add(emptyHint);
+        @Unmodifiable Map<String, PluginManifest> installedManifests;
+        try {
+            installedManifests = pluginManager.getPublishedPluginManifests();
+        } catch (IOException exception) {
+            LOG.warning("Failed to enumerate installed plugins", exception);
+            LineButton failure = new LineButton();
+            failure.setLeading(SVG.ERROR);
+            failure.setTitle(i18n("plugin.installed.load_failed"));
+            failure.setSubtitle(failureMessage(exception));
+            failure.setMouseTransparent(true);
+            pluginList.getContent().add(failure);
+            return;
+        }
+
+        if (installedManifests.isEmpty()) {
+            LineButton empty = new LineButton();
+            empty.setLeading(SVG.INFO);
+            empty.setTitle(i18n("plugin.empty"));
+            empty.setSubtitle(i18n("plugin.empty.description"));
+            empty.setMouseTransparent(true);
+            pluginList.getContent().add(empty);
         } else {
-            for (PluginContainer container : pluginManager.getPlugins()) {
-                pluginList.getContent().add(createPluginItem(container));
-            }
+            installedManifests.values().stream()
+                    .sorted((left, right) -> left.getName().compareToIgnoreCase(right.getName()))
+                    .forEach(manifest -> pluginList.getContent().add(createPluginItem(
+                            manifest,
+                            pluginManager.getPlugin(manifest.getId())
+                    )));
         }
     }
 
-    private VBox createPluginItem(PluginContainer container) {
-        VBox item = new VBox(5);
-        item.setPadding(new Insets(10));
-
-        boolean markedForUninstall = pluginManager.isMarkedForUninstall(container.getManifest().getId());
-
-        if (markedForUninstall) {
-            item.setStyle("-fx-background-color: #fff5f5; -fx-border-color: #ffcdd2; -fx-border-width: 1; -fx-border-radius: 5; -fx-background-radius: 5;");
-        } else {
-            item.setStyle("-fx-background-color: white; -fx-border-color: #e0e0e0; -fx-border-width: 1; -fx-border-radius: 5; -fx-background-radius: 5;");
-        }
-
-        // Header with name and version
-        HBox header = new HBox(10);
-        header.setAlignment(Pos.CENTER_LEFT);
-
-        Label nameLabel = new Label(container.getManifest().getName());
-        if (markedForUninstall) {
-            nameLabel.setStyle("-fx-font-size: 16px; -fx-font-weight: bold; -fx-strikethrough: true; -fx-font-style: italic; -fx-text-fill: #999;");
-        } else {
-            nameLabel.setStyle("-fx-font-size: 16px; -fx-font-weight: bold;");
-        }
-
-        Label versionLabel = new Label("v" + container.getManifest().getVersion());
-        if (markedForUninstall) {
-            versionLabel.setStyle("-fx-text-fill: #999; -fx-strikethrough: true; -fx-font-style: italic;");
-        } else {
-            versionLabel.setStyle("-fx-text-fill: gray;");
-        }
-
-        String typeText = container.getManifest().getType().name()
-                + (container.getManifest().hasMixins() ? " + MIXIN" : "");
-        Label typeLabel = new Label("[" + typeText + "]");
-        typeLabel.setStyle("-fx-text-fill: -monet-primary; -fx-font-size: 12px;");
-
-        Region spacer = new Region();
-        HBox.setHgrow(spacer, Priority.ALWAYS);
-
-        // Status indicator
-        Label statusLabel = new Label();
-        if (markedForUninstall) {
-            statusLabel.setText(i18n("plugin.pending_uninstall"));
-            statusLabel.setStyle("-fx-text-fill: #d32f2f; -fx-font-weight: bold;");
-        } else if (container.isRestartRequired()) {
-            statusLabel.setText(i18n("plugin.restart_pending"));
-            statusLabel.setStyle("-fx-text-fill: #e65100; -fx-font-weight: bold;");
-        } else if (container.isEnabled()) {
-            statusLabel.setText(i18n("plugin.enabled"));
-            statusLabel.setStyle("-fx-text-fill: green; -fx-font-weight: bold;");
-        } else {
-            statusLabel.setText(i18n("plugin.disabled"));
-            statusLabel.setStyle("-fx-text-fill: gray;");
-        }
-
-        header.getChildren().addAll(nameLabel, versionLabel, typeLabel, spacer, statusLabel);
-
-        // Info
-        VBox info = new VBox(3);
-
-        if (!container.getManifest().getDescription().isEmpty()) {
-            Label descLabel = new Label(container.getManifest().getDescription());
-            descLabel.setWrapText(true);
-            descLabel.setStyle("-fx-text-fill: #666;");
-            info.getChildren().add(descLabel);
-        }
-
-        if (!container.getManifest().getAuthor().isEmpty()) {
-            Label authorLabel = new Label(i18n("plugin.author") + ": " + container.getManifest().getAuthor());
-            authorLabel.setStyle("-fx-text-fill: #999; -fx-font-size: 12px;");
-            info.getChildren().add(authorLabel);
-        }
-
-        Label idLabel = new Label("ID: " + container.getManifest().getId());
-        idLabel.setStyle("-fx-text-fill: #999; -fx-font-size: 11px;");
-        info.getChildren().add(idLabel);
-
-        // Buttons
-        HBox buttons = new HBox(10);
-        buttons.setAlignment(Pos.CENTER_RIGHT);
-
-        if (!markedForUninstall) {
-            JFXButton toggleButton = new JFXButton();
-            if (container.isEnabled()) {
-                toggleButton.setText(i18n("plugin.disable"));
-                toggleButton.setOnAction(e -> {
-                    pluginManager.disablePlugin(container.getManifest().getId());
-                    Platform.runLater(() -> {
-                        refresh();
-                        PluginDialogs.showRestartRequired(i18n("plugin.restart_required.disable"));
-                    });
-                });
-            } else {
-                toggleButton.setText(i18n("plugin.enable"));
-                toggleButton.getStyleClass().add("jfx-button-raised");
-                toggleButton.setOnAction(e -> {
-                    pluginManager.enablePlugin(container.getManifest().getId());
-                    Platform.runLater(() -> {
-                        refresh();
-                        PluginDialogs.showRestartRequired(i18n("plugin.restart_required.enable"));
-                    });
-                });
-            }
-
-            JFXButton uninstallButton = new JFXButton(i18n("plugin.uninstall"));
-            uninstallButton.setStyle("-fx-text-fill: red;");
-            uninstallButton.setOnAction(e -> uninstallPlugin(container));
-
-            buttons.getChildren().addAll(toggleButton, uninstallButton);
-        }
-
-        item.getChildren().addAll(header, info, buttons);
-
-        return item;
+    /// Builds one installed plugin row with status and lifecycle actions.
+    ///
+    /// @param manifest installed plugin manifest
+    /// @param container loaded plugin container or `null`
+    /// @return plugin row
+    private LineButton createPluginItem(PluginManifest manifest, @Nullable PluginContainer container) {
+        LineButton row = LineButton.createNavigationButton();
+        row.setLeading(SVG.EXTENSION);
+        row.setTitle(summarizeDisplayText(manifest.getName(), ROW_TITLE_DISPLAY_UNITS));
+        String subtitleSource = manifest.getDescription().isBlank()
+                ? manifest.getId()
+                : manifest.getDescription();
+        row.setSubtitle(summarizeDisplayText(subtitleSource, ROW_DESCRIPTION_DISPLAY_UNITS));
+        PluginRuntimeStatus runtimeStatus = pluginManager.getPluginRuntimeStatus(manifest.getId());
+        @Nullable String runtimeDetail = pluginManager.getPluginRuntimeDetail(manifest.getId());
+        row.setTrailingText(null);
+        row.setTrailingIcon(createRuntimeStatusGroup(manifest.getVersion(), runtimeStatus));
+        FXUtils.setLimitHeight(row, PLUGIN_ROW_HEIGHT);
+        configurePluginRowTooltip(row, manifest, runtimeDetail);
+        row.setOnAction(event -> Controllers.navigate(new PluginPermissionManagementPage(
+                manifest,
+                container,
+                this::refresh
+        )));
+        return row;
     }
 
+    /// Builds a fixed-width, right-aligned status group without the ellipsis behavior of `LineButton.trailingText`.
+    ///
+    /// @param version installed plugin version
+    /// @param status exact artifact runtime state
+    /// @return stable version, status, and navigation-arrow group
+    private static HBox createRuntimeStatusGroup(String version, PluginRuntimeStatus status) {
+        Label versionLabel = new Label("v" + version);
+        versionLabel.getStyleClass().add("subtitle-label");
+        versionLabel.setAlignment(Pos.CENTER_RIGHT);
+        versionLabel.setMaxWidth(Double.MAX_VALUE);
+
+        Label statusLabel = new Label(PluginPermissionManagementPage.runtimeStatusLabel(status));
+        statusLabel.getStyleClass().add("trailing-label");
+        statusLabel.setAlignment(Pos.CENTER_RIGHT);
+        statusLabel.setTextAlignment(TextAlignment.RIGHT);
+        statusLabel.setWrapText(true);
+        statusLabel.setMinHeight(Region.USE_PREF_SIZE);
+        statusLabel.setMaxWidth(Double.MAX_VALUE);
+
+        VBox statusText = new VBox(2, versionLabel, statusLabel);
+        statusText.setAlignment(Pos.CENTER_RIGHT);
+        FXUtils.setLimitWidth(statusText, ROW_STATUS_WIDTH);
+
+        Node arrow = SVG.ARROW_FORWARD.createIcon(20);
+        arrow.getStyleClass().add("trailing-icon");
+        arrow.setMouseTransparent(true);
+
+        HBox trailing = new HBox(8, statusText, arrow);
+        trailing.setAlignment(Pos.CENTER_RIGHT);
+        trailing.setMinWidth(Region.USE_PREF_SIZE);
+        trailing.setAccessibleText(versionLabel.getText() + ", " + statusLabel.getText());
+        return trailing;
+    }
+
+    /// Adds complete metadata and artifact-bound diagnostics without placing long prose in the row layout.
+    ///
+    /// @param row installed plugin navigation row
+    /// @param manifest installed plugin manifest
+    /// @param runtimeDetail exact runtime diagnostic or `null`
+    private static void configurePluginRowTooltip(
+            LineButton row,
+            PluginManifest manifest,
+            @Nullable String runtimeDetail
+    ) {
+        List<String> sections = new ArrayList<>();
+        sections.add(manifest.getName());
+        if (!manifest.getDescription().isBlank()) {
+            sections.add(manifest.getDescription().trim());
+        }
+        if (runtimeDetail != null && !runtimeDetail.isBlank()) {
+            sections.add(runtimeDetail.trim());
+        }
+        Tooltip tooltip = new Tooltip(String.join("\n\n", sections));
+        tooltip.setWrapText(true);
+        tooltip.setMaxWidth(520);
+        Tooltip.install(row, tooltip);
+    }
+
+    /// Normalizes one row string and bounds its weighted display width for the minimum launcher window.
+    ///
+    /// ASCII code points count as one unit and wider Unicode code points count as two. The returned value is always a
+    /// single normalized paragraph; callers rely on the row width to wrap it to at most two short visual lines.
+    ///
+    /// @param value source text
+    /// @param maximumUnits maximum weighted display width
+    /// @return normalized and possibly ellipsized text
+    static String summarizeDisplayText(String value, int maximumUnits) {
+        if (maximumUnits < 3) {
+            throw new IllegalArgumentException("maximumUnits must be at least 3");
+        }
+        String normalized = value.trim().replaceAll("\\s+", " ");
+        if (displayUnits(normalized) <= maximumUnits) {
+            return normalized;
+        }
+
+        StringBuilder result = new StringBuilder();
+        int usedUnits = 0;
+        int contentLimit = maximumUnits - 2;
+        for (int offset = 0; offset < normalized.length();) {
+            int codePoint = normalized.codePointAt(offset);
+            int codePointUnits = codePoint <= 0x7f ? 1 : 2;
+            if (usedUnits + codePointUnits > contentLimit) {
+                break;
+            }
+            result.appendCodePoint(codePoint);
+            usedUnits += codePointUnits;
+            offset += Character.charCount(codePoint);
+        }
+        return result.toString().stripTrailing() + "\u2026";
+    }
+
+    /// Counts deterministic narrow and wide display units for installed-plugin row summaries.
+    ///
+    /// @param value normalized row text
+    /// @return weighted display width
+    private static int displayUnits(String value) {
+        return value.codePoints().map(codePoint -> codePoint <= 0x7f ? 1 : 2).sum();
+    }
+
+    /// Opens a file chooser for one local `.npl` package.
     private void installPlugin() {
         FileChooser fileChooser = new FileChooser();
         fileChooser.setTitle(i18n("plugin.install"));
@@ -356,14 +420,16 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
                 new FileChooser.ExtensionFilter(i18n("plugin.file"), "*.npl")
         );
 
-        File file = fileChooser.showOpenDialog(Controllers.getStage());
+        @Nullable File file = fileChooser.showOpenDialog(Controllers.getStage());
         if (file != null) {
             installPlugin(file);
         }
     }
 
+    /// Inspects a selected package and asks for metadata-aware confirmation before installation mutates state.
+    ///
+    /// @param file selected local package
     private void installPlugin(File file) {
-        String pluginName = file.getName();
         Path pluginPath = file.toPath();
 
         if (!Files.isRegularFile(pluginPath) || !Files.isReadable(pluginPath)) {
@@ -371,113 +437,144 @@ public class PluginManagementPage extends VBox implements DecoratorPage {
             return;
         }
 
-        // Show warning dialog asynchronously
-        PluginDialogs.confirmPluginInstall(pluginName, confirmed -> {
-            if (!confirmed) {
+        PluginDialogs.ProgressDialog inspectionDialog = PluginDialogs.showProgress(
+                i18n("plugin.install"),
+                i18n("plugin.local.inspecting")
+        );
+
+        Task.supplyAsync(() -> {
+            try {
+                return pluginManager.inspectLocalPluginPackage(pluginPath);
+            } catch (IOException exception) {
+                LOG.error("Failed to inspect local plugin package", exception);
+                throw new RuntimeException(exception);
+            }
+        }).whenComplete(Schedulers.javafx(), (@Nullable var inspection, @Nullable var exception) -> {
+            inspectionDialog.close();
+            if (exception != null) {
+                showInstallError(exception);
                 return;
             }
-
-            // User confirmed, proceed with installation
-            Task.supplyAsync(() -> {
-                try {
-                    // Validate and copy in the background. Existing IDs are staged for restart
-                    // instead of being registered a second time in the current JVM.
-                    return pluginManager.prepareLocalPluginInstallation(pluginPath);
-                } catch (IOException e) {
-                    LOG.error("Failed to prepare plugin", e);
-                    throw new RuntimeException(e);
-                }
-            }).whenComplete(Schedulers.javafx(), (installation, exception) -> {
-                if (exception != null) {
-                    showInstallError(exception);
-                } else {
-                    // Register and enable plugin on JavaFX thread
-                    try {
-                        if (installation.isRestartRequired()) {
-                            refresh();
-                            PluginDialogs.showInstallFinishedAndOfferRestart(
-                                    installation.getManifest().getName()
-                            );
-                            return;
-                        }
-                        PluginContainer container = pluginManager.registerPreparedPlugin(
-                                installation.getPreparedPlugin()
-                        );
-                        pluginManager.enablePlugin(container.getManifest().getId());
-                        refresh();
-                        PluginDialogs.showInstallFinishedAndOfferRestart(pluginName);
-                    } catch (Exception e) {
-                        LOG.error("Failed to register plugin", e);
-                        showInstallError(e);
-                    }
-                }
-            }).start();
-        });
+            confirmLocalPluginInstallation(inspection);
+        }).start();
     }
 
+    /// Shows package permissions and update deltas, then stages the exact inspected bytes for restart.
+    ///
+    /// @param inspection immutable package inspection produced before any installation mutation
+    private void confirmLocalPluginInstallation(LocalPluginInspection inspection) {
+        PluginManifest manifest = inspection.getManifest();
+        String pluginName = manifest.getName().isBlank()
+                ? inspection.getSourcePackage().getFileName().toString()
+                : manifest.getName();
+
+        @Unmodifiable Set<PluginPermission> suggestedPermissions;
+        try {
+            suggestedPermissions = pluginManager.getSuggestedGrantedPermissions(inspection);
+        } catch (IOException exception) {
+            showInstallError(exception);
+            return;
+        }
+
+        @Nullable PluginManifest oldManifest = inspection.getOldManifest();
+
+        PluginPermissionRequest permissionRequest = new PluginPermissionRequest(
+                manifest.getId(),
+                pluginName,
+                manifest.getVersion(),
+                manifest.getRequiredPermissions(),
+                manifest.getOptionalPermissions(),
+                suggestedPermissions,
+                true,
+                oldManifest != null,
+                oldManifest == null ? List.of() : oldManifest.getRequiredPermissions(),
+                oldManifest == null ? List.of() : oldManifest.getOptionalPermissions()
+        );
+
+        PluginDialogs.confirmPluginInstall(
+                pluginName,
+                oldManifest != null,
+                List.of(permissionRequest),
+                formatLocalInstallPlan(inspection),
+                grantsByPluginId -> {
+                    @Unmodifiable Set<PluginPermission> grantedPermissions =
+                            grantsByPluginId.getOrDefault(manifest.getId(), Set.of());
+                    Task.runAsync(() -> {
+                        try {
+                            pluginManager.stagePluginInstallations(
+                                    List.of(inspection),
+                                    Map.of(manifest.getId(), grantedPermissions)
+                            );
+                        } catch (IOException exception) {
+                            LOG.error("Failed to stage plugin", exception);
+                            throw new RuntimeException(exception);
+                        }
+                    }).whenComplete(Schedulers.javafx(), (@Nullable var result, @Nullable var exception) -> {
+                        if (exception != null) {
+                            showInstallError(exception);
+                        } else {
+                            refresh();
+                            PluginDialogs.showInstallFinishedAndOfferRestart(pluginName);
+                        }
+                    }).start();
+                }
+        );
+    }
+
+    /// Formats the root package action and declared dependency constraints for local confirmation.
+    ///
+    /// @param inspection inspected package and optional installed manifest
+    /// @return immutable confirmation plan rows
+    private static @Unmodifiable List<String> formatLocalInstallPlan(
+            LocalPluginInspection inspection
+    ) {
+        PluginManifest manifest = inspection.getManifest();
+        @Nullable PluginManifest oldManifest = inspection.getOldManifest();
+        List<String> rows = new ArrayList<>();
+        if (oldManifest == null) {
+            rows.add(i18n("plugin.local.plan.install", manifest.getName(), manifest.getVersion()));
+        } else {
+            rows.add(i18n(
+                    "plugin.local.plan.update",
+                    manifest.getName(),
+                    oldManifest.getVersion(),
+                    manifest.getVersion()
+            ));
+        }
+        rows.add(i18n("plugin.local.plan.launcher", manifest.getLauncherVersion()));
+        for (PluginDependency dependency : manifest.getPluginDependencies()) {
+            rows.add(i18n(
+                    "plugin.local.plan.dependency",
+                    dependency.getId(),
+                    dependency.getVersion()
+            ));
+        }
+        return List.copyOf(rows);
+    }
+
+    /// Shows the root cause of a local installation failure.
+    ///
+    /// @param exception asynchronous or direct installation failure
     private void showInstallError(Throwable exception) {
+        PluginDialogs.showError(i18n("plugin.install_failed"), failureMessage(exception));
+    }
+
+    /// Unwraps nested asynchronous failures into a stable message.
+    ///
+    /// @param exception failure to unwrap
+    /// @return root-cause message
+    private static String failureMessage(Throwable exception) {
         Throwable cause = exception;
         while (cause.getCause() != null) {
             cause = cause.getCause();
         }
-        String message = cause.getMessage() != null ? cause.getMessage() : cause.toString();
-        Alert alert = new Alert(Alert.AlertType.ERROR);
-        alert.setTitle(i18n("plugin.install"));
-        alert.setHeaderText(i18n("plugin.install_failed"));
-        alert.setContentText(message);
-        alert.initOwner(Controllers.getStage());
-        alert.showAndWait();
+        @Nullable String message = cause.getMessage();
+        return message == null || message.isBlank() ? cause.toString() : message;
     }
 
-    private void uninstallPlugin(PluginContainer container) {
-        boolean wasEnabled = container.isEnabled();
-
-        Alert confirmation = new Alert(Alert.AlertType.CONFIRMATION);
-        confirmation.setTitle(i18n("plugin.uninstall"));
-        confirmation.setHeaderText(i18n("plugin.uninstall_confirm"));
-        confirmation.setContentText(container.getManifest().getName() + " v" + container.getManifest().getVersion());
-        confirmation.initOwner(Controllers.getStage());
-
-        Optional<ButtonType> result = confirmation.showAndWait();
-        if (result.isPresent() && result.get() == ButtonType.OK) {
-            String pluginId = container.getManifest().getId();
-
-            if (wasEnabled || pluginManager.requiresRestartForUninstall(pluginId)) {
-                // Mark for uninstall and require restart
-                pluginManager.markForUninstall(pluginId);
-                refresh();
-                PluginDialogs.showRestartRequired(i18n("plugin.restart_required.uninstall"));
-            } else {
-                // Directly uninstall in background if disabled
-                Task.runAsync(() -> {
-                    try {
-                        pluginManager.uninstallPlugin(pluginId);
-                    } catch (IOException e) {
-                        LOG.error("Failed to uninstall plugin", e);
-                        throw new RuntimeException(e);
-                    }
-                }).whenComplete(Schedulers.javafx(), (r, exception) -> {
-                    if (exception != null) {
-                        Alert alert = new Alert(Alert.AlertType.ERROR);
-                        alert.setTitle(i18n("plugin.uninstall"));
-                        alert.setHeaderText(i18n("plugin.uninstall_failed"));
-                        alert.setContentText(exception.getMessage());
-                        alert.initOwner(Controllers.getStage());
-                        alert.showAndWait();
-                    } else {
-                        refresh();
-                        Alert alert = new Alert(Alert.AlertType.INFORMATION);
-                        alert.setTitle(i18n("plugin.uninstall"));
-                        alert.setHeaderText(null);
-                        alert.setContentText(i18n("plugin.uninstall_success"));
-                        alert.initOwner(Controllers.getStage());
-                        alert.showAndWait();
-                    }
-                }).start();
-            }
-        }
-    }
-
+    /// Returns the decorator navigation state.
+    ///
+    /// @return read-only page state
     @Override
     public ReadOnlyObjectProperty<State> stateProperty() {
         return state.getReadOnlyProperty();

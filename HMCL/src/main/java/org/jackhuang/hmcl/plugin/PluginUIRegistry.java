@@ -17,80 +17,115 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import javafx.application.Platform;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.UnmodifiableView;
 
 import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 
-/**
- * Registry for plugin-contributed sidebar items in the launcher main page.
- * Plugins register items via {@link PluginContext#registerSidebarItem}.
- */
+/// Stores sidebar actions registered through permission-checked plugin contexts.
+@NotNullByDefault
 public final class PluginUIRegistry {
+    /// Mutable backing list changed only by package-internal trusted callers.
+    private static final ObservableList<SidebarItem> SIDEBAR_ITEMS = FXCollections.observableArrayList();
 
+    /// Read-only observable list exposed to launcher UI consumers.
+    private static final @UnmodifiableView ObservableList<SidebarItem> SIDEBAR_ITEMS_VIEW =
+            FXCollections.unmodifiableObservableList(SIDEBAR_ITEMS);
+
+    /// Prevents construction of the process-wide registry.
     private PluginUIRegistry() {
     }
 
-    /**
-     * A sidebar item contributed by a plugin.
-     */
+    /// Returns the read-only observable sidebar item view used by the main page.
+    ///
+    /// @return unmodifiable observable sidebar items
+    public static @UnmodifiableView ObservableList<SidebarItem> getSidebarItems() {
+        return SIDEBAR_ITEMS_VIEW;
+    }
+
+    /// Registers one sidebar item after the owning context has passed its permission check.
+    ///
+    /// Package-private visibility prevents ordinary plugin source code from bypassing [PluginContext].
+    ///
+    /// @param pluginId owning plugin ID
+    /// @param title displayed sidebar title
+    /// @param onAction action invoked when the item is selected
+    static void registerSidebarItem(String pluginId, String title, Runnable onAction) {
+        SidebarItem item = new SidebarItem(pluginId, title, onAction);
+        runOnFxThreadOrNow(() -> SIDEBAR_ITEMS.add(item));
+        LOG.info("Plugin " + pluginId + " registered sidebar item: " + title);
+    }
+
+    /// Removes every sidebar item owned by one plugin.
+    ///
+    /// @param pluginId owning plugin ID
+    static void unregisterAll(String pluginId) {
+        runOnFxThreadOrNow(() -> SIDEBAR_ITEMS.removeIf(item -> item.getPluginId().equals(pluginId)));
+    }
+
+    /// Runs a registry mutation on JavaFX when available, or synchronously before toolkit startup.
+    ///
+    /// Startup discovery and headless tests can revoke plugin UI before JavaFX has initialized. In that state no UI
+    /// observer is active, so applying the mutation immediately is both deterministic and thread-safe.
+    ///
+    /// @param mutation registry mutation
+    private static void runOnFxThreadOrNow(Runnable mutation) {
+        if (Platform.isFxApplicationThread()) {
+            mutation.run();
+        } else {
+            try {
+                Platform.runLater(mutation);
+            } catch (IllegalStateException exception) {
+                mutation.run();
+            }
+        }
+    }
+
+    /// Immutable sidebar action contributed by one plugin.
+    @NotNullByDefault
     public static final class SidebarItem {
+        /// Stable ID of the plugin that owns this item.
         private final String pluginId;
+
+        /// Text displayed in the launcher sidebar.
         private final String title;
+
+        /// Action invoked when the user selects this item.
         private final Runnable onAction;
 
-        public SidebarItem(String pluginId, String title, Runnable onAction) {
+        /// Creates one immutable sidebar action for a trusted registry caller.
+        ///
+        /// @param pluginId owning plugin ID
+        /// @param title displayed sidebar title
+        /// @param onAction selection action
+        private SidebarItem(String pluginId, String title, Runnable onAction) {
             this.pluginId = pluginId;
             this.title = title;
             this.onAction = onAction;
         }
 
+        /// Returns the stable ID of the owning plugin.
+        ///
+        /// @return owning plugin ID
         public String getPluginId() {
             return pluginId;
         }
 
+        /// Returns the displayed sidebar title.
+        ///
+        /// @return sidebar title
         public String getTitle() {
             return title;
         }
 
+        /// Returns the action invoked when this item is selected.
+        ///
+        /// @return selection action
         public Runnable getOnAction() {
             return onAction;
-        }
-    }
-
-    private static final ObservableList<SidebarItem> sidebarItems = FXCollections.observableArrayList();
-
-    /**
-     * Get the observable list of plugin sidebar items.
-     * The main page sidebar listens to this list and updates accordingly.
-     */
-    public static ObservableList<SidebarItem> getSidebarItems() {
-        return sidebarItems;
-    }
-
-    /**
-     * Register a sidebar item for a plugin.
-     */
-    public static void registerSidebarItem(String pluginId, String title, Runnable onAction) {
-        SidebarItem item = new SidebarItem(pluginId, title, onAction);
-        if (javafx.application.Platform.isFxApplicationThread()) {
-            sidebarItems.add(item);
-        } else {
-            javafx.application.Platform.runLater(() -> sidebarItems.add(item));
-        }
-        LOG.info("Plugin " + pluginId + " registered sidebar item: " + title);
-    }
-
-    /**
-     * Remove all sidebar items registered by a plugin.
-     * Called automatically when a plugin is disabled or unloaded.
-     */
-    public static void unregisterAll(String pluginId) {
-        Runnable removal = () -> sidebarItems.removeIf(item -> item.getPluginId().equals(pluginId));
-        if (javafx.application.Platform.isFxApplicationThread()) {
-            removal.run();
-        } else {
-            javafx.application.Platform.runLater(removal);
         }
     }
 }

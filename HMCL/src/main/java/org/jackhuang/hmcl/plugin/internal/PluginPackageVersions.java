@@ -17,34 +17,46 @@
  */
 package org.jackhuang.hmcl.plugin.internal;
 
+import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
 /// Publishes extracted plugin packages into immutable content-addressed directories.
@@ -80,6 +92,12 @@ public final class PluginPackageVersions {
     /// JVM-local monitors preventing overlapping file locks for the same version in one process.
     private static final Map<Path, Object> LOCAL_LOCKS = new ConcurrentHashMap<>();
 
+    /// Maximum attempts used when Windows temporarily denies a same-directory cache publication rename.
+    private static final int PUBLICATION_MOVE_ATTEMPTS = 5;
+
+    /// Initial delay before retrying a transient cache publication denial.
+    private static final long PUBLICATION_RETRY_DELAY_MILLIS = 25L;
+
     /// Prepares a package version used by the regular plugin lifecycle loader.
     ///
     /// @param nplFile source plugin package
@@ -89,6 +107,21 @@ public final class PluginPackageVersions {
     /// @throws IOException if hashing, extraction, validation, or publication fails
     public static Path prepareLifecyclePackage(Path nplFile, Path packageRoot, String pluginId) throws IOException {
         return preparePackage(nplFile, packageRoot, pluginId, false);
+    }
+
+    /// Prepares and inventories a package version used by the regular plugin lifecycle loader.
+    ///
+    /// @param nplFile source plugin package
+    /// @param packageRoot root such as `plugin-data`
+    /// @param identity exact source artifact identity
+    /// @return immutable verified extracted package
+    /// @throws IOException if hashing, extraction, validation, publication, or inventory creation fails
+    public static VerifiedPluginPackage prepareVerifiedLifecyclePackage(
+            Path nplFile,
+            Path packageRoot,
+            PluginArtifactIdentity identity
+    ) throws IOException {
+        return prepareVerifiedPackage(nplFile, packageRoot, identity, false);
     }
 
     /// Prepares a package version used by the startup Mixin agent.
@@ -105,13 +138,29 @@ public final class PluginPackageVersions {
         return preparePackage(nplFile, packageRoot, pluginId, true);
     }
 
+    /// Prepares and inventories a package version used by the startup Mixin Agent.
+    ///
+    /// @param nplFile source plugin package
+    /// @param packageRoot root such as `plugin-cache`
+    /// @param identity exact source artifact identity
+    /// @return immutable verified extracted package including the generated root-resource JAR
+    /// @throws IOException if hashing, extraction, validation, publication, or inventory creation fails
+    public static VerifiedPluginPackage prepareVerifiedMixinPackage(
+            Path nplFile,
+            Path packageRoot,
+            PluginArtifactIdentity identity
+    ) throws IOException {
+        return prepareVerifiedPackage(nplFile, packageRoot, identity, true);
+    }
+
     /// Returns the directory containing all immutable versions for one plugin.
     ///
     /// @param packageRoot plugin package or cache root
     /// @param pluginId validated plugin identifier
     /// @return version container directory
     public static Path getPluginVersionsDirectory(Path packageRoot, String pluginId) {
-        if (!PLUGIN_ID_PATTERN.matcher(pluginId).matches()) {
+        if (!PLUGIN_ID_PATTERN.matcher(pluginId).matches()
+                || !PluginManifest.isCanonicalExecutableId(pluginId)) {
             throw new IllegalArgumentException("Invalid plugin ID: " + pluginId);
         }
         return packageRoot.resolve(VERSIONS_DIRECTORY).resolve(pluginId);
@@ -123,28 +172,108 @@ public final class PluginPackageVersions {
     /// @return lower-case hexadecimal digest
     /// @throws IOException if the file cannot be read or SHA-256 is unavailable
     public static String calculateSha256(Path file) throws IOException {
-        final MessageDigest digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException exception) {
-            throw new IOException("SHA-256 is unavailable", exception);
-        }
-
         try (InputStream input = new BufferedInputStream(Files.newInputStream(file))) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) >= 0) {
-                if (read > 0) {
-                    digest.update(buffer, 0, read);
+            return calculateSha256(input);
+        }
+    }
+
+    /// Returns whether a verified extracted package owns one root or nested-JAR resource.
+    ///
+    /// The lookup never delegates to a parent or system class loader, so another artifact cannot satisfy a package's
+    /// Mixin resource validation with a same-named entry.
+    ///
+    /// @param packageDirectory verified extracted package directory
+    /// @param resource normalized package-relative resource name
+    /// @return whether the resource exists in this package itself
+    /// @throws IOException if package traversal or a nested JAR read fails
+    public static boolean containsPackageResource(Path packageDirectory, String resource) throws IOException {
+        Path directResource = packageDirectory.resolve(resource).normalize();
+        if (directResource.startsWith(packageDirectory)
+                && !Files.isSymbolicLink(directResource)
+                && Files.isRegularFile(directResource)) {
+            return true;
+        }
+        try (Stream<Path> files = Files.walk(packageDirectory)) {
+            for (Path jar : files
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
+                    .sorted()
+                    .toList()) {
+                try (ZipFile zipFile = new ZipFile(jar.toFile())) {
+                    @Nullable ZipEntry entry = zipFile.getEntry(resource);
+                    if (entry != null && !entry.isDirectory()) {
+                        return true;
+                    }
                 }
             }
         }
+        return false;
+    }
 
-        StringBuilder result = new StringBuilder(digest.getDigestLength() * 2);
-        for (byte value : digest.digest()) {
-            result.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+    /// Prepares one content-addressed version and returns the exact validated file inventory.
+    ///
+    /// @param nplFile source plugin package
+    /// @param packageRoot lifecycle or Mixin cache root
+    /// @param identity exact source artifact identity
+    /// @param generateRootResourceJar whether the generated Mixin resource JAR is required
+    /// @return immutable verified package inventory
+    /// @throws IOException if the source identity or prepared version cannot be verified
+    private static VerifiedPluginPackage prepareVerifiedPackage(
+            Path nplFile,
+            Path packageRoot,
+            PluginArtifactIdentity identity,
+            boolean generateRootResourceJar
+    ) throws IOException {
+        Path snapshot = createPackageSnapshot(nplFile, packageRoot);
+        try {
+            String sourceHash = calculateSha256(snapshot);
+            if (!identity.getSha256().equals(sourceHash)) {
+                throw new IOException("Plugin package identity does not match source bytes: " + identity.getPluginId());
+            }
+            Path directory = preparePackage(
+                    snapshot,
+                    packageRoot,
+                    identity.getPluginId(),
+                    generateRootResourceJar
+            );
+            return createVerifiedPackage(snapshot, directory, identity, generateRootResourceJar);
+        } finally {
+            Files.deleteIfExists(snapshot);
         }
-        return result.toString();
+    }
+
+    /// Copies one source package through a no-follow file handle so all later verification consumes stable bytes.
+    ///
+    /// A concurrent rename or rewrite can change the source path, but it cannot change the private snapshot already
+    /// opened and copied by this method. The snapshot digest is compared with the artifact identity before extraction.
+    ///
+    /// @param nplFile mutable installed package path
+    /// @param packageRoot trusted launcher-owned cache root
+    /// @return private package snapshot
+    /// @throws IOException if the source is symbolic, non-regular, unreadable, or cannot be copied
+    private static Path createPackageSnapshot(Path nplFile, Path packageRoot) throws IOException {
+        if (!Files.isRegularFile(nplFile, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(nplFile)) {
+            throw new IOException("Plugin package must be a non-symbolic regular file: " + nplFile);
+        }
+        Files.createDirectories(packageRoot);
+        Path normalizedPackageRoot = packageRoot.toAbsolutePath().normalize();
+        if (!Files.isDirectory(normalizedPackageRoot, LinkOption.NOFOLLOW_LINKS)
+                || Files.isSymbolicLink(normalizedPackageRoot)
+                || !normalizedPackageRoot.equals(normalizedPackageRoot.toRealPath())) {
+            throw new IOException("Plugin package cache root is symbolic or redirected: " + packageRoot);
+        }
+        Path snapshot = Files.createTempFile(normalizedPackageRoot, ".npl-snapshot-", ".tmp");
+        boolean complete = false;
+        try (InputStream input = Files.newInputStream(nplFile, LinkOption.NOFOLLOW_LINKS);
+             OutputStream output = Files.newOutputStream(snapshot, StandardOpenOption.TRUNCATE_EXISTING)) {
+            input.transferTo(output);
+            complete = true;
+            return snapshot;
+        } finally {
+            if (!complete) {
+                Files.deleteIfExists(snapshot);
+            }
+        }
     }
 
     /// Prepares and publishes one immutable content-addressed package version.
@@ -163,17 +292,26 @@ public final class PluginPackageVersions {
     ) throws IOException {
         String sourceHash = calculateSha256(nplFile);
         Path versionsDirectory = getPluginVersionsDirectory(packageRoot, pluginId);
-        Path versionDirectory = versionsDirectory.resolve(sourceHash);
-        if (isComplete(versionDirectory, sourceHash, generateRootResourceJar)) {
-            return versionDirectory;
+        Path canonicalDirectory = versionsDirectory.resolve(sourceHash);
+        if (isComplete(nplFile, canonicalDirectory, sourceHash, generateRootResourceJar)) {
+            return canonicalDirectory;
         }
 
         Files.createDirectories(versionsDirectory);
-        Path normalizedVersion = versionDirectory.toAbsolutePath().normalize();
+        Path normalizedVersion = canonicalDirectory.toAbsolutePath().normalize();
         Object localLock = LOCAL_LOCKS.computeIfAbsent(normalizedVersion, ignored -> new Object());
         synchronized (localLock) {
-            if (isComplete(versionDirectory, sourceHash, generateRootResourceJar)) {
-                return versionDirectory;
+            if (isComplete(nplFile, canonicalDirectory, sourceHash, generateRootResourceJar)) {
+                return canonicalDirectory;
+            }
+            @Nullable Path reusableRepair = findCompleteRepair(
+                    nplFile,
+                    versionsDirectory,
+                    sourceHash,
+                    generateRootResourceJar
+            );
+            if (reusableRepair != null) {
+                return reusableRepair;
             }
 
             Path lockFile = versionsDirectory.resolve("." + sourceHash + ".lock");
@@ -182,16 +320,25 @@ public final class PluginPackageVersions {
                     StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE
             ); FileLock ignored = channel.lock()) {
-                if (isComplete(versionDirectory, sourceHash, generateRootResourceJar)) {
-                    return versionDirectory;
+                if (isComplete(nplFile, canonicalDirectory, sourceHash, generateRootResourceJar)) {
+                    return canonicalDirectory;
                 }
-                if (Files.exists(versionDirectory)) {
-                    throw new IOException("Incomplete immutable plugin package version: " + versionDirectory);
+                reusableRepair = findCompleteRepair(
+                        nplFile,
+                        versionsDirectory,
+                        sourceHash,
+                        generateRootResourceJar
+                );
+                if (reusableRepair != null) {
+                    return reusableRepair;
                 }
 
                 Path temporaryDirectory = versionsDirectory.resolve(
                         ".tmp-" + sourceHash + "-" + UUID.randomUUID()
                 );
+                Path publicationDirectory = Files.exists(canonicalDirectory)
+                        ? versionsDirectory.resolve(sourceHash + ".repair-" + UUID.randomUUID())
+                        : canonicalDirectory;
                 Files.createDirectory(temporaryDirectory);
                 try {
                     extractPackage(nplFile, temporaryDirectory);
@@ -208,16 +355,79 @@ public final class PluginPackageVersions {
                             StandardCharsets.UTF_8,
                             StandardOpenOption.CREATE_NEW
                     );
-                    publish(temporaryDirectory, versionDirectory);
-                    if (!isComplete(versionDirectory, sourceHash, generateRootResourceJar)) {
-                        throw new IOException("Published plugin package version is incomplete: " + versionDirectory);
+                    publish(temporaryDirectory, publicationDirectory);
+                    if (!isComplete(nplFile, publicationDirectory, sourceHash, generateRootResourceJar)) {
+                        throw new IOException(
+                                "Published plugin package version is incomplete: " + publicationDirectory
+                        );
                     }
-                    return versionDirectory;
+                    return publicationDirectory;
                 } finally {
                     deleteRecursively(temporaryDirectory);
                 }
             }
         }
+    }
+
+    /// Finds a complete repair directory without changing an existing canonical content-addressed directory.
+    ///
+    /// @param nplFile source plugin package
+    /// @param versionsDirectory plugin version container
+    /// @param sourceHash complete source package digest
+    /// @param requireRootResourceJar whether the generated Mixin resource JAR is required
+    /// @return reusable repair directory or `null`
+    /// @throws IOException if version enumeration or validation fails
+    private static @Nullable Path findCompleteRepair(
+            Path nplFile,
+            Path versionsDirectory,
+            String sourceHash,
+            boolean requireRootResourceJar
+    ) throws IOException {
+        String prefix = sourceHash + ".repair-";
+        try (Stream<Path> paths = Files.list(versionsDirectory)) {
+            for (Path candidate : paths
+                    .filter(Files::isDirectory)
+                    .filter(path -> path.getFileName().toString().startsWith(prefix))
+                    .sorted()
+                    .toList()) {
+                if (isComplete(nplFile, candidate, sourceHash, requireRootResourceJar)) {
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Builds an immutable loader inventory from a complete prepared package directory.
+    ///
+    /// @param nplFile exact source package
+    /// @param versionDirectory complete prepared directory
+    /// @param identity exact source identity
+    /// @param requireRootResourceJar whether the generated Mixin resource JAR is required
+    /// @return verified package inventory
+    /// @throws IOException if any prepared file no longer matches the source package
+    private static VerifiedPluginPackage createVerifiedPackage(
+            Path nplFile,
+            Path versionDirectory,
+            PluginArtifactIdentity identity,
+            boolean requireRootResourceJar
+    ) throws IOException {
+        if (!isComplete(nplFile, versionDirectory, identity.getSha256(), requireRootResourceJar)) {
+            throw new IOException("Plugin package cache is incomplete: " + versionDirectory);
+        }
+        @Nullable @Unmodifiable Set<Path> extractedFiles = validateExtractedFiles(nplFile, versionDirectory);
+        if (extractedFiles == null) {
+            throw new IOException("Plugin package cache changed during inventory creation: " + versionDirectory);
+        }
+        Map<Path, String> fileDigests = new java.util.LinkedHashMap<>();
+        for (Path relative : extractedFiles.stream().sorted().toList()) {
+            fileDigests.put(relative, calculateSha256(versionDirectory.resolve(relative)));
+        }
+        if (requireRootResourceJar) {
+            Path relativeRootJar = Path.of(ROOT_RESOURCE_JAR);
+            fileDigests.put(relativeRootJar, calculateSha256(versionDirectory.resolve(relativeRootJar)));
+        }
+        return new VerifiedPluginPackage(versionDirectory, identity, fileDigests);
     }
 
     /// Extracts a bounded plugin archive into a newly created directory.
@@ -229,6 +439,7 @@ public final class PluginPackageVersions {
         int entryCount = 0;
         long totalBytes = 0;
         byte[] buffer = new byte[8192];
+        Set<Path> extractedFiles = new HashSet<>();
 
         try (ZipInputStream zipInput = new ZipInputStream(
                 new BufferedInputStream(Files.newInputStream(nplFile)),
@@ -248,6 +459,9 @@ public final class PluginPackageVersions {
                 if (entry.isDirectory()) {
                     Files.createDirectories(output);
                     continue;
+                }
+                if (!extractedFiles.add(output)) {
+                    throw new IOException("Plugin package contains a duplicate path: " + entry.getName());
                 }
 
                 @Nullable Path parent = output.getParent();
@@ -286,7 +500,7 @@ public final class PluginPackageVersions {
         try (JarOutputStream jarOutput = new JarOutputStream(
                 new BufferedOutputStream(Files.newOutputStream(output, StandardOpenOption.CREATE_NEW))
         ); Stream<Path> files = Files.walk(packageDirectory)) {
-            List<Path> resourceFiles = files
+            @Unmodifiable List<Path> resourceFiles = files
                     .filter(Files::isRegularFile)
                     .filter(path -> !path.equals(output))
                     .filter(path -> !path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
@@ -311,33 +525,279 @@ public final class PluginPackageVersions {
     /// @param versionDirectory final content-addressed directory
     /// @throws IOException if publication fails
     private static void publish(Path temporaryDirectory, Path versionDirectory) throws IOException {
-        try {
-            Files.move(temporaryDirectory, versionDirectory, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(temporaryDirectory, versionDirectory);
-        }
+        publishWithRetries(temporaryDirectory, versionDirectory, Files::move);
     }
 
-    /// Returns whether a published directory contains a valid completion marker and required files.
+    /// Publishes a prepared directory with bounded retries for transient Windows sharing violations.
     ///
+    /// The default same-directory move preserves the required no-replace contract and reports a
+    /// raced target explicitly. A short-lived scanner or indexer handle can still deny the rename;
+    /// bounded retry lets that transient handle clear without weakening the immutable cache rules.
+    ///
+    /// @param temporaryDirectory complete temporary directory
+    /// @param versionDirectory final content-addressed directory
+    /// @param mover directory move operation
+    /// @throws IOException if publication remains denied, a target races into place, or moving fails
+    static void publishWithRetries(
+            Path temporaryDirectory,
+            Path versionDirectory,
+            PublicationMover mover
+    ) throws IOException {
+        List<AccessDeniedException> accessDeniedFailures = new ArrayList<>();
+        for (int attempt = 0; attempt < PUBLICATION_MOVE_ATTEMPTS; attempt++) {
+            try {
+                mover.move(temporaryDirectory, versionDirectory);
+                return;
+            } catch (AccessDeniedException exception) {
+                accessDeniedFailures.add(exception);
+                if (Files.exists(versionDirectory, LinkOption.NOFOLLOW_LINKS)) {
+                    FileAlreadyExistsException racedTarget = new FileAlreadyExistsException(
+                            temporaryDirectory.toString(),
+                            versionDirectory.toString(),
+                            "Plugin package cache target appeared while publication was retrying"
+                    );
+                    accessDeniedFailures.forEach(racedTarget::addSuppressed);
+                    throw racedTarget;
+                }
+                if (attempt + 1 >= PUBLICATION_MOVE_ATTEMPTS) {
+                    IOException exhausted = new IOException(
+                            "Plugin package cache publication remained access-denied after "
+                                    + PUBLICATION_MOVE_ATTEMPTS + " attempts: "
+                                    + temporaryDirectory + " -> " + versionDirectory,
+                            exception
+                    );
+                    accessDeniedFailures.stream()
+                            .limit(accessDeniedFailures.size() - 1L)
+                            .forEach(exhausted::addSuppressed);
+                    throw exhausted;
+                }
+
+                long delayMillis = PUBLICATION_RETRY_DELAY_MILLIS << attempt;
+                try {
+                    Thread.sleep(delayMillis);
+                } catch (InterruptedException interruptedException) {
+                    Thread.currentThread().interrupt();
+                    IOException interrupted = new IOException(
+                            "Interrupted while retrying plugin package cache publication: "
+                                    + temporaryDirectory + " -> " + versionDirectory,
+                            interruptedException
+                    );
+                    accessDeniedFailures.forEach(interrupted::addSuppressed);
+                    throw interrupted;
+                }
+            }
+        }
+        throw new AssertionError("Publication retry loop completed without returning or throwing");
+    }
+
+    /// Returns whether a published directory exactly matches its source package and generated resource JAR.
+    ///
+    /// @param nplFile source package used to validate every extracted file
     /// @param versionDirectory candidate immutable version
     /// @param sourceHash expected source package hash
     /// @param requireRootResourceJar whether the Mixin root-resource JAR is required
     /// @return whether the version can be safely reused
     private static boolean isComplete(
+            Path nplFile,
             Path versionDirectory,
             String sourceHash,
             boolean requireRootResourceJar
     ) throws IOException {
-        if (!Files.isRegularFile(versionDirectory.resolve(PLUGIN_MANIFEST))) {
-            return false;
-        }
-        if (requireRootResourceJar && !Files.isRegularFile(versionDirectory.resolve(ROOT_RESOURCE_JAR))) {
-            return false;
-        }
         Path marker = versionDirectory.resolve(COMPLETION_MARKER);
-        return Files.isRegularFile(marker)
-                && completionMarker(sourceHash).equals(Files.readString(marker, StandardCharsets.UTF_8));
+        if (!Files.isRegularFile(marker)
+                || !completionMarker(sourceHash).equals(Files.readString(marker, StandardCharsets.UTF_8))) {
+            return false;
+        }
+
+        @Nullable @Unmodifiable Set<Path> extractedFiles = validateExtractedFiles(nplFile, versionDirectory);
+        if (extractedFiles == null) {
+            return false;
+        }
+        if (requireRootResourceJar && !validateRootResourceJar(versionDirectory, extractedFiles)) {
+            return false;
+        }
+
+        Set<Path> allowedFiles = new HashSet<>(extractedFiles);
+        allowedFiles.add(Path.of(COMPLETION_MARKER));
+        if (requireRootResourceJar) {
+            allowedFiles.add(Path.of(ROOT_RESOURCE_JAR));
+        }
+        try (Stream<Path> paths = Files.walk(versionDirectory)) {
+            for (Path path : paths.toList()) {
+                if (Files.isSymbolicLink(path)) {
+                    return false;
+                }
+                if (Files.isRegularFile(path)
+                        && !allowedFiles.contains(versionDirectory.relativize(path))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Validates every extracted file against the corresponding source archive entry.
+    ///
+    /// @param nplFile source plugin package
+    /// @param versionDirectory candidate extracted directory
+    /// @return relative extracted file paths, or `null` when any byte or path differs
+    /// @throws IOException if the source archive cannot be read
+    private static @Nullable @Unmodifiable Set<Path> validateExtractedFiles(
+            Path nplFile,
+            Path versionDirectory
+    ) throws IOException {
+        int entryCount = 0;
+        long totalBytes = 0;
+        byte[] buffer = new byte[8192];
+        Set<Path> expectedFiles = new HashSet<>();
+        try (ZipInputStream zipInput = new ZipInputStream(
+                new BufferedInputStream(Files.newInputStream(nplFile)),
+                StandardCharsets.UTF_8
+        )) {
+            @Nullable ZipEntry entry;
+            while ((entry = zipInput.getNextEntry()) != null) {
+                entryCount++;
+                if (entryCount > MAX_ARCHIVE_ENTRIES) {
+                    throw new IOException("Plugin package contains too many entries");
+                }
+                Path output = versionDirectory.resolve(entry.getName()).normalize();
+                if (!output.startsWith(versionDirectory)) {
+                    throw new IOException("Plugin package contains an unsafe path: " + entry.getName());
+                }
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                Path relative = versionDirectory.relativize(output);
+                if (!expectedFiles.add(relative)
+                        || Files.isSymbolicLink(output)
+                        || !Files.isRegularFile(output)) {
+                    return null;
+                }
+
+                MessageDigest digest = createSha256();
+                long entryBytes = 0;
+                int read;
+                while ((read = zipInput.read(buffer)) >= 0) {
+                    if (read == 0) {
+                        continue;
+                    }
+                    entryBytes = Math.addExact(entryBytes, read);
+                    totalBytes = Math.addExact(totalBytes, read);
+                    if (totalBytes > MAX_ARCHIVE_BYTES) {
+                        throw new IOException("Plugin package expands beyond the allowed size");
+                    }
+                    digest.update(buffer, 0, read);
+                }
+                if (Files.size(output) != entryBytes
+                        || !toHex(digest.digest()).equals(calculateSha256(output))) {
+                    return null;
+                }
+            }
+        } catch (ArithmeticException exception) {
+            throw new IOException("Plugin package size overflow", exception);
+        }
+        return expectedFiles.contains(Path.of(PLUGIN_MANIFEST)) ? Set.copyOf(expectedFiles) : null;
+    }
+
+    /// Validates the generated root-resource JAR against verified non-JAR package files.
+    ///
+    /// @param versionDirectory verified extracted package directory
+    /// @param extractedFiles verified relative package file paths
+    /// @return whether the generated JAR has exactly the expected entries and bytes
+    /// @throws IOException if the JAR or a verified package file cannot be read
+    private static boolean validateRootResourceJar(
+            Path versionDirectory,
+            @Unmodifiable Set<Path> extractedFiles
+    ) throws IOException {
+        Path rootResourceJar = versionDirectory.resolve(ROOT_RESOURCE_JAR);
+        if (!Files.isRegularFile(rootResourceJar) || Files.isSymbolicLink(rootResourceJar)) {
+            return false;
+        }
+        Set<String> expectedEntries = new HashSet<>();
+        for (Path relative : extractedFiles) {
+            if (!relative.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")) {
+                expectedEntries.add(relative.toString().replace('\\', '/'));
+            }
+        }
+
+        try (JarFile jarFile = new JarFile(rootResourceJar.toFile())) {
+            Set<String> actualEntries = new HashSet<>();
+            for (JarEntry entry : jarFile.stream().filter(candidate -> !candidate.isDirectory()).toList()) {
+                if (!actualEntries.add(entry.getName())) {
+                    return false;
+                }
+                Path source = versionDirectory.resolve(entry.getName()).normalize();
+                if (!source.startsWith(versionDirectory)
+                        || !expectedEntries.contains(entry.getName())
+                        || Files.size(source) != entry.getSize()) {
+                    return false;
+                }
+                try (InputStream input = new BufferedInputStream(jarFile.getInputStream(entry))) {
+                    if (!calculateSha256(input).equals(calculateSha256(source))) {
+                        return false;
+                    }
+                }
+            }
+            return actualEntries.equals(expectedEntries);
+        }
+    }
+
+    /// Moves an invalid immutable version aside so a verified replacement can be published safely.
+    ///
+    /// Existing processes keep any already-open files, while new discovery never loads the quarantined directory.
+    ///
+    /// @param versionDirectory invalid content-addressed version
+    /// @throws IOException if the directory cannot be quarantined
+    private static void quarantineIncompleteVersion(Path versionDirectory) throws IOException {
+        Path quarantine = versionDirectory.resolveSibling(
+                ".invalid-" + versionDirectory.getFileName() + "-" + UUID.randomUUID()
+        );
+        try {
+            Files.move(versionDirectory, quarantine, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(versionDirectory, quarantine);
+        }
+    }
+
+    /// Calculates a SHA-256 digest from the current position to the end of an input stream.
+    ///
+    /// @param input source bytes
+    /// @return lower-case hexadecimal digest
+    /// @throws IOException if reading fails or SHA-256 is unavailable
+    private static String calculateSha256(InputStream input) throws IOException {
+        MessageDigest digest = createSha256();
+        byte[] buffer = new byte[8192];
+        int read;
+        while ((read = input.read(buffer)) >= 0) {
+            if (read > 0) {
+                digest.update(buffer, 0, read);
+            }
+        }
+        return toHex(digest.digest());
+    }
+
+    /// Creates the required SHA-256 message digest.
+    ///
+    /// @return new digest instance
+    /// @throws IOException if SHA-256 is unavailable
+    private static MessageDigest createSha256() throws IOException {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IOException("SHA-256 is unavailable", exception);
+        }
+    }
+
+    /// Converts digest bytes to lower-case hexadecimal text.
+    ///
+    /// @param bytes digest bytes
+    /// @return lower-case hexadecimal digest
+    private static String toHex(byte @Unmodifiable [] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) {
+            result.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+        }
+        return result.toString();
     }
 
     /// Builds the exact completion marker contents for one source hash.
@@ -361,6 +821,18 @@ public final class PluginPackageVersions {
                 Files.deleteIfExists(file);
             }
         }
+    }
+
+    /// Moves one prepared directory into its final immutable cache location.
+    @FunctionalInterface
+    @NotNullByDefault
+    interface PublicationMover {
+        /// Moves the source directory without replacing an existing target.
+        ///
+        /// @param source prepared source directory
+        /// @param target immutable publication target
+        /// @throws IOException if the move cannot complete
+        void move(Path source, Path target) throws IOException;
     }
 
     /// Prevents construction of the immutable package utility.
