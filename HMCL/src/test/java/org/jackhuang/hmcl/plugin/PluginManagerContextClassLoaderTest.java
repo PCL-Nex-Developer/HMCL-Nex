@@ -17,10 +17,12 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.FXThreadTestSupport;
 import org.jackhuang.hmcl.plugin.loader.fixture.ContextClassLoaderPlugin;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -36,6 +38,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /// Verifies that every manager-owned lifecycle callback uses the exact package class loader as TCCL.
+///
+/// Discovery reaches [PluginManager#registerPreparedPlugin(PreparedPlugin)], which requires the JavaFX
+/// application thread, so this class is skipped when the JavaFX toolkit cannot start (e.g. headless CI).
+@EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 @NotNullByDefault
 public final class PluginManagerContextClassLoaderTest {
     /// Stable plugin ID used by the isolated lifecycle package.
@@ -53,7 +59,7 @@ public final class PluginManagerContextClassLoaderTest {
             writePluginPackage(manager.getPluginsDirectory().resolve(PLUGIN_ID + ".npl"));
             manager.enablePlugin(PLUGIN_ID);
 
-            manager.discoverPlugins();
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
             assertNotNull(manager.getPlugin(PLUGIN_ID));
             assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(PLUGIN_ID));

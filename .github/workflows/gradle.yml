@@ -26,8 +26,10 @@ jobs:
     - name: Set release version
       if: startsWith(github.ref, 'refs/tags/v26.8-beta.')
       run: echo "BUILD_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+    - name: Install xvfb
+      run: sudo apt-get update && sudo apt-get install -y xvfb
     - name: Build with Gradle
-      run: ./gradlew build --no-daemon --parallel
+      run: xvfb-run -a ./gradlew build --no-daemon --parallel
       env:
         MICROSOFT_AUTH_ID: ${{ secrets.CLIENT_ID }}
         CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
