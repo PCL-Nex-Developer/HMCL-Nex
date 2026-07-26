@@ -35,6 +35,10 @@ public final class JavaFXLauncher {
         } catch (Throwable e) {
             e.printStackTrace();
         }
+        if (started) {
+            // Keep the toolkit alive for later tests even if one of them ever shows and closes a Stage.
+            javafx.application.Platform.setImplicitExit(false);
+        }
     }
 
     public static void start() {

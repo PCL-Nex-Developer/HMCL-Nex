@@ -19,6 +19,7 @@ package org.jackhuang.hmcl.plugin.loader;
 
 import org.jackhuang.hmcl.plugin.Plugin;
 import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.internal.VerifiedPluginPackage;
 import org.jetbrains.annotations.NotNullByDefault;
 
 import java.io.IOException;
@@ -30,9 +31,9 @@ public interface PluginLoader {
     /// Loads one validated plugin package.
     ///
     /// @param manifest validated plugin manifest
-    /// @param extractedDir extracted package directory
+    /// @param pluginPackage exact verified package inventory
     /// @param nplFile original package path
     /// @return loaded lifecycle implementation
     /// @throws IOException if loading fails
-    Plugin load(PluginManifest manifest, Path extractedDir, Path nplFile) throws IOException;
+    Plugin load(PluginManifest manifest, VerifiedPluginPackage pluginPackage, Path nplFile) throws IOException;
 }
