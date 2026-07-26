@@ -39,6 +39,7 @@ public final class PluginVersion {
     /// @param left first version
     /// @param right second version
     /// @return a negative value, zero, or a positive value when the first version is older, equal, or newer
+    /// @throws IllegalArgumentException if either version is malformed or has no numeric release component
     public static int compare(String left, String right) {
         ParsedVersion leftVersion = ParsedVersion.parse(left);
         ParsedVersion rightVersion = ParsedVersion.parse(right);
@@ -80,6 +81,19 @@ public final class PluginVersion {
             }
         }
         return 0;
+    }
+
+    /// Returns whether a version contains a numeric release component and can be compared.
+    ///
+    /// @param source candidate version
+    /// @return whether the version is valid for comparison
+    static boolean isValid(String source) {
+        try {
+            ParsedVersion.parse(source);
+            return true;
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
     }
 
     /// Compares one prerelease identifier using numeric ordering and common qualifier precedence.
@@ -144,23 +158,39 @@ public final class PluginVersion {
         ///
         /// @param source source version
         /// @return parsed version
+        /// @throws IllegalArgumentException if the version is malformed or has no numeric release component
         private static ParsedVersion parse(String source) {
             String normalized = source.trim();
+            if (normalized.chars().anyMatch(character -> Character.isWhitespace(character)
+                    || character == ','
+                    || character == '<'
+                    || character == '>'
+                    || character == '='
+                    || character == '*')) {
+                throw invalidVersion(source);
+            }
             if (normalized.startsWith("v") || normalized.startsWith("V")) {
                 normalized = normalized.substring(1);
             }
             int buildMetadata = normalized.indexOf('+');
             if (buildMetadata >= 0) {
+                if (buildMetadata == normalized.length() - 1
+                        || normalized.indexOf('+', buildMetadata + 1) >= 0) {
+                    throw invalidVersion(source);
+                }
                 normalized = normalized.substring(0, buildMetadata);
             }
 
-            String[] parts = normalized.split("[.-]");
+            int prereleaseSeparator = normalized.indexOf('-');
+            String release = prereleaseSeparator >= 0
+                    ? normalized.substring(0, prereleaseSeparator)
+                    : normalized;
             List<BigInteger> core = new ArrayList<>();
             List<String> prerelease = new ArrayList<>();
             boolean readingPrerelease = false;
-            for (String part : parts) {
+            for (String part : release.split("\\.", -1)) {
                 if (part.isEmpty()) {
-                    continue;
+                    throw invalidVersion(source);
                 }
                 if (!readingPrerelease && part.chars().allMatch(Character::isDigit)) {
                     core.add(new BigInteger(part));
@@ -170,9 +200,27 @@ public final class PluginVersion {
                 }
             }
             if (core.isEmpty()) {
-                core.add(BigInteger.ZERO);
+                throw invalidVersion(source);
+            }
+
+            if (prereleaseSeparator >= 0) {
+                String explicitPrerelease = normalized.substring(prereleaseSeparator + 1);
+                for (String part : explicitPrerelease.split("[.-]", -1)) {
+                    if (part.isEmpty()) {
+                        throw invalidVersion(source);
+                    }
+                    prerelease.add(part.toLowerCase(Locale.ROOT));
+                }
             }
             return new ParsedVersion(core, prerelease);
+        }
+
+        /// Creates a consistent parse failure for a malformed version.
+        ///
+        /// @param source rejected source version
+        /// @return parse exception
+        private static IllegalArgumentException invalidVersion(String source) {
+            return new IllegalArgumentException("Invalid plugin version: " + source);
         }
     }
 }

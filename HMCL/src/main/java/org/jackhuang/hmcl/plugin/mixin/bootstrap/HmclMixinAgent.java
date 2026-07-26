@@ -17,8 +17,10 @@
  */
 package org.jackhuang.hmcl.plugin.mixin.bootstrap;
 
+import org.jackhuang.hmcl.plugin.PluginMutationLock;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 import org.spongepowered.asm.launch.MixinBootstrap;
 import org.spongepowered.asm.mixin.MixinEnvironment;
 import org.spongepowered.asm.mixin.Mixins;
@@ -31,6 +33,8 @@ import java.lang.instrument.IllegalClassFormatException;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.security.ProtectionDomain;
 import java.util.ArrayList;
@@ -52,39 +56,88 @@ public final class HmclMixinAgent {
     /// @param agentArguments optional `-javaagent` argument text
     /// @param instrumentation active JVM instrumentation handle
     public static void premain(@Nullable String agentArguments, Instrumentation instrumentation) {
+        PluginAgentSnapshot.clear();
         System.setProperty(HmclMixinBootstrap.AGENT_ACTIVE_PROPERTY, "true");
         if (Boolean.getBoolean(HmclMixinBootstrap.DISABLE_PROPERTY)) {
+            System.clearProperty(HmclMixinBootstrap.ACTIVE_PROPERTY);
+            report("Plugin Mixins are disabled for this launch");
             return;
         }
 
         try {
-            HmclMixinBootstrap.AgentConfiguration configuration = HmclMixinBootstrap.prepareAgentConfiguration();
-            if (configuration.mixinConfigs().isEmpty()) {
-                return;
-            }
-
-            appendPluginClassPath(configuration.classPathEntries(), instrumentation);
-            ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
-            HmclMixinService.configure(systemClassLoader, instrumentation);
-
-            MixinBootstrap.init();
-            MixinEnvironment.getDefaultEnvironment().setSide(MixinEnvironment.Side.CLIENT);
-            Mixins.addConfigurations(configuration.mixinConfigs().toArray(String[]::new), null);
-
-            HmclMixinService service = (HmclMixinService) MixinService.getService();
-            IMixinTransformer transformer = service.createTransformer();
-            enterDefaultPhase();
-            instrumentation.addTransformer(new HmclClassFileTransformer(transformer), false);
-
-            System.setProperty(
-                    HmclMixinBootstrap.ACTIVE_PROPERTY,
-                    String.join(",", configuration.activePluginIds())
+            Path localHome = HmclMixinBootstrap.resolveLocalHome();
+            runInitializationUnderMutationLock(
+                    localHome,
+                    () -> initializePluginMixins(localHome, instrumentation)
             );
-            report("Enabled " + configuration.mixinConfigs().size() + " Mixin configuration(s) from "
-                    + configuration.activePluginIds().size() + " plugin(s)");
-        } catch (IOException | ReflectiveOperationException exception) {
-            throw new IllegalStateException("Failed to initialize the HMCL plugin Mixin agent", exception);
+        } catch (Throwable throwable) {
+            handleInitializationFailure(throwable);
         }
+    }
+
+    /// Holds the launcher-local mutation lock for the complete second verification and Agent publication sequence.
+    ///
+    /// @param localHome launcher-local home
+    /// @param initialization complete Agent initialization action
+    /// @throws IOException if lock acquisition or initialization fails
+    static void runInitializationUnderMutationLock(
+            Path localHome,
+            PluginMutationLock.IORunnable initialization
+    ) throws IOException {
+        new PluginMutationLock(localHome).run(initialization);
+    }
+
+    /// Revalidates packages and grants, appends verified class paths, and publishes exact active artifacts.
+    ///
+    /// The caller must hold the launcher-local mutation lock for this complete method so installation or permission
+    /// changes cannot split the configuration snapshot from the class path and authorization snapshot it publishes.
+    ///
+    /// @param localHome launcher-local home protected by the mutation lock
+    /// @param instrumentation active JVM instrumentation handle
+    /// @throws IOException if discovery, class-path publication, or Mixin initialization fails
+    private static void initializePluginMixins(Path localHome, Instrumentation instrumentation) throws IOException {
+        HmclMixinBootstrap.AgentConfiguration configuration =
+                HmclMixinBootstrap.prepareAgentConfiguration(localHome);
+        if (configuration.mixinConfigs().isEmpty()) {
+            return;
+        }
+
+        configuration.verifyInstalledArtifacts();
+        appendPluginClassPath(configuration.classPathArtifacts(), instrumentation);
+        ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
+        HmclMixinService.configure(systemClassLoader, instrumentation);
+
+        MixinBootstrap.init();
+        MixinEnvironment.getDefaultEnvironment().setSide(MixinEnvironment.Side.CLIENT);
+        Mixins.addConfigurations(configuration.mixinConfigs().toArray(String[]::new), null);
+
+        HmclMixinService service = (HmclMixinService) MixinService.getService();
+        IMixinTransformer transformer = service.createTransformer();
+        try {
+            enterDefaultPhase();
+        } catch (ReflectiveOperationException exception) {
+            throw new IOException("Unable to enter the default Mixin phase", exception);
+        }
+        configuration.verifyInstalledArtifacts();
+        instrumentation.addTransformer(new HmclClassFileTransformer(transformer), false);
+        PluginAgentSnapshot.publish(configuration.registrations());
+
+        System.setProperty(
+                HmclMixinBootstrap.ACTIVE_PROPERTY,
+                String.join(",", configuration.activePluginIds())
+        );
+        report("Enabled " + configuration.mixinConfigs().size() + " Mixin configuration(s) from "
+                + configuration.activePluginIds().size() + " plugin(s)");
+    }
+
+    /// Fails closed without throwing from premain, so HMCL remains available for plugin management and removal.
+    ///
+    /// @param failure Agent initialization failure
+    static void handleInitializationFailure(Throwable failure) {
+        PluginAgentSnapshot.clear();
+        System.setProperty(HmclMixinBootstrap.DISABLE_PROPERTY, "true");
+        System.clearProperty(HmclMixinBootstrap.ACTIVE_PROPERTY);
+        report("Failed to initialize plugin Mixins; continuing with every Mixin plugin blocked: " + failure);
     }
 
     /// Appends immutable generated and nested plugin JAR files to the system class loader search path.
@@ -92,14 +145,47 @@ public final class HmclMixinAgent {
     /// @param entries extracted roots and JAR files
     /// @param instrumentation active instrumentation handle
     /// @throws IOException if a resource JAR cannot be created or opened
-    private static void appendPluginClassPath(
-            List<Path> entries,
+    static void appendPluginClassPath(
+            @Unmodifiable List<HmclMixinBootstrap.AgentClassPathEntry> entries,
             Instrumentation instrumentation
     ) throws IOException {
-        for (Path entry : entries) {
-            JarFile jarFile = new JarFile(entry.toFile());
-            OPEN_PLUGIN_JARS.add(jarFile);
-            instrumentation.appendToSystemClassLoaderSearch(jarFile);
+        for (HmclMixinBootstrap.AgentClassPathEntry entry : entries) {
+            Path jarPath = entry.path();
+            verifyNoSymbolicLinkComponents(jarPath);
+            if (!Files.isRegularFile(jarPath, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Verified Agent class-path entry is not a regular file: " + jarPath);
+            }
+
+            JarFile jarFile = new JarFile(jarPath.toFile());
+            boolean retained = false;
+            try {
+                String actualDigest = HmclMixinBootstrap.calculateAgentJarDigest(jarFile);
+                if (!entry.contentDigest().equals(actualDigest)) {
+                    throw new IOException("Verified Agent JAR changed before append: " + jarPath);
+                }
+                instrumentation.appendToSystemClassLoaderSearch(jarFile);
+                OPEN_PLUGIN_JARS.add(jarFile);
+                retained = true;
+            } finally {
+                if (!retained) {
+                    jarFile.close();
+                }
+            }
+        }
+    }
+
+    /// Rejects a JAR path when any existing component is a symbolic link.
+    ///
+    /// @param path normalized Agent JAR path
+    /// @throws IOException if a symbolic link appears in the path
+    private static void verifyNoSymbolicLinkComponents(Path path) throws IOException {
+        Path absolutePath = path.toAbsolutePath().normalize();
+        @Nullable Path current = absolutePath.getRoot();
+        for (Path component : absolutePath) {
+            current = current == null ? component : current.resolve(component);
+            if (Files.isSymbolicLink(current)) {
+                throw new IOException("Agent class-path entry contains a symbolic link: " + current);
+            }
         }
     }
 
