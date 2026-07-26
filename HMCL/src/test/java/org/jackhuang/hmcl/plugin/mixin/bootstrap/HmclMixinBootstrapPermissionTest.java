@@ -85,7 +85,8 @@ public final class HmclMixinBootstrapPermissionTest {
     public void prepareConfigurationUnderMutationLock(@TempDir Path temporaryDirectory) throws Exception {
         PluginMutationLock mutationLock = new PluginMutationLock(temporaryDirectory);
         CountDownLatch preparationAttempted = new CountDownLatch(1);
-        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
             Future<HmclMixinBootstrap.AgentConfiguration> preparation = mutationLock.call(() -> {
                 Future<HmclMixinBootstrap.AgentConfiguration> submitted = executor.submit(() -> {
                     preparationAttempted.countDown();
@@ -99,6 +100,8 @@ public final class HmclMixinBootstrapPermissionTest {
             HmclMixinBootstrap.AgentConfiguration configuration = preparation.get();
             assertTrue(configuration.mixinConfigs().isEmpty());
             assertTrue(configuration.registrations().isEmpty());
+        } finally {
+            executor.shutdownNow();
         }
     }
 

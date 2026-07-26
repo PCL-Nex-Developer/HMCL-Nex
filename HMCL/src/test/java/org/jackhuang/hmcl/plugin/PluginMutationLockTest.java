@@ -66,7 +66,8 @@ public final class PluginMutationLockTest {
         CountDownLatch releaseFirst = new CountDownLatch(1);
         CountDownLatch secondAttempted = new CountDownLatch(1);
         CountDownLatch secondEntered = new CountDownLatch(1);
-        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
             Future<?> firstFuture = executor.submit(() -> {
                 first.run(() -> {
                     firstEntered.countDown();
@@ -87,6 +88,8 @@ public final class PluginMutationLockTest {
             firstFuture.get();
             secondFuture.get();
             assertEquals(0L, secondEntered.getCount());
+        } finally {
+            executor.shutdownNow();
         }
     }
 
