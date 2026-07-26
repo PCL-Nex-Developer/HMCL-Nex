@@ -110,7 +110,8 @@ public final class HmclMixinAgentTest {
         CountDownLatch releaseInitialization = new CountDownLatch(1);
         CountDownLatch mutationAttempted = new CountDownLatch(1);
         CountDownLatch mutationEntered = new CountDownLatch(1);
-        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
             Future<?> initialization = executor.submit(() -> {
                 HmclMixinAgent.runInitializationUnderMutationLock(temporaryDirectory, () -> {
                     initializationEntered.countDown();
@@ -132,6 +133,8 @@ public final class HmclMixinAgentTest {
             initialization.get();
             mutation.get();
             assertEquals(0L, mutationEntered.getCount());
+        } finally {
+            executor.shutdownNow();
         }
     }
 
