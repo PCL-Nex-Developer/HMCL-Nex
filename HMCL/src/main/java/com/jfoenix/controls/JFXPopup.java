@@ -24,6 +24,7 @@ import javafx.application.Platform;
 import javafx.beans.DefaultProperty;
 import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.SimpleObjectProperty;
+import javafx.beans.value.ChangeListener;
 import javafx.geometry.NodeOrientation;
 import javafx.geometry.Point2D;
 import javafx.scene.Node;
@@ -68,12 +69,29 @@ public class JFXPopup extends PopupControl {
         initialize();
     }
 
+    /// Hides this popup as soon as the owner window loses focus, so the popup never floats above other applications.
+    private final ChangeListener<Boolean> ownerFocusListener = (observable, wasFocused, isFocused) -> {
+        if (!isFocused && isShowing()) {
+            hide();
+        }
+    };
+
     private void initialize() {
         this.setAutoFix(false);
         this.setAutoHide(true);
         this.setHideOnEscape(true);
         this.setConsumeAutoHidingEvents(false);
         this.getStyleClass().add(DEFAULT_STYLE_CLASS);
+        // Popup windows are separate top-level windows: without this hook, switching to another
+        // application leaves the popup rendered above the foreign window.
+        ownerWindowProperty().addListener((observable, oldOwner, newOwner) -> {
+            if (oldOwner != null) {
+                oldOwner.focusedProperty().removeListener(ownerFocusListener);
+            }
+            if (newOwner != null) {
+                newOwner.focusedProperty().addListener(ownerFocusListener);
+            }
+        });
     }
 
     @Override
