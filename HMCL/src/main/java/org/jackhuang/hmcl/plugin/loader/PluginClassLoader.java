@@ -44,6 +44,25 @@ public final class PluginClassLoader extends URLClassLoader {
             "org.spongepowered.asm."
     );
 
+    /// Launcher-owned namespaces whose classes fall back to the host loader when absent from the verified package.
+    ///
+    /// Covers the launcher itself and the third-party libraries bundled inside the launcher artifact, so plugins may
+    /// use launcher UI and service classes without a per-class whitelist entry.
+    private static final @Unmodifiable List<String> HOST_FALLBACK_PREFIXES = List.of(
+            "org.jackhuang.hmcl.",
+            "com.jfoenix.",
+            "com.google.gson.",
+            "org.jsoup.",
+            "org.glavo.",
+            "org.tomlj.",
+            "org.hildan.",
+            "org.girod.",
+            "kala.compress.",
+            "net.jpountz.",
+            "org.tukaani.",
+            "fi.iki.elonen."
+    );
+
     /// Exact launcher API classes that must retain host type identity, including their nested types.
     private static final @Unmodifiable Set<String> SHARED_HMCL_API_CLASSES = Set.of(
             "org.jackhuang.hmcl.plugin.JavaScriptPluginPage",
@@ -99,10 +118,12 @@ public final class PluginClassLoader extends URLClassLoader {
         return loaded == null ? findClass(binaryName) : loaded;
     }
 
-    /// Loads package-owned helper classes only from the verified artifact and shared API classes only from HMCL.
+    /// Loads package-owned helper classes from the verified artifact and shared API classes only from HMCL.
     ///
-    /// Production loaders never fall back to an unrelated parent-classpath class for an ordinary plugin namespace.
-    /// Detached guard-test loaders retain standard [URLClassLoader] delegation.
+    /// Launcher-namespace classes absent from the verified package fall back to the host loader, so plugins may use
+    /// launcher UI and service classes without a per-class whitelist entry. Production loaders never fall back to an
+    /// unrelated parent-classpath class for an ordinary plugin namespace. Detached guard-test loaders retain standard
+    /// [URLClassLoader] delegation.
     ///
     /// @param binaryName requested binary class name
     /// @param resolve whether to resolve the returned class
@@ -122,7 +143,7 @@ public final class PluginClassLoader extends URLClassLoader {
             result = loadParentClass(binaryName);
         } else {
             @Nullable Class<?> platformClass = findPlatformClass(binaryName);
-            result = platformClass == null ? findClass(binaryName) : platformClass;
+            result = platformClass == null ? findPackageClassWithHostFallback(binaryName) : platformClass;
         }
         if (resolve) {
             resolveClass(result);
@@ -237,5 +258,31 @@ public final class PluginClassLoader extends URLClassLoader {
     private Class<?> loadParentClass(String binaryName) throws ClassNotFoundException {
         @Nullable ClassLoader parent = getParent();
         return Class.forName(binaryName, false, parent);
+    }
+
+    /// Loads a class from the verified package, falling back to the host loader for launcher-owned namespaces.
+    ///
+    /// Package-owned bytes always win, so a plugin cannot be silently overridden by a same-named host class. The
+    /// launcher-namespace fallback keeps host type identity for launcher UI and service classes that plugins use
+    /// directly, without maintaining a per-class whitelist. Other namespaces stay package-owned and never fall back
+    /// to unrelated parent-classpath classes.
+    ///
+    /// @param binaryName requested binary class name
+    /// @return package-owned class, or host launcher class for an absent launcher-namespace name
+    /// @throws ClassNotFoundException if neither authorized source defines the class
+    private Class<?> findPackageClassWithHostFallback(String binaryName) throws ClassNotFoundException {
+        try {
+            return findClass(binaryName);
+        } catch (ClassNotFoundException packageMiss) {
+            if (HOST_FALLBACK_PREFIXES.stream().noneMatch(binaryName::startsWith)) {
+                throw packageMiss;
+            }
+            try {
+                return loadParentClass(binaryName);
+            } catch (ClassNotFoundException hostMiss) {
+                packageMiss.addSuppressed(hostMiss);
+                throw packageMiss;
+            }
+        }
     }
 }

@@ -89,7 +89,8 @@ public final class VerifiedPluginPackageTest {
         }
     }
 
-    /// Uses package-owned helper classes and rejects an unowned parent-classpath fallback with the same namespace.
+    /// Uses package-owned helper classes, rejects unowned third-party parent fallback, and keeps host identity for
+    /// launcher-namespace fallback classes.
     ///
     /// @param temporaryDirectory isolated package and parent class paths
     /// @throws Exception if class generation or loading fails
@@ -112,7 +113,7 @@ public final class VerifiedPluginPackageTest {
             assertEquals(loader, packageClass.getClassLoader());
             assertEquals("trusted-loose", invokeMarker(packageClass));
             assertThrows(ClassNotFoundException.class, () -> loader.loadClass("parentonly.Helper"));
-            assertThrows(ClassNotFoundException.class, () -> loader.loadClass(VerifiedPluginPackageTest.class.getName()));
+            assertEquals(VerifiedPluginPackageTest.class, loader.loadClass(VerifiedPluginPackageTest.class.getName()));
             assertEquals(String.class, loader.loadClass("java.lang.String"));
         }
     }
