@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.FXThreadTestSupport;
 import org.jackhuang.hmcl.plugin.internal.PluginPackageVersions;
 import org.jackhuang.hmcl.plugin.mixin.bootstrap.HmclMixinBootstrap;
 import org.jackhuang.hmcl.plugin.mixin.bootstrap.PluginAgentSnapshotTestSupport;
@@ -24,6 +25,7 @@ import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -59,6 +61,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies safe local `.npl` installation and restart-only update staging.
+@EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 @NotNullByDefault
 public final class PluginManagerLocalInstallTest {
     /// Inspects a package without mutation and rejects preparation after the source bytes change.
@@ -124,7 +127,7 @@ public final class PluginManagerLocalInstallTest {
         );
 
         PluginManager restarted = new PluginManager(localHome);
-        restarted.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
         PluginContainer container = Objects.requireNonNull(restarted.getPlugin("dev.hmclnex.test.local"));
         assertTrue(container.isEnabled());
         assertEquals(PluginRuntimeStatus.ENABLED, restarted.getPluginRuntimeStatus("dev.hmclnex.test.local"));
@@ -208,7 +211,7 @@ public final class PluginManagerLocalInstallTest {
         manager.prepareLocalPluginInstallation(sourcePackage, Set.of(PluginPermission.MIXIN));
 
         PluginManager restarted = new PluginManager(localHome);
-        restarted.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
 
         assertNull(restarted.getPlugin(pluginId));
         assertEquals(PluginRuntimeStatus.BLOCKED_AGENT, restarted.getPluginRuntimeStatus(pluginId));
@@ -238,7 +241,7 @@ public final class PluginManagerLocalInstallTest {
         );
         manager.prepareLocalPluginInstallation(sourcePackage, Set.of(PluginPermission.MIXIN));
         PluginManager restarted = new PluginManager(localHome);
-        restarted.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
         assertEquals(PluginRuntimeStatus.BLOCKED_AGENT, restarted.getPluginRuntimeStatus(pluginId));
 
         restarted.setGrantedPermissions(
@@ -272,7 +275,7 @@ public final class PluginManagerLocalInstallTest {
         System.setProperty(HmclMixinBootstrap.AGENT_ACTIVE_PROPERTY, "true");
         try {
             PluginManager restarted = new PluginManager(localHome);
-            restarted.discoverPlugins();
+            FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
 
             assertNull(restarted.getPlugin(pluginId));
             assertEquals(PluginRuntimeStatus.BLOCKED_AGENT, restarted.getPluginRuntimeStatus(pluginId));
@@ -309,7 +312,7 @@ public final class PluginManagerLocalInstallTest {
         PluginAgentSnapshotTestSupport.publish(identity, List.of(mixinConfig), LifecycleProbePlugin.class);
         try {
             PluginManager restarted = new PluginManager(localHome);
-            restarted.discoverPlugins();
+            FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
 
             assertNull(restarted.getPlugin(pluginId));
             assertEquals(PluginRuntimeStatus.LOAD_FAILED, restarted.getPluginRuntimeStatus(pluginId));
@@ -356,7 +359,7 @@ public final class PluginManagerLocalInstallTest {
         PluginAgentSnapshotTestSupport.publish(identity, List.of(mixinConfig), LifecycleProbePlugin.class);
         try {
             PluginManager restarted = new PluginManager(localHome);
-            restarted.discoverPlugins();
+            FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
             assertTrue(Objects.requireNonNull(restarted.getPlugin(pluginId)).isEnabled());
 
             System.setProperty(LifecycleProbePlugin.THROW_DISABLE_PROPERTY, "true");
@@ -391,7 +394,7 @@ public final class PluginManagerLocalInstallTest {
         assertFalse(manager.enablePlugin(pluginId));
         assertFalse(manager.isPluginEnabled(pluginId));
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertNull(manager.getPlugin(pluginId));
         assertEquals(PluginRuntimeStatus.BLOCKED_LEGACY, manager.getPluginRuntimeStatus(pluginId));
@@ -481,7 +484,7 @@ public final class PluginManagerLocalInstallTest {
         assertEquals(Set.of(PluginPermission.FILESYSTEM), manager.getGrantedPermissions(inspection));
 
         PluginManager restartedManager = new PluginManager(localHome);
-        restartedManager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restartedManager::discoverPlugins);
 
         assertTrue(Files.exists(installedPackage));
         assertEquals(Set.of(PluginPermission.FILESYSTEM), manager.getGrantedPermissions(inspection));
@@ -557,7 +560,7 @@ public final class PluginManagerLocalInstallTest {
         try {
             manager.prepareLocalPluginInstallation(inspection, Set.of());
             PluginManager restarted = new PluginManager(temporaryDirectory.resolve("home"));
-            restarted.discoverPlugins();
+            FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
             assertNull(restarted.getPlugin(pluginId));
             assertEquals(PluginRuntimeStatus.LOAD_FAILED, restarted.getPluginRuntimeStatus(pluginId));
             assertFalse(AdministrativeConstructorPlugin.constructed);
@@ -748,7 +751,7 @@ public final class PluginManagerLocalInstallTest {
 
         manager.prepareLocalPluginInstallation(initialPackage);
         PluginManager activeManager = new PluginManager(localHome);
-        activeManager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(activeManager::discoverPlugins);
         PluginContainer originalContainer = Objects.requireNonNull(activeManager.getPlugin(pluginId));
 
         LocalPluginInstallation updateInstallation =
@@ -794,7 +797,7 @@ public final class PluginManagerLocalInstallTest {
         );
         manager.enablePlugin("dev.hmclnex.test.missing-dependent");
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertTrue(manager.getPlugins().isEmpty());
     }
@@ -828,14 +831,14 @@ public final class PluginManagerLocalInstallTest {
         manager.enablePlugin(dependencyId);
         manager.enablePlugin(dependentId);
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(dependencyId));
         assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(dependentId));
         assertNull(manager.getPlugin(dependentId));
         assertLifecycleProbeNeverRan();
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(dependencyId));
         assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(dependentId));
@@ -868,7 +871,7 @@ public final class PluginManagerLocalInstallTest {
         manager.enablePlugin(failingId);
         manager.enablePlugin(validId);
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(failingId));
         assertNull(manager.getPlugin(failingId));
@@ -913,7 +916,7 @@ public final class PluginManagerLocalInstallTest {
         Files.delete(permissionFile);
         Files.createDirectory(permissionFile);
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertNotNull(manager.getPlugin(validId));
         assertNull(manager.getPlugin(staleId));
@@ -940,7 +943,7 @@ public final class PluginManagerLocalInstallTest {
         manager.enablePlugin("dev.hmclnex.test.version-base");
         manager.enablePlugin("dev.hmclnex.test.version-dependent");
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertEquals(1, manager.getPlugins().size());
         assertNotNull(manager.getPlugin("dev.hmclnex.test.version-base"));
@@ -969,7 +972,7 @@ public final class PluginManagerLocalInstallTest {
         manager.enablePlugin("dev.hmclnex.test.cycle-a");
         manager.enablePlugin("dev.hmclnex.test.cycle-b");
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertTrue(manager.getPlugins().isEmpty());
     }
@@ -986,7 +989,7 @@ public final class PluginManagerLocalInstallTest {
         String dependentId = "dev.hmclnex.test.batch-dependent";
         writePluginPackage(manager.getPluginsDirectory().resolve(baseId + ".npl"), baseId, "1.0.0");
         manager.enablePlugin(baseId);
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
         assertNotNull(manager.getPlugin(baseId));
 
         Path baseReplacement = temporaryDirectory.resolve("base-replacement.npl");
@@ -1014,7 +1017,7 @@ public final class PluginManagerLocalInstallTest {
         );
 
         PluginManager restartedManager = new PluginManager(localHome);
-        restartedManager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restartedManager::discoverPlugins);
         assertEquals("2.0.0", Objects.requireNonNull(restartedManager.getPlugin(baseId)).getManifest().getVersion());
         assertNotNull(restartedManager.getPlugin(dependentId));
     }
@@ -1246,7 +1249,7 @@ public final class PluginManagerLocalInstallTest {
                 Set.of(PluginPermission.FILESYSTEM, PluginPermission.NETWORK)
         );
         manager.enablePlugin(pluginId);
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
         assertEquals("1.0.0", Objects.requireNonNull(manager.getPlugin(pluginId)).getManifest().getVersion());
 
         Path versionTwo = temporaryDirectory.resolve("chained-v2.npl");
@@ -1307,7 +1310,7 @@ public final class PluginManagerLocalInstallTest {
                 Set.of(PluginPermission.FILESYSTEM, PluginPermission.NETWORK)
         );
         manager.enablePlugin(pluginId);
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
         PluginContainer loaded = Objects.requireNonNull(manager.getPlugin(pluginId));
 
         Path replacement = temporaryDirectory.resolve("pending-v2.npl");
@@ -1559,7 +1562,7 @@ public final class PluginManagerLocalInstallTest {
         );
         manager.setGrantedPermissions(pluginId, Set.of(PluginPermission.FILESYSTEM));
         manager.enablePlugin(pluginId);
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
         assertNull(manager.getPlugin(pluginId));
         assertEquals(PluginRuntimeStatus.LOAD_FAILED, manager.getPluginRuntimeStatus(pluginId));
         assertNotNull(manager.getPluginRuntimeDetail(pluginId));

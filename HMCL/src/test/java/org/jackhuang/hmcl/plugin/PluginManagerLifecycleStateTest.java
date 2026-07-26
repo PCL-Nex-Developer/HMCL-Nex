@@ -17,9 +17,11 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.FXThreadTestSupport;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -36,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies persisted enablement closure, dependency activation diagnostics, and reverse disable cascades.
+@EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 @NotNullByDefault
 public final class PluginManagerLifecycleStateTest {
     /// Preserves an exact legacy-policy diagnostic while rejecting a repeated enable request.
@@ -56,7 +59,7 @@ public final class PluginManagerLifecycleStateTest {
                 LifecycleProbePlugin.class
         );
         manager.enablePlugin(pluginId);
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
         assertEquals(PluginRuntimeStatus.BLOCKED_LEGACY, manager.getPluginRuntimeStatus(pluginId));
         String blockedDetail = Objects.requireNonNull(manager.getPluginRuntimeDetail(pluginId));
 
@@ -101,7 +104,7 @@ public final class PluginManagerLifecycleStateTest {
             assertFalse(manager.enablePlugin(dependentId));
             assertTrue(manager.isPluginEnabled(dependencyId));
             assertTrue(manager.isPluginEnabled(dependentId));
-            manager.discoverPlugins();
+            FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
             assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependencyId));
             assertEquals(PluginRuntimeStatus.ENABLED, manager.getPluginRuntimeStatus(dependentId));
 
@@ -262,7 +265,7 @@ public final class PluginManagerLifecycleStateTest {
         assertTrue(manager.isMarkedForUninstall(dependencyId));
 
         PluginManager restarted = new PluginManager(localHome);
-        restarted.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
 
         assertFalse(Files.exists(dependencyPackage));
         assertTrue(Files.isRegularFile(legacyPackage));

@@ -17,10 +17,12 @@
  */
 package org.jackhuang.hmcl.plugin;
 
+import org.jackhuang.hmcl.FXThreadTestSupport;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -39,6 +41,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies schema-v4 required and optional permission behavior across installation and lifecycle updates.
+///
+/// Discovery reaches [PluginManager#registerPreparedPlugin(PreparedPlugin)], which requires the JavaFX
+/// application thread, so this class is skipped when the JavaFX toolkit cannot start (e.g. headless CI).
+@EnabledIf("org.jackhuang.hmcl.JavaFXLauncher#isStarted")
 @NotNullByDefault
 public final class PluginManagerSchemaFourPermissionTest {
     /// Loads a schema-v4 plugin with its required grant and a denied optional capability, then rejects an attempted
@@ -69,7 +75,7 @@ public final class PluginManagerSchemaFourPermissionTest {
         manager.prepareLocalPluginInstallation(inspection, suggested);
 
         PluginManager restarted = new PluginManager(localHome);
-        restarted.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(restarted::discoverPlugins);
         PluginContainer container = Objects.requireNonNull(restarted.getPlugin(pluginId));
         assertTrue(container.isEnabled());
         assertEquals("true", System.getProperty(LifecycleProbePlugin.CONSTRUCTED_PROPERTY));
@@ -106,7 +112,7 @@ public final class PluginManagerSchemaFourPermissionTest {
         clearLifecycleProbeProperties();
         manager.enablePlugin(pluginId);
 
-        manager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(manager::discoverPlugins);
 
         assertNull(manager.getPlugin(pluginId));
         assertEquals(PluginRuntimeStatus.BLOCKED_PERMISSION, manager.getPluginRuntimeStatus(pluginId));
@@ -134,7 +140,7 @@ public final class PluginManagerSchemaFourPermissionTest {
         );
         manager.prepareLocalPluginInstallation(versionOne, Set.of(PluginPermission.FILESYSTEM));
         PluginManager activeManager = new PluginManager(localHome);
-        activeManager.discoverPlugins();
+        FXThreadTestSupport.runOnFxThread(activeManager::discoverPlugins);
         PluginContainer loaded = Objects.requireNonNull(activeManager.getPlugin(pluginId));
 
         Path versionTwo = temporaryDirectory.resolve("schema-four-v2.npl");
