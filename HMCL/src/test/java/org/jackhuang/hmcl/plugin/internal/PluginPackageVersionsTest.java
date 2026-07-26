@@ -18,12 +18,15 @@
 package org.jackhuang.hmcl.plugin.internal;
 
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -32,6 +35,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
@@ -43,6 +47,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies immutable, content-addressed plugin package publication and reuse.
@@ -100,6 +105,30 @@ public final class PluginPackageVersionsTest {
         }
     }
 
+    /// Publishes a separate repair cache without moving or deleting a tampered canonical directory.
+    ///
+    /// @param temporaryDirectory isolated test directory
+    /// @throws Exception if package preparation, tampering, or repair fails
+    @Test
+    public void repairMixinCacheWithInjectedJar(@TempDir Path temporaryDirectory) throws Exception {
+        String pluginId = "dev.hmclnex.test.mixin-repair";
+        Path nplFile = temporaryDirectory.resolve("plugin.npl");
+        Path cacheRoot = temporaryDirectory.resolve("plugin-cache");
+        writePackage(nplFile, "mixin-repair");
+        Path originalVersion = PluginPackageVersions.prepareMixinPackage(nplFile, cacheRoot, pluginId);
+        Files.write(originalVersion.resolve("injected.jar"), new byte[]{1, 2, 3});
+
+        Path repairedVersion = PluginPackageVersions.prepareMixinPackage(nplFile, cacheRoot, pluginId);
+
+        assertNotEquals(originalVersion, repairedVersion);
+        assertTrue(repairedVersion.getFileName().toString().startsWith(
+                PluginPackageVersions.calculateSha256(nplFile) + ".repair-"
+        ));
+        assertFalse(Files.exists(repairedVersion.resolve("injected.jar")));
+        assertTrue(Files.exists(originalVersion.resolve("injected.jar")));
+        assertTrue(Files.isRegularFile(repairedVersion.resolve(PluginPackageVersions.ROOT_RESOURCE_JAR)));
+    }
+
     /// Serializes concurrent preparation of the same version and leaves no partial package directories.
     ///
     /// @param temporaryDirectory isolated test directory
@@ -143,6 +172,114 @@ public final class PluginPackageVersionsTest {
         try (Stream<Path> children = Files.list(versionsDirectory)) {
             assertFalse(children.anyMatch(path -> path.getFileName().toString().startsWith(".tmp-")));
         }
+    }
+
+    /// Retries a transient access denial and publishes the prepared directory without replacing data.
+    ///
+    /// @param temporaryDirectory isolated test directory
+    /// @throws Exception if directory preparation or publication fails
+    @Test
+    public void retryTransientAccessDeniedDuringPublication(@TempDir Path temporaryDirectory) throws Exception {
+        Path source = temporaryDirectory.resolve("source");
+        Path target = temporaryDirectory.resolve("target");
+        Files.createDirectory(source);
+        Files.writeString(source.resolve("payload.txt"), "payload", StandardCharsets.UTF_8);
+        AtomicInteger attempts = new AtomicInteger();
+
+        PluginPackageVersions.publishWithRetries(source, target, (moveSource, moveTarget) -> {
+            if (attempts.getAndIncrement() == 0) {
+                throw new AccessDeniedException(
+                        moveSource.toString(),
+                        moveTarget.toString(),
+                        "simulated transient sharing violation"
+                );
+            }
+            Files.move(moveSource, moveTarget);
+        });
+
+        assertEquals(2, attempts.get());
+        assertFalse(Files.exists(source));
+        assertEquals("payload", Files.readString(target.resolve("payload.txt"), StandardCharsets.UTF_8));
+    }
+
+    /// Refuses to replace a target that appears while an access-denied publication is waiting to retry.
+    ///
+    /// @param temporaryDirectory isolated test directory
+    /// @throws Exception if directory preparation or publication probing fails
+    @Test
+    public void refuseRacedPublicationTarget(@TempDir Path temporaryDirectory) throws Exception {
+        Path source = temporaryDirectory.resolve("source");
+        Path target = temporaryDirectory.resolve("target");
+        Files.createDirectory(source);
+        Files.writeString(source.resolve("payload.txt"), "source", StandardCharsets.UTF_8);
+
+        FileAlreadyExistsException exception = assertThrows(
+                FileAlreadyExistsException.class,
+                () -> PluginPackageVersions.publishWithRetries(source, target, (moveSource, moveTarget) -> {
+                    Files.createDirectory(moveTarget);
+                    Files.writeString(moveTarget.resolve("payload.txt"), "raced", StandardCharsets.UTF_8);
+                    throw new AccessDeniedException(
+                            moveSource.toString(),
+                            moveTarget.toString(),
+                            "simulated publication race"
+                    );
+                })
+        );
+
+        assertTrue(exception.getMessage().contains("target appeared"));
+        assertEquals("source", Files.readString(source.resolve("payload.txt"), StandardCharsets.UTF_8));
+        assertEquals("raced", Files.readString(target.resolve("payload.txt"), StandardCharsets.UTF_8));
+    }
+
+    /// Stops after the bounded retry budget when publication remains access-denied.
+    ///
+    /// @param temporaryDirectory isolated test directory
+    /// @throws Exception if directory preparation or publication probing fails
+    @Test
+    public void stopAfterPersistentPublicationDenial(@TempDir Path temporaryDirectory) throws Exception {
+        Path source = temporaryDirectory.resolve("source");
+        Path target = temporaryDirectory.resolve("target");
+        Files.createDirectory(source);
+        AtomicInteger attempts = new AtomicInteger();
+
+        IOException exception = assertThrows(
+                IOException.class,
+                () -> PluginPackageVersions.publishWithRetries(source, target, (moveSource, moveTarget) -> {
+                    attempts.incrementAndGet();
+                    throw new AccessDeniedException(
+                            moveSource.toString(),
+                            moveTarget.toString(),
+                            "simulated persistent sharing violation"
+                    );
+                })
+        );
+
+        assertEquals(5, attempts.get());
+        assertTrue(exception.getMessage().contains("after 5 attempts"));
+        assertTrue(Files.isDirectory(source));
+        assertFalse(Files.exists(target));
+    }
+
+    /// Keeps both directories unchanged when the real no-replace move finds an existing target.
+    ///
+    /// @param temporaryDirectory isolated test directory
+    /// @throws Exception if directory preparation or publication probing fails
+    @Test
+    public void neverReplaceExistingPublicationTarget(@TempDir Path temporaryDirectory) throws Exception {
+        Path source = temporaryDirectory.resolve("source");
+        Path target = temporaryDirectory.resolve("target");
+        Files.createDirectory(source);
+        Files.createDirectory(target);
+        Files.writeString(source.resolve("payload.txt"), "source", StandardCharsets.UTF_8);
+        Files.writeString(target.resolve("payload.txt"), "existing", StandardCharsets.UTF_8);
+
+        assertThrows(
+                FileAlreadyExistsException.class,
+                () -> PluginPackageVersions.publishWithRetries(source, target, Files::move)
+        );
+
+        assertEquals("source", Files.readString(source.resolve("payload.txt"), StandardCharsets.UTF_8));
+        assertEquals("existing", Files.readString(target.resolve("payload.txt"), StandardCharsets.UTF_8));
     }
 
     /// Keeps a locked legacy extraction untouched while publishing the new immutable layout.
@@ -195,7 +332,7 @@ public final class PluginPackageVersionsTest {
     /// @param payload version-specific payload
     /// @throws IOException if package creation fails
     private static void writePackage(Path target, String payload) throws IOException {
-        byte[] nestedJar = createNestedJar(payload);
+        byte @Unmodifiable [] nestedJar = createNestedJar(payload);
         try (ZipOutputStream output = new ZipOutputStream(Files.newOutputStream(target))) {
             writeZipEntry(output, "plugin.json", "{\"id\":\"dev.hmclnex.test\"}".getBytes(StandardCharsets.UTF_8));
             writeZipEntry(output, "mixins.test.json", "{}".getBytes(StandardCharsets.UTF_8));
@@ -209,7 +346,7 @@ public final class PluginPackageVersionsTest {
     /// @param payload version-specific payload
     /// @return complete JAR bytes
     /// @throws IOException if JAR creation fails
-    private static byte[] createNestedJar(String payload) throws IOException {
+    private static byte @Unmodifiable [] createNestedJar(String payload) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (JarOutputStream output = new JarOutputStream(bytes)) {
             JarEntry entry = new JarEntry("payload.txt");
@@ -227,7 +364,11 @@ public final class PluginPackageVersionsTest {
     /// @param name entry name
     /// @param contents entry bytes
     /// @throws IOException if writing fails
-    private static void writeZipEntry(ZipOutputStream output, String name, byte[] contents) throws IOException {
+    private static void writeZipEntry(
+            ZipOutputStream output,
+            String name,
+            byte @Unmodifiable [] contents
+    ) throws IOException {
         ZipEntry entry = new ZipEntry(name);
         entry.setTime(0);
         output.putNextEntry(entry);

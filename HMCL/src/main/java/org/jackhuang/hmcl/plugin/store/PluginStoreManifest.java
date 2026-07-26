@@ -18,14 +18,21 @@
 package org.jackhuang.hmcl.plugin.store;
 
 import com.google.gson.annotations.SerializedName;
+import org.jackhuang.hmcl.plugin.PluginDependency;
 import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginVersion;
+import org.jackhuang.hmcl.plugin.PluginVersionConstraint;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.IOException;
+import java.time.DateTimeException;
+import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -36,7 +43,7 @@ import java.util.regex.Pattern;
 @NotNullByDefault
 public final class PluginStoreManifest {
     /// Current plugin repository manifest schema version.
-    public static final int CURRENT_SCHEMA_VERSION = 1;
+    public static final int CURRENT_SCHEMA_VERSION = 2;
 
     /// Required SHA-256 representation for downloadable packages.
     private static final Pattern SHA256_PATTERN = Pattern.compile("[0-9a-fA-F]{64}");
@@ -65,6 +72,10 @@ public final class PluginStoreManifest {
     @SerializedName("source")
     private @Nullable String source;
 
+    /// Optional raw README URL displayed by the plugin details view.
+    @SerializedName("readmeUrl")
+    private @Nullable String readmeUrl;
+
     /// Creates an empty repository manifest for Gson deserialization.
     public PluginStoreManifest() {
     }
@@ -92,6 +103,26 @@ public final class PluginStoreManifest {
             return List.of();
         }
         return values.stream().map(Objects::requireNonNull).toList();
+    }
+
+    /// Returns published versions sorted from newest to oldest.
+    ///
+    /// @return descending immutable version list
+    public @Unmodifiable List<PluginVersionEntry> getVersionsNewestFirst() {
+        List<PluginVersionEntry> sorted = new ArrayList<>(getVersions());
+        sorted.sort((left, right) -> PluginVersion.compare(right.getVersion(), left.getVersion()));
+        return List.copyOf(sorted);
+    }
+
+    /// Finds one published version by its exact version string.
+    ///
+    /// @param version exact version string
+    /// @return matching version or `null`
+    public @Nullable PluginVersionEntry getVersion(String version) {
+        return getVersions().stream()
+                .filter(candidate -> candidate.getVersion().equals(version))
+                .findFirst()
+                .orElse(null);
     }
 
     /// Returns the greatest published version independent of JSON array ordering.
@@ -124,12 +155,19 @@ public final class PluginStoreManifest {
         return Objects.requireNonNullElse(source, "");
     }
 
+    /// Returns the optional raw README URL.
+    ///
+    /// @return README URL or an empty string
+    public String getReadmeUrl() {
+        return Objects.requireNonNullElse(readmeUrl, "");
+    }
+
     /// Validates schema, plugin identity, version uniqueness, checksums, and API declarations.
     ///
     /// @param expectedPluginId plugin ID from the parent registry entry
     /// @throws IOException if the manifest is invalid or belongs to another plugin
     public void validate(String expectedPluginId) throws IOException {
-        if (schemaVersion != CURRENT_SCHEMA_VERSION) {
+        if (schemaVersion < 1 || schemaVersion > CURRENT_SCHEMA_VERSION) {
             throw new IOException("Unsupported plugin repository schemaVersion: " + schemaVersion);
         }
         if (!expectedPluginId.equals(id)) {
@@ -145,7 +183,10 @@ public final class PluginStoreManifest {
             if (version == null) {
                 throw new IOException("Plugin repository contains a null version: " + expectedPluginId);
             }
-            version.validate();
+            version.validate(schemaVersion);
+            if (version.getDependencies().stream().anyMatch(dependency -> expectedPluginId.equals(dependency.getId()))) {
+                throw new IOException("Plugin version " + version.getVersion() + " cannot depend on itself");
+            }
             if (!publishedVersions.add(version.getVersion())) {
                 throw new IOException("Duplicate plugin version " + version.getVersion() + " for " + expectedPluginId);
             }
@@ -170,6 +211,10 @@ public final class PluginStoreManifest {
         /// Minimum compatible launcher version.
         @SerializedName("minLauncherVersion")
         private @Nullable String minLauncherVersion;
+
+        /// Schema-v4 launcher version constraint expressed with [PluginVersionConstraint] syntax.
+        @SerializedName("launcherVersion")
+        private @Nullable String launcherVersion;
 
         /// Optional release notes.
         @SerializedName("releaseNotes")
@@ -198,6 +243,21 @@ public final class PluginStoreManifest {
         /// Release channel such as `stable`, `beta`, or `nightly`.
         @SerializedName("channel")
         private @Nullable String channel = "stable";
+
+        /// Permissions declared by this exact package version.
+        @SerializedName("permissions")
+        private @Nullable List<@Nullable PluginPermission> permissions;
+
+        /// Permissions required before this exact schema-v4 package version may execute.
+        @SerializedName("requiredPermissions")
+        private @Nullable List<@Nullable PluginPermission> requiredPermissions;
+
+        /// Required plugins and version constraints for this exact package version.
+        @SerializedName("dependencies")
+        private @Nullable List<@Nullable PluginDependency> dependencies = List.of();
+
+        /// Whether the parent repository schema makes this dependency metadata authoritative for package checks.
+        private transient boolean dependencyMetadataAuthoritative;
 
         /// Creates an empty version entry for Gson deserialization.
         public PluginVersionEntry() {
@@ -229,6 +289,39 @@ public final class PluginStoreManifest {
         /// @return minimum launcher version
         public String getMinLauncherVersion() {
             return Objects.requireNonNullElse(minLauncherVersion, "");
+        }
+
+        /// Returns the normalized launcher version constraint for this package version.
+        ///
+        /// API-v1 through API-v3 minimum versions are exposed as equivalent `>=` constraints. An absent legacy
+        /// minimum accepts every launcher version.
+        ///
+        /// @return launcher version constraint expression
+        public String getLauncherVersion() {
+            if (pluginApiVersion >= 4) {
+                return PluginVersionConstraint.parse(
+                        Objects.requireNonNull(launcherVersion, "API-v4 version has no launcherVersion")
+                ).getExpression();
+            }
+            String minimum = getMinLauncherVersion();
+            return minimum.isBlank()
+                    ? PluginVersionConstraint.ANY.getExpression()
+                    : PluginVersionConstraint.parse(">=" + minimum).getExpression();
+        }
+
+        /// Returns the parsed launcher version constraint used by compatibility filtering.
+        ///
+        /// @return parsed launcher version constraint
+        public PluginVersionConstraint getLauncherVersionConstraint() {
+            return PluginVersionConstraint.parse(getLauncherVersion());
+        }
+
+        /// Returns whether one launcher version satisfies this package version's constraint.
+        ///
+        /// @param version launcher version to test
+        /// @return whether the launcher is compatible
+        public boolean matchesLauncherVersion(String version) {
+            return getLauncherVersionConstraint().matches(version);
         }
 
         /// Returns optional release notes.
@@ -280,10 +373,73 @@ public final class PluginStoreManifest {
             return Objects.requireNonNullElse(channel, "stable");
         }
 
+        /// Returns declared permissions in manifest order.
+        ///
+        /// @return immutable permission list
+        public @Unmodifiable List<PluginPermission> getPermissions() {
+            @Nullable List<@Nullable PluginPermission> values = permissions;
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return values.stream().map(Objects::requireNonNull).toList();
+        }
+
+        /// Returns permissions required before this package version may execute.
+        ///
+        /// API-v3 entries preserve the launcher policy by treating every declared permission as required when the
+        /// `mixin` capability is present and no permission as required otherwise. API-v4 entries use the explicit
+        /// `requiredPermissions` declaration.
+        ///
+        /// @return immutable required permission list
+        public @Unmodifiable List<PluginPermission> getRequiredPermissions() {
+            if (pluginApiVersion < 4) {
+                return getPermissions().contains(PluginPermission.MIXIN) ? getPermissions() : List.of();
+            }
+            @Nullable List<@Nullable PluginPermission> values = requiredPermissions;
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return values.stream().map(Objects::requireNonNull).toList();
+        }
+
+        /// Returns permissions that may be denied without blocking ordinary package execution.
+        ///
+        /// @return immutable optional permission list in declaration order
+        public @Unmodifiable List<PluginPermission> getOptionalPermissions() {
+            @Unmodifiable List<PluginPermission> required = getRequiredPermissions();
+            if (required.isEmpty()) {
+                return getPermissions();
+            }
+            return getPermissions().stream().filter(permission -> !required.contains(permission)).toList();
+        }
+
+        /// Returns required plugin dependencies and version constraints.
+        ///
+        /// @return immutable dependency list
+        public @Unmodifiable List<PluginDependency> getDependencies() {
+            @Nullable List<@Nullable PluginDependency> values = dependencies;
+            if (values == null || values.isEmpty()) {
+                return List.of();
+            }
+            return values.stream().map(Objects::requireNonNull).toList();
+        }
+
+        /// Returns whether downloaded package dependencies must exactly match this repository entry.
+        ///
+        /// Repository schema v2 introduced version-scoped dependency metadata. API-v3 entries are also treated as
+        /// authoritative because their package schema requires an explicit security and dependency declaration.
+        ///
+        /// @return whether package dependency metadata must match
+        public boolean hasAuthoritativeDependencies() {
+            return dependencyMetadataAuthoritative || pluginApiVersion >= 3;
+        }
+
         /// Validates required download metadata and supported plugin API version.
         ///
+        /// @param repositorySchemaVersion parent repository schema version
         /// @throws IOException if the version entry is invalid
-        private void validate() throws IOException {
+        private void validate(int repositorySchemaVersion) throws IOException {
+            dependencyMetadataAuthoritative = repositorySchemaVersion >= 2;
             if (version == null || version.isBlank()) {
                 throw new IOException("Plugin version entry has no version");
             }
@@ -296,9 +452,134 @@ public final class PluginStoreManifest {
             if (size == null || size <= 0) {
                 throw new IOException("Plugin version " + version + " has an invalid size");
             }
-            if (pluginApiVersion < 1 || pluginApiVersion > PluginManifest.CURRENT_SCHEMA_VERSION) {
+            if (pluginApiVersion < 1) {
+                throw new IOException("Plugin version " + version + " has an invalid plugin API "
+                        + pluginApiVersion);
+            }
+            if (pluginApiVersion > PluginManifest.CURRENT_SCHEMA_VERSION) {
                 throw new IOException("Plugin version " + version + " requires unsupported plugin API "
                         + pluginApiVersion);
+            }
+            if (releaseDate != null && !releaseDate.isBlank()) {
+                try {
+                    LocalDate.parse(releaseDate);
+                } catch (DateTimeException exception) {
+                    throw new IOException("Plugin version " + version + " has an invalid releaseDate", exception);
+                }
+            }
+            String normalizedChannel = getChannel();
+            if (!normalizedChannel.equals("stable")
+                    && !normalizedChannel.equals("beta")
+                    && !normalizedChannel.equals("nightly")) {
+                throw new IOException("Plugin version " + version + " has an invalid channel: " + normalizedChannel);
+            }
+
+            if (pluginApiVersion >= 3 && permissions == null) {
+                throw new IOException("Plugin version " + version + " must declare permissions");
+            }
+            EnumSet<PluginPermission> seenPermissions = EnumSet.noneOf(PluginPermission.class);
+            if (permissions != null) {
+                for (@Nullable PluginPermission permission : permissions) {
+                    if (permission == null) {
+                        throw new IOException("Plugin version " + version + " has an unknown permission");
+                    }
+                    if (!seenPermissions.add(permission)) {
+                        throw new IOException("Plugin version " + version + " has duplicate permission "
+                                + permission.getId());
+                    }
+                }
+            }
+
+            if (pluginApiVersion >= 4 && requiredPermissions == null) {
+                throw new IOException("Plugin version " + version + " must declare requiredPermissions");
+            }
+            if (pluginApiVersion < 4 && requiredPermissions != null) {
+                throw new IOException("Plugin version " + version
+                        + " cannot declare requiredPermissions before plugin API 4");
+            }
+            EnumSet<PluginPermission> seenRequiredPermissions = EnumSet.noneOf(PluginPermission.class);
+            if (requiredPermissions != null) {
+                for (@Nullable PluginPermission permission : requiredPermissions) {
+                    if (permission == null) {
+                        throw new IOException("Plugin version " + version + " has an unknown required permission");
+                    }
+                    if (!seenRequiredPermissions.add(permission)) {
+                        throw new IOException("Plugin version " + version + " has duplicate required permission "
+                                + permission.getId());
+                    }
+                    if (!seenPermissions.contains(permission)) {
+                        throw new IOException("Plugin version " + version + " requires undeclared permission "
+                                + permission.getId());
+                    }
+                }
+            }
+            if (pluginApiVersion >= 4
+                    && seenPermissions.contains(PluginPermission.MIXIN)
+                    && !seenRequiredPermissions.contains(PluginPermission.MIXIN)) {
+                throw new IOException("Plugin version " + version + " must require permission mixin");
+            }
+
+            if (pluginApiVersion >= 4) {
+                if (minLauncherVersion != null) {
+                    throw new IOException("Plugin version " + version
+                            + " cannot declare minLauncherVersion with plugin API 4");
+                }
+                requireValidLauncherVersionConstraint(launcherVersion, version);
+            } else if (launcherVersion != null) {
+                throw new IOException("Plugin version " + version
+                        + " cannot declare launcherVersion before plugin API 4");
+            } else if (!getMinLauncherVersion().isBlank()) {
+                requireValidLegacyLauncherMinimum(getMinLauncherVersion(), version);
+            }
+
+            Set<String> dependencyIds = new HashSet<>();
+            if (dependencies != null) {
+                for (@Nullable PluginDependency dependency : dependencies) {
+                    if (dependency == null) {
+                        throw new IOException("Plugin version " + version + " has a null dependency");
+                    }
+                    if (!dependencyIds.add(dependency.getId())) {
+                        throw new IOException("Plugin version " + version + " has duplicate dependency "
+                                + dependency.getId());
+                    }
+                }
+            }
+        }
+
+        /// Requires a launcher constraint to be present and accepted by the shared version parser.
+        ///
+        /// @param value serialized launcher constraint
+        /// @param versionName package version used in diagnostics
+        /// @throws IOException if the value is missing, blank, or malformed
+        private static void requireValidLauncherVersionConstraint(
+                @Nullable String value,
+                String versionName
+        ) throws IOException {
+            if (value == null || value.isBlank()) {
+                throw new IOException("Plugin version " + versionName + " must declare launcherVersion");
+            }
+            try {
+                PluginVersionConstraint.parse(value);
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Plugin version " + versionName
+                        + " has invalid launcherVersion constraint " + value, exception);
+            }
+        }
+
+        /// Validates one legacy minimum launcher version through the shared constraint parser.
+        ///
+        /// @param value legacy minimum launcher version
+        /// @param versionName package version used in diagnostics
+        /// @throws IOException if the minimum cannot form a valid `>=` constraint
+        private static void requireValidLegacyLauncherMinimum(
+                String value,
+                String versionName
+        ) throws IOException {
+            try {
+                PluginVersionConstraint.parse(">=" + value);
+            } catch (IllegalArgumentException exception) {
+                throw new IOException("Plugin version " + versionName
+                        + " has invalid minLauncherVersion " + value, exception);
             }
         }
     }
