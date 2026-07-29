@@ -128,7 +128,7 @@ public final class PluginStorePreferences implements PluginSourceRepository {
         }
     }
 
-    /// Loads and validates version-two sources, always retaining a valid official source at priority zero.
+    /// Loads and validates version-two sources while ensuring the required official source remains present.
     ///
     /// @param persistedSources serialized source list
     /// @return valid source snapshot
@@ -539,17 +539,17 @@ public final class PluginStorePreferences implements PluginSourceRepository {
     /// @return immutable custom source URL snapshot
     synchronized @Unmodifiable List<String> getCustomRegistryUrls() {
         return sources.stream()
-                .filter(source -> !source.isOfficial())
+                .filter(source -> !source.isOfficial() && source.isEnabled())
                 .map(PluginSource::getUrl)
                 .toList();
     }
 
-    /// Returns the legacy active source represented by the highest-priority custom source.
+    /// Returns the legacy active source represented by the highest-priority enabled custom source.
     ///
     /// @return active registry URL
     synchronized String getActiveRegistryUrl() {
         return sources.stream()
-                .filter(source -> !source.isOfficial())
+                .filter(source -> !source.isOfficial() && source.isEnabled())
                 .findFirst()
                 .map(PluginSource::getUrl)
                 .orElse(PluginStoreManager.DEFAULT_REGISTRY_URL);

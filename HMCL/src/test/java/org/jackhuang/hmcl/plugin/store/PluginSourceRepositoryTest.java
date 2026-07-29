@@ -20,6 +20,7 @@ package org.jackhuang.hmcl.plugin.store;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Unmodifiable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -151,6 +152,19 @@ public final class PluginSourceRepositoryTest {
         assertFalse(disabled.isEnabled());
         assertFalse(preferences.getSources().get(0).isEnabled());
         assertTrue(preferences.getSources().get(0).isOfficial());
+    }
+
+    /// Keeps disabled custom sources out of the legacy single-source manager state after a reload.
+    @Test
+    public void excludesDisabledCustomSourceFromLegacyManagerReload(@TempDir Path localHome) throws Exception {
+        PluginStorePreferences preferences = new PluginStorePreferences(localHome);
+        PluginSource source = preferences.addSource("https://one.example/plugins.json", null);
+        preferences.setEnabled(source.getId(), false);
+
+        PluginStoreManager reloaded = new PluginStoreManager(localHome);
+
+        assertEquals(PluginStoreManager.DEFAULT_REGISTRY_URL, reloaded.getRegistryUrl());
+        assertEquals(List.of(PluginStoreManager.DEFAULT_REGISTRY_URL), reloaded.getRegistryUrls());
     }
 
     /// Updates only a custom source alias while retaining its existing URL and stable ID.
@@ -299,7 +313,7 @@ public final class PluginSourceRepositoryTest {
     ///
     /// @param sources source snapshot
     /// @return ordered source IDs
-    private static List<String> sourceIds(List<PluginSource> sources) {
+    private static @Unmodifiable List<String> sourceIds(List<PluginSource> sources) {
         return sources.stream().map(PluginSource::getId).toList();
     }
 }
