@@ -265,12 +265,26 @@ public final class PluginSourceLoadResult {
             return new URI(uri.getScheme(), null, uri.getHost(), uri.getPort(), uri.getPath(), null, null).toString();
         } catch (URISyntaxException exception) {
             int queryIndex = url.indexOf('?');
-            String withoutQuery = queryIndex < 0 ? url : url.substring(0, queryIndex);
-            int credentialsIndex = withoutQuery.indexOf('@');
-            int schemeIndex = withoutQuery.indexOf("://");
-            return credentialsIndex > schemeIndex ? withoutQuery.substring(0, schemeIndex + 3)
-                    + withoutQuery.substring(credentialsIndex + 1) : withoutQuery;
+            int fragmentIndex = url.indexOf('#');
+            int suffixIndex = earliestIndex(queryIndex, fragmentIndex);
+            String withoutSensitiveSuffix = suffixIndex < 0 ? url : url.substring(0, suffixIndex);
+            int credentialsIndex = withoutSensitiveSuffix.indexOf('@');
+            int schemeIndex = withoutSensitiveSuffix.indexOf("://");
+            return credentialsIndex > schemeIndex ? withoutSensitiveSuffix.substring(0, schemeIndex + 3)
+                    + withoutSensitiveSuffix.substring(credentialsIndex + 1) : withoutSensitiveSuffix;
         }
+    }
+
+    /// Returns the earliest non-negative index, or `-1` when neither candidate is present.
+    ///
+    /// @param first first optional index
+    /// @param second second optional index
+    /// @return earliest present index
+    private static int earliestIndex(int first, int second) {
+        if (first < 0) {
+            return second;
+        }
+        return second < 0 ? first : Math.min(first, second);
     }
 
     /// Enumerates every explicit outcome of one source refresh request.
