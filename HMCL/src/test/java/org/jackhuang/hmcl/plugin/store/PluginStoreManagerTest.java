@@ -222,23 +222,23 @@ public final class PluginStoreManagerTest {
         }
     }
 
-    /// Persists favorite changes across managers and rejects IDs that cannot be stored safely.
+    /// Persists favorite changes across repository instances and rejects IDs that cannot be stored safely.
     @Test
     public void persistFavoritesAndRejectInvalidIds(@TempDir Path temporaryDirectory) {
         String pluginId = "dev.hmclnex.test.favorite";
-        PluginStoreManager manager = new PluginStoreManager(temporaryDirectory);
+        PluginStorePreferences preferences = new PluginStorePreferences(temporaryDirectory);
 
-        manager.setFavorite(pluginId, true);
-        assertTrue(manager.isFavorite(pluginId));
-        assertEquals(Set.of(pluginId), manager.getFavoritePluginIds());
+        preferences.setFavorite(pluginId, true);
+        assertTrue(preferences.isFavorite(pluginId));
+        assertEquals(Set.of(pluginId), preferences.getFavoritePluginIds());
 
-        PluginStoreManager reloaded = new PluginStoreManager(temporaryDirectory);
+        PluginStorePreferences reloaded = new PluginStorePreferences(temporaryDirectory);
         assertTrue(reloaded.isFavorite(pluginId));
         assertThrows(IllegalArgumentException.class, () -> reloaded.setFavorite("invalid favorite id", true));
         assertEquals(Set.of(pluginId), reloaded.getFavoritePluginIds());
 
         reloaded.setFavorite(pluginId, false);
-        assertFalse(new PluginStoreManager(temporaryDirectory).isFavorite(pluginId));
+        assertFalse(new PluginStorePreferences(temporaryDirectory).isFavorite(pluginId));
     }
 
     /// Reuses a cached README until clearing the manager caches forces a fresh request.

@@ -1111,7 +1111,7 @@ public final class PluginStoreManager {
     /// @param url URL to validate
     /// @param purpose value used in diagnostics
     /// @throws IOException if the URL is malformed or insecure
-    private static void validateRemoteUrl(String url, String purpose) throws IOException {
+    static void validateRemoteUrl(String url, String purpose) throws IOException {
         final URI uri;
         try {
             uri = new URI(url);
