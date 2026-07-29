@@ -177,6 +177,24 @@ public final class PluginStoreAggregatorTest {
         assertTrue(!result.getFailureMessage().contains("fragment"));
     }
 
+    /// Removes fragments from malformed URI tokens while retaining the full failure for logs.
+    @Test
+    public void sourceFailureMessageSanitizesMalformedUriFragments() {
+        IOException failure = new IOException(
+                "Unable to load ftp://user:secret@example.test/path%zz#fragment-secret"
+        );
+        PluginSourceLoadResult result = PluginSourceLoadResult.failed(
+                source("failed", "https://example.test/plugins.json", true),
+                0,
+                failure
+        );
+
+        assertEquals("Unable to load ftp://example.test/path%zz", result.getFailureMessage());
+        assertSame(failure, result.getFailure());
+        assertTrue(!Objects.requireNonNull(result.getFailureMessage()).contains("secret"));
+        assertTrue(!result.getFailureMessage().contains("fragment"));
+    }
+
     /// Rejects success-result counts that do not match the source items with unresolved manifests.
     @Test
     public void sourceResultSuccessRejectsMismatchedPartialManifestCounts() throws Exception {
