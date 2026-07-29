@@ -23,18 +23,29 @@ import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
+import org.jackhuang.hmcl.plugin.store.PluginStoreDependencyResolver;
+import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
+import org.jackhuang.hmcl.plugin.store.PluginStoreManifest;
+import org.jackhuang.hmcl.plugin.store.PluginStoreRegistry;
 import org.jackhuang.hmcl.plugin.store.PluginStoreSnapshot;
 import org.jackhuang.hmcl.ui.SVG;
+import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jsoup.nodes.Document;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -69,6 +80,7 @@ public final class PluginStorePageTest {
         assertTrue(PluginStorePage.isSafeExternalLink("https://example.com/plugin"));
         assertTrue(PluginStorePage.isSafeExternalLink("http://localhost:8080/plugin"));
         assertTrue(PluginStorePage.isSafeExternalLink("http://127.0.0.1:8080/plugin"));
+        assertFalse(PluginStorePage.isSafeExternalLink("http://127.0.0.1.attacker.example/plugin"));
         assertFalse(PluginStorePage.isSafeExternalLink("http://example.com/plugin"));
         assertFalse(PluginStorePage.isSafeExternalLink("file:///tmp/plugin"));
         assertFalse(PluginStorePage.isSafeExternalLink("javascript:alert(1)"));
@@ -351,10 +363,7 @@ public final class PluginStorePageTest {
     @Test
     public void snapshotPublicationPrecedesSourceManagementRefresh() {
         java.util.concurrent.atomic.AtomicReference<PluginStoreSnapshot> current = new java.util.concurrent.atomic.AtomicReference<>();
-        PluginSource source = new PluginSource(
-                PluginSource.OFFICIAL_ID, PluginStoreManager.DEFAULT_REGISTRY_URL, null, true, true);
-        PluginStoreSnapshot snapshot = PluginStorePage.failureSnapshot(
-                1, source, 2, new java.io.IOException("failure"));
+        PluginStoreSnapshot snapshot = degradedSnapshot();
         java.util.concurrent.atomic.AtomicLong observedGeneration = new java.util.concurrent.atomic.AtomicLong(-1);
 
         PluginStorePage.publishSnapshotThenNotify(
@@ -366,31 +375,282 @@ public final class PluginStorePageTest {
         assertEquals(1, observedGeneration.get());
     }
 
-    /// Replaces a previous success with a current-generation source failure snapshot.
+    /// Presents successful catalog rows while visibly warning that one enabled source failed.
     @Test
-    public void currentGenerationFailureReplacesPriorSuccessfulSourceSnapshot() {
-        PluginSource source = new PluginSource(
-                PluginSource.OFFICIAL_ID, PluginStoreManager.DEFAULT_REGISTRY_URL, null, true, true);
-        PluginStoreSnapshot previous = new PluginStoreSnapshot(1, List.of(
-                PluginSourceLoadResult.failed(source, 1, new java.io.IOException("previous"))));
-        PluginStoreSnapshot failure = PluginStorePage.failureSnapshot(
-                2,
-                source,
-                3,
-                new java.io.IOException("current")
-        );
+    public void partialSourceFailureProducesVisibleDegradedState() {
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(degradedSnapshot());
 
-        assertEquals(1, previous.getGeneration());
-        assertEquals(2, failure.getGeneration());
-        assertEquals(PluginSourceLoadResult.Status.FAILED, failure.getSourceResults().get(0).getStatus());
-        assertEquals("current", failure.getSourceResults().get(0).getFailureMessage());
+        assertEquals(PluginStorePage.StoreState.DEGRADED, presentation.state());
+        assertTrue(presentation.showPluginRows());
+        assertEquals(1, presentation.failedSourceCount());
     }
 
-    /// Keeps source load durations nonnegative for source-management presentation.
+    /// Identifies the winner's source for every remotely downloaded install-plan row.
     @Test
-    public void storeLoadResultRejectsNegativeDuration() {
-        assertThrows(IllegalArgumentException.class,
-                () -> new PluginStorePage.StoreLoadResult(new PluginStoreManager(), List.of(), -1));
+    public void everyDownloadedPlanRowIdentifiesItsWinningSource() throws IOException {
+        List<String> rows = PluginStorePage.formatInstallPlan(planWithTwoRemoteSources());
+
+        assertTrue(rows.stream().anyMatch(row -> row.contains("Source A")));
+        assertTrue(rows.stream().anyMatch(row -> row.contains("Source B")));
+    }
+
+    /// Retains the accepted aggregate state while a newer refresh is still active.
+    @Test
+    public void refreshingPresentationRetainsPriorAcceptedPluginRows() {
+        assertTrue(PluginStorePage.presentationFor(degradedSnapshot(), true).showPluginRows());
+    }
+
+    /// Rejects a superseded completion even when its aggregate result was once current.
+    @Test
+    public void staleCompletionCannotReplaceNewerAcceptedSnapshot() {
+        PluginStoreSnapshot stale = degradedSnapshot();
+        PluginStoreSnapshot current = conflictingSnapshot();
+
+        assertFalse(PluginStorePage.canPublishSnapshot(1, 2, stale, stale));
+        assertFalse(PluginStorePage.canPublishSnapshot(2, 2, stale, current));
+        assertTrue(PluginStorePage.canPublishSnapshot(2, 2, current, current));
+    }
+
+    /// Closes a page-owned aggregate loader exactly once at its deterministic application lifetime boundary.
+    @Test
+    public void aggregateLoaderClosesOnceAtApplicationShutdown() {
+        AtomicBoolean closed = new AtomicBoolean();
+        AtomicInteger closeCount = new AtomicInteger();
+
+        PluginStorePage.closeAggregatorWhenApplicationStops(false, closed, closeCount::incrementAndGet);
+        PluginStorePage.closeAggregatorWhenApplicationStops(false, closed, closeCount::incrementAndGet);
+        assertEquals(0, closeCount.get());
+
+        PluginStorePage.closeAggregatorWhenApplicationStops(true, closed, closeCount::incrementAndGet);
+        PluginStorePage.closeAggregatorWhenApplicationStops(true, closed, closeCount::incrementAndGet);
+
+        assertEquals(1, closeCount.get());
+    }
+
+    /// Retains the degradation warning for the snapshot that resolved a plan when a later refresh is healthy.
+    @Test
+    public void planWarningUsesResolvedSnapshotAfterLaterRefresh() {
+        PluginStoreSnapshot resolvedSnapshot = degradedSnapshot();
+        PluginStoreSnapshot laterSnapshot = conflictingSnapshot();
+
+        assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(resolvedSnapshot)).contains("Source B"));
+        assertNull(PluginStorePage.degradedCatalogWarning(laterSnapshot));
+    }
+
+    /// Redacts hostile source aliases and IDs before displaying degraded catalog warnings.
+    @Test
+    public void degradedCatalogWarningNeverContainsSourceUrls() {
+        PluginSource hostile = new PluginSource(
+                "https://id.example.test/catalog?token=secret#fragment",
+                "https://source.example.test/plugins.json",
+                "https://user:password@alias.example.test/catalog?token=secret#fragment",
+                true,
+                false
+        );
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.failed(hostile, 1, new IOException("offline"))
+        ));
+
+        String warning = PluginStorePage.degradedCatalogWarning(snapshot);
+        assertFalse(warning.contains("://"));
+        assertFalse(warning.contains("password"));
+        assertFalse(warning.contains("token"));
+    }
+
+    /// Returns no plugin rows when every configured enabled source fails.
+    @Test
+    public void allFailedSourcesProduceAnAllFailedPresentation() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.failed(source, 1, new IOException("offline"))
+        )));
+
+        assertEquals(PluginStorePage.StoreState.ALL_FAILED, presentation.state());
+        assertFalse(presentation.showPluginRows());
+    }
+
+    /// Returns the source-management state when no configured source is enabled.
+    @Test
+    public void disabledSourcesProduceNoEnabledSourcesPresentation() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", false, false);
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.disabled(source)
+        )));
+
+        assertEquals(PluginStorePage.StoreState.NO_ENABLED_SOURCES, presentation.state());
+        assertFalse(presentation.showPluginRows());
+    }
+
+    /// Marks aggregate winners with source conflicts for a dedicated warning and details presentation.
+    @Test
+    public void conflictingCandidatesProduceConflictPresentation() {
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(conflictingSnapshot());
+
+        assertEquals(PluginStorePage.StoreState.CONFLICTS, presentation.state());
+        assertTrue(presentation.hasConflicts());
+    }
+
+    /// Adds the winning source to aggregate row metadata rather than selecting a global registry name.
+    @Test
+    public void rowSubtitleContainsWinningSourceBadge() {
+        PluginStoreItem item = successfulItem(
+                new PluginSource("source_a", "https://source-a.example.test/plugins.json", "Source A", true, false),
+                "dev.hmclnex.source.badge",
+                "Badge Plugin"
+        );
+
+        assertTrue(PluginStorePage.buildPluginRowSubtitle(item, null).contains("Source: Source A"));
+    }
+
+    /// Keeps favorites attached to plugin identity regardless of the source that currently wins that identity.
+    @Test
+    public void favoriteFilteringKeysOnlyByPluginId() {
+        assertTrue(PluginStorePage.matchesFavorite(Set.of("dev.hmclnex.favorite"),
+                successfulItem(
+                        new PluginSource("source_b", "https://source-b.example.test/plugins.json", "Source B", true, false),
+                        "dev.hmclnex.favorite",
+                        "Favorite"
+                )));
+    }
+
+    /// Retains installed state after a source deletion removes the catalog winner.
+    @Test
+    public void installedStateSurvivesSourceRemoval() {
+        PluginManifest installed = new PluginManifest(
+                "dev.hmclnex.removed", "Removed Source Plugin", "1.0.0",
+                PluginManifest.PluginType.JAVA, "dev.hmclnex.test.Plugin"
+        );
+
+        assertEquals(PluginInstallPlan.Action.UPDATE, PluginStorePage.rootInstallationAction(installed));
+        assertFalse(PluginStorePage.presentationFor(new PluginStoreSnapshot(2, List.of())).showPluginRows());
+    }
+
+    /// Creates an aggregate snapshot containing one successful winner and one unavailable enabled source.
+    ///
+    /// @return degraded aggregate snapshot
+    private static PluginStoreSnapshot degradedSnapshot() {
+        PluginSource sourceA = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginSource sourceB = new PluginSource(
+                "source_b", "https://source-b.example.test/plugins.json", "Source B", true, false);
+        return new PluginStoreSnapshot(1, List.of(
+                successfulResult(sourceA, "dev.hmclnex.aggregate", "Aggregate Plugin"),
+                PluginSourceLoadResult.failed(sourceB, 1, new IOException("offline"))
+        ));
+    }
+
+    /// Creates an aggregate snapshot with the same plugin ID published by two priority-ordered sources.
+    ///
+    /// @return conflict-bearing aggregate snapshot
+    private static PluginStoreSnapshot conflictingSnapshot() {
+        PluginSource sourceA = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginSource sourceB = new PluginSource(
+                "source_b", "https://source-b.example.test/plugins.json", "Source B", true, false);
+        return new PluginStoreSnapshot(1, List.of(
+                successfulResult(sourceA, "dev.hmclnex.conflict", "Source A Plugin"),
+                successfulResult(sourceB, "dev.hmclnex.conflict", "Source B Plugin")
+        ));
+    }
+
+    /// Resolves an aggregate plan whose root and dependency intentionally come from different winners.
+    ///
+    /// @return source-aware dependency plan
+    private static PluginInstallPlan planWithTwoRemoteSources() throws IOException {
+        PluginSource sourceA = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginSource sourceB = new PluginSource(
+                "source_b", "https://source-b.example.test/plugins.json", "Source B", true, false);
+        PluginStoreItem root = itemWithManifest(
+                sourceA,
+                "dev.hmclnex.root",
+                "Root",
+                "[{\"id\":\"dev.hmclnex.dependency\",\"version\":\"*\"}]",
+                "1"
+        );
+        PluginStoreItem dependency = itemWithManifest(
+                sourceB, "dev.hmclnex.dependency", "Dependency", "[]", "2"
+        );
+        PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
+                Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
+        );
+        return new PluginStoreDependencyResolver(Map.of(
+                root.getEntry().getId(), root,
+                dependency.getEntry().getId(), dependency
+        )).resolveInstallPlan(root.getEntry().getId(), rootVersion, Map.of(), Map.of(), Map.of());
+    }
+
+    /// Creates one successful source result for a registry item without a repository manifest.
+    ///
+    /// @param source source owning the item
+    /// @param pluginId stable plugin ID
+    /// @param name display name
+    /// @return successful source result
+    private static PluginSourceLoadResult successfulResult(PluginSource source, String pluginId, String name) {
+        PluginStoreItem item = successfulItem(source, pluginId, name);
+        return PluginSourceLoadResult.success(
+                source, 1, List.of(item), 1, item.getRegistry(), item.getSourceManager());
+    }
+
+    /// Creates one source-bound registry item without a repository manifest.
+    ///
+    /// @param source source owning the item
+    /// @param pluginId stable plugin ID
+    /// @param name display name
+    /// @return source-bound catalog item
+    private static PluginStoreItem successfulItem(PluginSource source, String pluginId, String name) {
+        PluginStoreRegistry registry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {
+                  "schemaVersion": 1,
+                  "name": "%s",
+                  "plugins": [{
+                    "id": "%s",
+                    "name": "%s",
+                    "manifestUrl": "https://plugins.example.test/%s.json"
+                  }]
+                }
+                """.formatted(source.getAlias(), pluginId, name, pluginId), PluginStoreRegistry.class));
+        return new PluginStoreItem(source, registry, new PluginStoreManager(), registry.getPlugins().get(0), null);
+    }
+
+    /// Creates one source-bound catalog item with a complete repository manifest.
+    ///
+    /// @param source source owning the item
+    /// @param pluginId stable plugin ID
+    /// @param name display name
+    /// @param dependenciesJson dependency JSON array
+    /// @param hashDigit hexadecimal checksum digit
+    /// @return source-bound catalog item
+    /// @throws IOException if the generated manifest is invalid
+    private static PluginStoreItem itemWithManifest(
+            PluginSource source,
+            String pluginId,
+            String name,
+            String dependenciesJson,
+            String hashDigit
+    ) throws IOException {
+        PluginStoreItem item = successfulItem(source, pluginId, name);
+        PluginStoreManifest manifest = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "versions": [{
+                    "version": "1.0.0",
+                    "packageUrl": "https://plugins.example.test/%s.npl",
+                    "sha256": "%s",
+                    "pluginApiVersion": 4,
+                    "permissions": [],
+                    "requiredPermissions": [],
+                    "launcherVersion": "*",
+                    "dependencies": %s,
+                    "size": 1
+                  }]
+                }
+                """.formatted(pluginId, pluginId, hashDigit.repeat(64), dependenciesJson), PluginStoreManifest.class));
+        manifest.validate(pluginId);
+        return new PluginStoreItem(source, item.getRegistry(), item.getSourceManager(), item.getEntry(), manifest);
     }
 
     /// Requires every runtime state used by plugin rows and permission details to have a localized label.

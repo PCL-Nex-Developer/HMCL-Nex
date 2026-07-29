@@ -107,8 +107,18 @@ public class LauncherSettingsPage extends DecoratorAnimatedPage implements Decor
         tab.select(pluginTab, false);
     }
 
+    /// Selects the cached plugin-store tab without recreating its aggregate loader.
     public void showPluginStore() {
         tab.select(pluginStoreTab, false);
+    }
+
+    /// Closes the cached plugin-store aggregate loader at the owning application's shutdown boundary.
+    ///
+    /// The tab keeps the page instance while hidden, so this must not run during tab navigation.
+    public void closePluginStoreAtApplicationShutdown() {
+        if (pluginStoreTab.isInitialized()) {
+            pluginStoreTab.getNode().closeAtApplicationShutdown(true);
+        }
     }
 
     @Override
