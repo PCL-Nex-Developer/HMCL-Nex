@@ -19,7 +19,6 @@ package org.jackhuang.hmcl.ui.main;
 
 import com.jfoenix.controls.JFXButton;
 import com.jfoenix.controls.JFXComboBox;
-import com.jfoenix.controls.JFXDialogLayout;
 import com.jfoenix.controls.JFXSpinner;
 import com.jfoenix.controls.JFXTextField;
 import javafx.beans.property.ReadOnlyObjectProperty;
@@ -41,7 +40,6 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.text.TextAlignment;
-import javafx.util.StringConverter;
 import org.jackhuang.hmcl.plugin.LocalPluginInspection;
 import org.jackhuang.hmcl.plugin.PluginDependency;
 import org.jackhuang.hmcl.plugin.PluginInstallationPlanningSnapshot;
@@ -49,9 +47,12 @@ import org.jackhuang.hmcl.plugin.PluginManager;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
+import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
+import org.jackhuang.hmcl.plugin.store.PluginSource;
 import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
+import org.jackhuang.hmcl.plugin.store.PluginStorePreferences;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManifest;
 import org.jackhuang.hmcl.plugin.store.PluginStoreRegistry;
 import org.jackhuang.hmcl.task.Schedulers;
@@ -61,7 +62,6 @@ import org.jackhuang.hmcl.ui.FXUtils;
 import org.jackhuang.hmcl.ui.HTMLRenderer;
 import org.jackhuang.hmcl.ui.SVG;
 import org.jackhuang.hmcl.ui.construct.ComponentList;
-import org.jackhuang.hmcl.ui.construct.DialogCloseEvent;
 import org.jackhuang.hmcl.ui.construct.LineButton;
 import org.jackhuang.hmcl.ui.construct.LineSelectButton;
 import org.jackhuang.hmcl.ui.construct.PageAware;
@@ -115,8 +115,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     private final ReadOnlyObjectWrapper<State> state =
             new ReadOnlyObjectWrapper<>(State.fromTitle(i18n("plugin.store")));
 
-    /// Remote registry, preference, compatibility, README, and download service.
+    /// Remote registry, compatibility, README, and download service for the fixed official source.
     private PluginStoreManager storeManager = new PluginStoreManager();
+
+    /// Page-owned persistence for favorite plugin IDs.
+    private final PluginStorePreferences storePreferences = new PluginStorePreferences(Metadata.HMCL_LOCAL_HOME);
 
     /// Process-wide plugin lifecycle manager used to inspect and publish downloaded packages.
     private final PluginManager pluginManager = PluginManager.getInstance();
@@ -135,9 +138,6 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Category filter selector.
     private final JFXComboBox<CategoryItem> categoryBox = new JFXComboBox<>();
-
-    /// Registry source selector.
-    private final JFXComboBox<String> sourceBox = new JFXComboBox<>();
 
     /// Whether the current result is limited to persisted favorite plugins.
     private final BooleanProperty favoritesOnly = new SimpleBooleanProperty();
@@ -159,12 +159,6 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Monotonic request generation preventing stale registry loads from replacing a newer selection.
     private long storeLoadGeneration;
-
-    /// Suppresses source reloads while the selector is synchronized from a completed request.
-    private boolean updatingSourceSelection;
-
-    /// Registry names learned from successful loads, indexed by their secure source URL.
-    private final Map<String, String> sourceNames = new LinkedHashMap<>();
 
     /// Whether the current generation has published a complete registry result.
     private boolean storeLoaded;
@@ -203,8 +197,12 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         JFXButton settingsButton = createIconButton(
                 i18n("plugin.store.settings"),
                 SVG.SETTINGS,
-                this::showStoreSettings
+                () -> {
+                }
         );
+        settingsButton.setDisable(true);
+        settingsButton.setTooltip(new Tooltip(i18n("plugin.store.settings")));
+        settingsButton.setAccessibleHelp(i18n("plugin.store.settings"));
         favoritesOnlyButton.getStyleClass().add("jfx-tool-bar-button");
         favoritesOnlyButton.setMinSize(40, 40);
         favoritesOnlyButton.setPrefSize(40, 40);
@@ -226,52 +224,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         categoryBox.valueProperty().addListener((var observable, @Nullable var oldValue, @Nullable var newValue) ->
                 applyFilter());
 
-        for (String registryUrl : storeManager.getRegistryUrls()) {
-            sourceNames.put(registryUrl, registrySourceFallback(registryUrl));
-        }
-        sourceNames.put(
-                PluginStoreManager.DEFAULT_REGISTRY_URL,
-                i18n("plugin.store.source.official")
-        );
-        sourceBox.setConverter(new StringConverter<>() {
-            /// Converts a source URL to its learned registry name for display.
-            ///
-            /// @param url registry URL or `null`
-            /// @return source display name
-            @Override
-            public String toString(@Nullable String url) {
-                return url == null ? "" : sourceDisplayName(url, sourceNames.get(url));
-            }
-
-            /// Returns the unchanged source token when the non-editable control invokes reverse conversion.
-            ///
-            /// @param value displayed value or `null`
-            /// @return unchanged non-null value
-            @Override
-            public String fromString(@Nullable String value) {
-                return Objects.requireNonNullElse(value, "");
-            }
-        });
-        sourceBox.setMinWidth(210);
-        sourceBox.setPrefWidth(300);
-        sourceBox.setMaxWidth(360);
-        sourceBox.getItems().setAll(storeManager.getRegistryUrls());
-        sourceBox.getSelectionModel().select(storeManager.getRegistryUrl());
-        updateSourceTooltip(storeManager.getRegistryUrl());
-        sourceBox.valueProperty().addListener((var observable, @Nullable var oldValue, @Nullable var newValue) -> {
-            updateSourceTooltip(newValue);
-            if (!updatingSourceSelection
-                    && newValue != null
-                    && !Objects.equals(oldValue, newValue)) {
-                sourceBox.hide();
-                loadPluginStore();
-            }
-        });
-
-        filters.getChildren().addAll(
-                categoryBox,
-                sourceBox
-        );
+        filters.getChildren().add(categoryBox);
 
         HBox statusRow = new HBox(statusLabel);
         statusRow.setAlignment(Pos.CENTER_LEFT);
@@ -330,43 +283,6 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         favoritesOnlyButton.setStyle(selected ? "-fx-text-fill: -monet-primary;" : null);
     }
 
-    /// Returns a compact registry name without exposing a long source URL in the selector.
-    ///
-    /// @param url secure registry URL
-    /// @param registryName learned manifest name or `null`
-    /// @return human-readable source label
-    static String sourceDisplayName(String url, @Nullable String registryName) {
-        return StringUtils.isBlank(registryName) ? registrySourceFallback(url) : registryName;
-    }
-
-    /// Builds a stable host-and-file fallback for a source whose manifest has not loaded yet.
-    ///
-    /// @param url secure registry URL
-    /// @return compact fallback label that is never the complete URL
-    private static String registrySourceFallback(String url) {
-        try {
-            URI uri = new URI(url);
-            @Nullable String host = uri.getHost();
-            String path = Objects.requireNonNullElse(uri.getPath(), "");
-            int separator = path.lastIndexOf('/');
-            String fileName = separator >= 0 ? path.substring(separator + 1) : path;
-            if (StringUtils.isNotBlank(host)) {
-                return StringUtils.isBlank(fileName) ? host : host + " / " + fileName;
-            }
-        } catch (URISyntaxException ignored) {
-            // The manager performs authoritative URL validation before any request is accepted.
-        }
-        return i18n("plugin.store.source.custom");
-    }
-
-    /// Keeps the complete selected source discoverable without placing it in the main layout.
-    ///
-    /// @param url selected registry URL or `null`
-    private void updateSourceTooltip(@Nullable String url) {
-        sourceBox.setTooltip(url == null ? null : new Tooltip(url));
-        sourceBox.setAccessibleHelp(url);
-    }
-
     /// Replaces the plugin rows with one explicit loading, error, empty, or no-result state.
     ///
     /// @param icon state glyph
@@ -382,7 +298,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         pluginList.getContent().setAll(message);
     }
 
-    /// Loads the selected registry and its repository manifests on a background thread.
+    /// Loads the fixed official source and its repository manifests on a background thread.
     private void loadPluginStore() {
         long generation = ++storeLoadGeneration;
         storeLoaded = false;
@@ -394,15 +310,18 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         allItems.clear();
         refreshInstalledManifests();
 
-        @Nullable String selectedRegistry = sourceBox.getSelectionModel().getSelectedItem();
-        String registryUrl = StringUtils.isBlank(selectedRegistry)
-                ? storeManager.getRegistryUrl()
-                : Objects.requireNonNull(selectedRegistry);
         PluginStoreManager requestManager = new PluginStoreManager();
+        PluginSource officialSource = new PluginSource(
+                PluginSource.OFFICIAL_ID,
+                PluginStoreManager.DEFAULT_REGISTRY_URL,
+                null,
+                true,
+                true
+        );
 
         Task.supplyAsync(() -> {
             try {
-                requestManager.loadRegistryForRequest(registryUrl);
+                requestManager.loadSource(officialSource);
                 return new StoreLoadResult(requestManager, requestManager.getStoreItems());
             } catch (IOException exception) {
                 LOG.error("Failed to load plugin store", exception);
@@ -423,24 +342,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 );
                 return;
             }
-            result.manager.commitActiveRegistry();
             storeManager = result.manager;
             storeLoaded = true;
             storeLoadFailure = null;
             allItems.clear();
             allItems.addAll(result.items);
-            @Nullable PluginStoreRegistry loadedRegistry = storeManager.getRegistry();
-            if (loadedRegistry != null) {
-                sourceNames.put(storeManager.getRegistryUrl(), loadedRegistry.getName());
-            }
-            updatingSourceSelection = true;
-            try {
-                sourceBox.getItems().setAll(storeManager.getRegistryUrls());
-                sourceBox.getSelectionModel().select(storeManager.getRegistryUrl());
-                updateSourceTooltip(storeManager.getRegistryUrl());
-            } finally {
-                updatingSourceSelection = false;
-            }
             refreshCategories();
             applyFilter();
         }).start();
@@ -515,7 +421,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 .filter(item -> matchesCategory(item, category))
                 .filter(item -> matchesKeyword(item, keyword))
                 .filter(item -> !favoritesOnly.get()
-                        || storeManager.isFavorite(item.getEntry().getId()))
+                        || storePreferences.isFavorite(item.getEntry().getId()))
                 .sorted((left, right) -> displayName(left).compareToIgnoreCase(displayName(right)))
                 .toList();
 
@@ -533,7 +439,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         }
 
         @Nullable PluginStoreRegistry registry = storeManager.getRegistry();
-        String registryName = registry == null ? storeManager.getRegistryUrl() : registry.getName();
+        String registryName = registry == null ? PluginStoreManager.DEFAULT_REGISTRY_URL : registry.getName();
         String loadedStatus = i18n("plugin.store.loaded") + ": " + filtered.size() + "/" + allItems.size()
                 + " " + i18n("plugin.store.plugins") + " - " + registryName;
         @Nullable String installedFailure = installedManifestFailure;
@@ -597,10 +503,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @return plugin navigation row
     private LineButton createPluginRow(PluginStoreItem item) {
         PluginStoreRegistry.PluginStoreEntry entry = item.getEntry();
+        PluginStoreManager sourceManager = item.getSourceManager();
         @Nullable PluginStoreManifest.PluginVersionEntry compatibleVersion =
-                storeManager.getLatestCompatibleVersion(item.getManifest());
+                sourceManager.getLatestCompatibleVersion(item.getManifest());
         @Nullable PluginManifest installed = installedManifests.get(entry.getId());
-        boolean hasUpdate = storeManager.hasUpdate(installed, compatibleVersion);
+        boolean hasUpdate = sourceManager.hasUpdate(installed, compatibleVersion);
         boolean manifestLoadFailed = item.getManifest() == null;
         boolean installedStateUnavailable = installedManifestFailure != null;
         @Nullable PluginRuntimeStatus runtimeStatus = installed == null
@@ -801,11 +708,12 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         button.setMinSize(36, 36);
         button.setPrefSize(36, 36);
         button.setMaxSize(36, 36);
-        updateFavoriteButton(button, storeManager.isFavorite(pluginId));
+        updateFavoriteButton(button, storePreferences.isFavorite(pluginId));
         button.setOnMouseClicked(event -> event.consume());
         button.setOnAction(event -> {
-            boolean favorite = storeManager.toggleFavorite(pluginId);
-            updateFavoriteButton(button, favorite);
+            boolean favorite = !storePreferences.isFavorite(pluginId);
+            storePreferences.setFavorite(pluginId, favorite);
+            updateFavoriteButton(button, storePreferences.isFavorite(pluginId));
             if (favoritesOnly.get() && !favorite) {
                 applyFilter();
             }
@@ -841,9 +749,13 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Returns a localized compatibility status and backend validation reason.
     ///
+    /// @param sourceManager manager bound to the selected store item
     /// @param version selected remote version
     /// @return compatibility text
-    private String compatibilityText(PluginStoreManifest.PluginVersionEntry version) {
+    private String compatibilityText(
+            PluginStoreManager sourceManager,
+            PluginStoreManifest.PluginVersionEntry version
+    ) {
         if (version.getPluginApiVersion() != PluginManifest.CURRENT_SCHEMA_VERSION) {
             return i18n(
                     "plugin.store.compatibility.incompatible",
@@ -855,7 +767,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             );
         }
         try {
-            storeManager.validateCompatibility(version);
+            sourceManager.validateCompatibility(version);
             List<String> requirements = new ArrayList<>();
             String launcherVersion = version.getLauncherVersion();
             if (!launcherVersion.isBlank() && !launcherVersion.equals("*")) {
@@ -891,11 +803,13 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Loads README text asynchronously and exposes loading, retry, unavailable, and error states.
     ///
+    /// @param sourceManager manager bound to the repository manifest
     /// @param manifest repository manifest
     /// @param container README section content
     /// @param status status label retained across retries
     /// @param retryButton retry action
     private void loadReadme(
+            PluginStoreManager sourceManager,
             PluginStoreManifest manifest,
             VBox container,
             Label status,
@@ -912,10 +826,9 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         }
         status.setText(i18n("plugin.store.readme.loading"));
 
-        PluginStoreManager requestManager = storeManager;
         Task.supplyAsync(() -> {
             try {
-                return requestManager.fetchReadme(manifest);
+                return sourceManager.fetchReadme(manifest);
             } catch (IOException exception) {
                 throw new RuntimeException(exception);
             }
@@ -1076,7 +989,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             try {
                 PluginInstallationPlanningSnapshot planningSnapshot =
                         pluginManager.getInstallationPlanningSnapshot();
-                return storeManager.resolveInstallPlan(
+                return item.getSourceManager().resolveInstallPlan(
                         item.getEntry().getId(),
                         version,
                         planningSnapshot.getManifests(),
@@ -1095,7 +1008,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 );
                 return;
             }
-            confirmInstallPlan(plan);
+            confirmInstallPlan(plan, item.getSourceManager());
         }).start();
     }
 
@@ -1106,7 +1019,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// in the plan but cannot modify permission state.
     ///
     /// @param plan dependency-first resolved plan
-    private void confirmInstallPlan(PluginInstallPlan plan) {
+    /// @param sourceManager manager bound to every downloaded plan entry
+    private void confirmInstallPlan(PluginInstallPlan plan, PluginStoreManager sourceManager) {
         PluginInstallPlan.Entry root = plan.getRootEntry();
         List<PluginPermissionRequest> requests = new ArrayList<>();
         try {
@@ -1142,7 +1056,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 root.getAction() == PluginInstallPlan.Action.UPDATE,
                 List.copyOf(requests),
                 formatInstallPlan(plan),
-                grantsByPluginId -> executeInstallPlan(plan, grantsByPluginId)
+                grantsByPluginId -> executeInstallPlan(plan, sourceManager, grantsByPluginId)
         );
     }
 
@@ -1273,9 +1187,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Downloads every mutable plan entry into isolated staging before any installed file is touched.
     ///
     /// @param plan confirmed installation plan
+    /// @param sourceManager manager bound to the resolved dependency plan
     /// @param grantsByPluginId immutable grants chosen for every changed plugin
     private void executeInstallPlan(
             PluginInstallPlan plan,
+            PluginStoreManager sourceManager,
             @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId
     ) {
         PluginDialogs.ProgressDialog progressDialog = PluginDialogs.showProgress(
@@ -1300,7 +1216,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                     ));
                     PluginStoreManifest.PluginVersionEntry remoteVersion =
                             Objects.requireNonNull(entry.getRemoteVersion(), "Download entry has no remote version");
-                    Path staged = storeManager.downloadPluginToStaging(
+                    Path staged = sourceManager.downloadPluginToStaging(
                             entry.getPluginId(),
                             remoteVersion,
                             stagingDirectory
@@ -1412,11 +1328,6 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         return String.format(Locale.ROOT, "%.1f MB", size / 1024.0 / 1024.0);
     }
 
-    /// Opens the custom registry URL editor and reloads an accepted secure source.
-    private void showStoreSettings() {
-        Controllers.dialog(new RegistrySourceDialog());
-    }
-
     /// Shows an application-owned HMCL error dialog on the JavaFX thread.
     ///
     /// @param title localized title
@@ -1475,6 +1386,9 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
         /// Repository manifest containing versions and README metadata.
         private final PluginStoreManifest manifest;
+
+        /// Source-scoped manager retained with the selected store item.
+        private final PluginStoreManager sourceManager;
 
         /// Native HMCL selector for the exact version displayed and installed.
         private final LineSelectButton<VersionItem> versionSelector = new LineSelectButton<>();
@@ -1547,6 +1461,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         private PluginDetailsPage(PluginStoreItem item, PluginStoreManifest manifest) {
             this.item = item;
             this.manifest = manifest;
+            this.sourceManager = item.getSourceManager();
             this.detailsState = new ReadOnlyObjectWrapper<>(State.fromTitle(displayName(item)));
             getStyleClass().add("gray-background");
 
@@ -1584,9 +1499,9 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             versionSelector.setNullSafeConverter(VersionItem::toString);
             versionSelector.setDescriptionConverter((@Nullable var candidate) -> candidate == null
                     ? ""
-                    : compatibilityText(candidate.version));
+                    : compatibilityText(sourceManager, candidate.version));
             @Unmodifiable List<VersionItem> versions = manifest.getVersionsNewestFirst().stream()
-                    .map(version -> new VersionItem(version, storeManager.isCompatible(version)))
+                    .map(version -> new VersionItem(version, sourceManager.isCompatible(version)))
                     .toList();
             versionSelector.setItems(versions);
             versionSelector.valueProperty().addListener((var observable, @Nullable var oldValue,
@@ -1633,7 +1548,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             readmeStatus.setWrapText(true);
             JFXButton retryButton = new JFXButton(i18n("plugin.store.readme.retry"));
             retryButton.setOnAction(event ->
-                    loadReadme(manifest, readmeContainer, readmeStatus, retryButton));
+                    loadReadme(sourceManager, manifest, readmeContainer, readmeStatus, retryButton));
             content.getChildren().addAll(
                     ComponentList.createComponentListTitle(i18n("plugin.store.readme")),
                     readmeContainer
@@ -1648,7 +1563,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             getChildren().setAll(scrollPane, actions);
 
             @Nullable PluginStoreManifest.PluginVersionEntry latestCompatible =
-                    storeManager.getLatestCompatibleVersion(manifest);
+                    sourceManager.getLatestCompatibleVersion(manifest);
             @Nullable VersionItem initial = versions.stream()
                     .filter(candidate -> latestCompatible != null
                             && candidate.version.getVersion().equals(latestCompatible.getVersion()))
@@ -1659,7 +1574,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             } else {
                 versionSelector.setValue(initial);
             }
-            loadReadme(manifest, readmeContainer, readmeStatus, retryButton);
+            loadReadme(sourceManager, manifest, readmeContainer, readmeStatus, retryButton);
         }
 
         /// Builds the plugin identity, author, category, tags, installed version, and license rows.
@@ -1738,7 +1653,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             PluginStoreManifest.PluginVersionEntry version = selected.version;
             compatibilityRow.setLeading(compatibilityIcon(selected.compatible));
             compatibilityRow.pseudoClassStateChanged(PSEUDO_ERROR, !selected.compatible);
-            compatibilityRow.setSubtitle(compatibilityText(version));
+            compatibilityRow.setSubtitle(compatibilityText(sourceManager, version));
             String launcherVersion = version.getLauncherVersion();
             launcherVersionRow.setSubtitle(launcherVersionRequirementText(launcherVersion));
             channelRow.setSubtitle(version.getChannel());
@@ -1780,7 +1695,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                     : "plugin.store.install.selected"));
             installButton.setTooltip(selected.compatible
                     ? null
-                    : new Tooltip(i18n("plugin.store.install.incompatible", compatibilityText(version))));
+                    : new Tooltip(i18n("plugin.store.install.incompatible", compatibilityText(sourceManager, version))));
             installButton.setDisable(!selected.compatible);
         }
 
@@ -1836,58 +1751,6 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         row.setSubtitle(subtitle);
         row.setMouseTransparent(true);
         return row;
-    }
-
-    /// HMCL dialog that validates and saves one custom plugin registry URL.
-    @NotNullByDefault
-    private final class RegistrySourceDialog extends JFXDialogLayout {
-        /// Editable registry URL.
-        private final JFXTextField urlField = new JFXTextField();
-
-        /// Creates the registry source editor with explicit save and cancel actions.
-        private RegistrySourceDialog() {
-            setHeading(new HBox(new Label(i18n("plugin.store.custom_registry"))));
-
-            urlField.setPromptText(i18n("plugin.store.registry_url"));
-            urlField.setText(storeManager.getRegistryUrl());
-            urlField.setPrefWidth(520);
-            setBody(urlField);
-
-            JFXButton saveButton = new JFXButton(i18n("button.save"));
-            saveButton.getStyleClass().add("dialog-accept");
-            saveButton.setOnAction(event -> saveRegistry());
-
-            JFXButton cancelButton = new JFXButton(i18n("button.cancel"));
-            cancelButton.getStyleClass().add("dialog-cancel");
-            cancelButton.setOnAction(event -> fireEvent(new DialogCloseEvent()));
-
-            setActions(saveButton, cancelButton);
-            FXUtils.onEscPressed(this, cancelButton::fire);
-        }
-
-        /// Validates the entered source, persists it, closes the dialog, and reloads the store.
-        private void saveRegistry() {
-            String url = Optional.ofNullable(urlField.getText()).orElse("").trim();
-            if (url.isEmpty()) {
-                return;
-            }
-            try {
-                storeManager.addCustomRegistry(url);
-                sourceNames.putIfAbsent(url, registrySourceFallback(url));
-                updatingSourceSelection = true;
-                try {
-                    sourceBox.getItems().setAll(storeManager.getRegistryUrls());
-                    sourceBox.getSelectionModel().select(url);
-                    updateSourceTooltip(url);
-                } finally {
-                    updatingSourceSelection = false;
-                }
-                fireEvent(new DialogCloseEvent());
-                loadPluginStore();
-            } catch (IllegalArgumentException exception) {
-                showError(i18n("plugin.store.load_failed"), failureMessage(exception));
-            }
-        }
     }
 
     /// Immutable result of one isolated registry load request.
