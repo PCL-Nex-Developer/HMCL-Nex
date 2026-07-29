@@ -37,12 +37,12 @@ import java.util.function.Function;
 @NotNullByDefault
 public final class PluginStoreAggregator implements AutoCloseable {
     /// Default maximum number of source requests active at once.
-    static final int DEFAULT_CONCURRENCY = 4;
+    static final int DEFAULT_CONCURRENCY = PluginSourceLoadExecutor.MAX_CONCURRENCY;
 
-    /// Counts daemon threads created for source requests.
+    /// Counts daemon threads created for aggregate source requests.
     private static final AtomicInteger THREAD_COUNTER = new AtomicInteger();
 
-    /// Dedicated bounded executor that isolates source refresh requests from shared application pools.
+    /// Dedicated bounded executor owned and closed by this aggregate client.
     private final ExecutorService executor;
 
     /// Builds an unloaded manager for each enabled source request.
@@ -81,12 +81,12 @@ public final class PluginStoreAggregator implements AutoCloseable {
         executor = Executors.newFixedThreadPool(concurrency, newSourceThreadFactory());
     }
 
-    /// Creates daemon threads that cannot keep the launcher alive after a refresh is abandoned.
+    /// Creates daemon aggregate threads that cannot keep the launcher alive after an abandoned refresh.
     ///
     /// @return named daemon thread factory
     private static ThreadFactory newSourceThreadFactory() {
         return task -> {
-            Thread thread = new Thread(task, "plugin-store-source-" + THREAD_COUNTER.incrementAndGet());
+            Thread thread = new Thread(task, "plugin-store-aggregate-" + THREAD_COUNTER.incrementAndGet());
             thread.setDaemon(true);
             return thread;
         };
@@ -121,28 +121,46 @@ public final class PluginStoreAggregator implements AutoCloseable {
     private PluginSourceLoadResult load(PluginSource source) {
         long startedAt = System.nanoTime();
         try {
-            PluginStoreManager manager = managerFactory.apply(source);
-            if (manager == null) {
-                throw new IOException("Plugin store manager factory returned null");
+            return PluginSourceLoadExecutor.call(() -> loadWithinGlobalLimit(source, startedAt));
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            return PluginSourceLoadResult.failed(source, elapsedMillis(startedAt),
+                    new IOException("Plugin source load was interrupted", exception));
+        } catch (Exception exception) {
+            if (exception instanceof IOException ioException) {
+                return PluginSourceLoadResult.failed(source, elapsedMillis(startedAt), ioException);
             }
-            manager.loadSource(source);
-            List<PluginStoreItem> items = manager.getStoreItems();
-            int partialFailureCount = (int) items.stream().filter(item -> item.getManifest() == null).count();
-            @Nullable PluginStoreRegistry registry = manager.getRegistry();
-            if (registry == null) {
-                throw new IOException("Plugin source loaded without a registry");
-            }
-            return PluginSourceLoadResult.success(
-                    source,
-                    elapsedMillis(startedAt),
-                    items,
-                    partialFailureCount,
-                    registry,
-                    manager
-            );
-        } catch (IOException exception) {
-            return PluginSourceLoadResult.failed(source, elapsedMillis(startedAt), exception);
+            return PluginSourceLoadResult.failed(source, elapsedMillis(startedAt),
+                    new IOException("Failed to load plugin source", exception));
         }
+    }
+
+    /// Loads one source after the shared process-wide source-load permit has been acquired.
+    ///
+    /// @param source enabled source configuration
+    /// @param startedAt monotonic source request start timestamp
+    /// @return completed source load result
+    /// @throws IOException if source transport, parsing, or validation fails
+    private PluginSourceLoadResult loadWithinGlobalLimit(PluginSource source, long startedAt) throws IOException {
+        PluginStoreManager manager = managerFactory.apply(source);
+        if (manager == null) {
+            throw new IOException("Plugin store manager factory returned null");
+        }
+        manager.loadSource(source);
+        List<PluginStoreItem> items = manager.getStoreItems();
+        int partialFailureCount = (int) items.stream().filter(item -> item.getManifest() == null).count();
+        @Nullable PluginStoreRegistry registry = manager.getRegistry();
+        if (registry == null) {
+            throw new IOException("Plugin source loaded without a registry");
+        }
+        return PluginSourceLoadResult.success(
+                source,
+                elapsedMillis(startedAt),
+                items,
+                partialFailureCount,
+                registry,
+                manager
+        );
     }
 
     /// Converts elapsed monotonic time to a non-negative millisecond duration.

@@ -19,6 +19,7 @@ package org.jackhuang.hmcl.ui.main;
 
 import org.jackhuang.hmcl.plugin.store.PluginSource;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
+import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
 import org.jackhuang.hmcl.plugin.store.PluginStoreRegistry;
 import org.jackhuang.hmcl.plugin.store.PluginStoreSnapshot;
@@ -26,7 +27,9 @@ import org.jackhuang.hmcl.util.gson.JsonUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -103,19 +106,87 @@ public final class PluginSourceManagementPageTest {
         assertTrue(row.subtitle().endsWith("· -"));
     }
 
-    /// Includes validated registry description and safe homepage host in the save preview.
+    /// Includes normalized source configuration and validated registry metadata in the save preview.
     @Test
-    public void sourcePreviewIncludesRegistryDescriptionHomepageAndPluginCount() {
+    public void sourcePreviewIncludesConfigurationRegistryMetadataAndPluginCount() {
         assertEquals(
-                "Remote\nA curated plugin registry\nHomepage: plugins.example.org\n3 "
+                "URL: https://plugins.example.org/catalog/plugins.json\nAlias: Local\nRemote\n"
+                        + "A curated plugin registry\nHomepage: plugins.example.org\n3 "
                         + org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.plugins"),
                 PluginSourceManagementPage.previewMessage(
+                        "https://plugins.example.org/catalog/plugins.json",
+                        "Local",
                         "Remote",
                         "A curated plugin registry",
                         "plugins.example.org",
                         3
                 )
         );
+    }
+
+    /// Prefers a configuration-matching manual source success over an older aggregate failure and its duration/count.
+    @Test
+    public void currentManualResultsOverrideSnapshotFailureCountAndDuration() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult aggregate = PluginSourceLoadResult.failed(source, 10, new IOException("aggregate failure"));
+        PluginStoreRegistry registry = JsonUtils.GSON.fromJson("""
+                {
+                  "schemaVersion": 1,
+                  "name": "Manual",
+                  "plugins": [{
+                    "id": "dev.hmclnex.manual",
+                    "name": "Manual",
+                    "manifestUrl": "https://plugins.example.org/manifest.json"
+                  }]
+                }
+                """, PluginStoreRegistry.class);
+        PluginStoreManager manager = new PluginStoreManager();
+        PluginStoreItem item = new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(0), null);
+        PluginSourceLoadResult manual = PluginSourceLoadResult.success(
+                source, 20, List.of(item), 1, registry, manager);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(aggregate));
+
+        Map<String, PluginSourceLoadResult> merged = PluginSourceManagementPage.mergeSourceResults(
+                snapshot,
+                Map.of(source.getId(), manual),
+                List.of(source)
+        );
+
+        assertEquals(manual, merged.get(source.getId()));
+        assertEquals(PluginSourceLoadResult.Status.PARTIAL_FAILURE, merged.get(source.getId()).getStatus());
+        assertEquals(20, merged.get(source.getId()).getDurationMillis());
+        assertEquals(1, merged.get(source.getId()).getItems().size());
+    }
+
+    /// Discards aggregate and manual outcomes whose source URL no longer matches persisted configuration.
+    @Test
+    public void sourceResultMergeDiscardsOutcomesAfterSourceMutation() {
+        PluginSource original = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSource current = original.withConfiguration("https://plugins.example.org/changed.json", null);
+        PluginSourceLoadResult stale = PluginSourceLoadResult.failed(original, 10, new IOException("stale"));
+
+        assertTrue(PluginSourceManagementPage.mergeSourceResults(
+                new PluginStoreSnapshot(1, List.of(stale)),
+                Map.of(original.getId(), stale),
+                List.of(current)
+        ).isEmpty());
+    }
+
+    /// Gives custom source manual outcomes first priority for installed-plugin removal impact checks.
+    @Test
+    public void manualSourceItemsArePreferredForInstalledPluginDeletionWarning() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+
+        assertTrue(PluginSourceManagementPage.shouldWarnInstalledPlugins(
+                source,
+                Map.of(source.getId(), Set.of("dev.hmclnex.installed")),
+                Map.of(),
+                Set.of("dev.hmclnex.installed")
+        ));
     }
 
     /// Exposes explicit source diagnostics in details while retaining the full URL only there.
@@ -151,6 +222,44 @@ public final class PluginSourceManagementPageTest {
         assertTrue(details.message().contains("Plugins: 0"));
         assertTrue(details.message().contains("Partial manifest failures: 0"));
         assertTrue(details.message().contains("Conflicts: 0"));
+        assertTrue(details.message().contains("Type: Third-party"));
+        assertTrue(details.message().contains("Enabled: true"));
+    }
+
+    /// Keeps URL-bearing failure diagnostics out of compact rows while retaining them in details.
+    @Test
+    public void failedCompactRowsHideDiagnosticUrlWhileDetailsShowIt() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult failed = PluginSourceLoadResult.failed(
+                source,
+                7,
+                new IOException("Cannot read https://plugins.example.org/catalog/plugins.json?token=secret")
+        );
+
+        PluginSourceManagementPage.SourceRow row = PluginSourceManagementPage.sourceRow(source, null, failed);
+        PluginSourceManagementPage.SourceDetails details = PluginSourceManagementPage.sourceDetails(source, null, failed);
+
+        assertFalse(row.subtitle().contains("https://"));
+        assertTrue(row.subtitle().contains("FAILED"));
+        assertTrue(details.message().contains("Failure: Cannot read https://plugins.example.org/catalog/plugins.json"));
+        assertTrue(details.message().contains("Type: Third-party"));
+        assertTrue(details.message().contains("Enabled: true"));
+    }
+
+    /// Presents separate enabled and source result statuses for compact source rows.
+    @Test
+    public void compactRowsRenderEnabledAndActualLoadStatuses() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, false, false);
+        PluginSourceLoadResult disabled = PluginSourceLoadResult.disabled(source);
+
+        PluginSourceManagementPage.SourceRow unavailable = PluginSourceManagementPage.sourceRow(source, null, null);
+        PluginSourceManagementPage.SourceRow loaded = PluginSourceManagementPage.sourceRow(source, null, disabled);
+
+        assertTrue(unavailable.subtitle().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.disabled")));
+        assertTrue(unavailable.subtitle().contains("Unavailable"));
+        assertTrue(loaded.subtitle().contains("DISABLED"));
     }
 
     /// Rejects stale source-test completions after a newer request or source configuration mutation.

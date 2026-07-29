@@ -30,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -319,6 +320,147 @@ public final class PluginStoreAggregatorTest {
             assertTrue(maximumActiveRequests.get() <= concurrency);
         } finally {
             releaseRequests.countDown();
+        }
+    }
+
+    /// Limits concurrent requests across independently owned aggregators to the shared process-wide budget.
+    @Test
+    public void globalSourceLoadBudgetSpansIndependentAggregators() throws Exception {
+        AtomicInteger activeRequests = new AtomicInteger();
+        AtomicInteger maximumActiveRequests = new AtomicInteger();
+        CountDownLatch requestsStarted = new CountDownLatch(PluginSourceLoadExecutor.MAX_CONCURRENCY);
+        CountDownLatch releaseRequests = new CountDownLatch(1);
+        try (RegistryFixture first = RegistryFixture.startBlocking(
+                "First", requestsStarted, releaseRequests, activeRequests, maximumActiveRequests
+        );
+             RegistryFixture second = RegistryFixture.startBlocking(
+                     "Second", requestsStarted, releaseRequests, activeRequests, maximumActiveRequests
+             );
+             RegistryFixture third = RegistryFixture.startBlocking(
+                     "Third", requestsStarted, releaseRequests, activeRequests, maximumActiveRequests
+             );
+             RegistryFixture fourth = RegistryFixture.startBlocking(
+                     "Fourth", requestsStarted, releaseRequests, activeRequests, maximumActiveRequests
+             );
+             RegistryFixture fifth = RegistryFixture.startBlocking(
+                     "Fifth", requestsStarted, releaseRequests, activeRequests, maximumActiveRequests
+             );
+             RegistryFixture sixth = RegistryFixture.startBlocking(
+                     "Sixth", requestsStarted, releaseRequests, activeRequests, maximumActiveRequests
+             );
+             PluginStoreAggregator left = new PluginStoreAggregator(PluginSourceLoadExecutor.MAX_CONCURRENCY);
+             PluginStoreAggregator right = new PluginStoreAggregator(PluginSourceLoadExecutor.MAX_CONCURRENCY)) {
+            var leftFuture = left.refresh(List.of(
+                    source("first", first.registryUrl(), true),
+                    source("second", second.registryUrl(), true),
+                    source("third", third.registryUrl(), true)
+            ));
+            var rightFuture = right.refresh(List.of(
+                    source("fourth", fourth.registryUrl(), true),
+                    source("fifth", fifth.registryUrl(), true),
+                    source("sixth", sixth.registryUrl(), true)
+            ));
+            assertTrue(requestsStarted.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertTrue(maximumActiveRequests.get() <= PluginSourceLoadExecutor.MAX_CONCURRENCY);
+
+            releaseRequests.countDown();
+            leftFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            rightFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertTrue(maximumActiveRequests.get() <= PluginSourceLoadExecutor.MAX_CONCURRENCY);
+        } finally {
+            releaseRequests.countDown();
+        }
+    }
+
+    /// Preserves exact permit accounting when a source load is interrupted before permit acquisition.
+    @Test
+    public void interruptedGlobalPermitWaitDoesNotOverRelease() throws Exception {
+        CountDownLatch permitsOccupied = new CountDownLatch(PluginSourceLoadExecutor.MAX_CONCURRENCY);
+        CountDownLatch releasePermits = new CountDownLatch(1);
+        List<Thread> holders = new java.util.ArrayList<>();
+        try {
+            for (int index = 0; index < PluginSourceLoadExecutor.MAX_CONCURRENCY; index++) {
+                Thread holder = new Thread(() -> {
+                    try {
+                        PluginSourceLoadExecutor.call(() -> {
+                            permitsOccupied.countDown();
+                            releasePermits.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                            return null;
+                        });
+                    } catch (Exception exception) {
+                        throw new AssertionError(exception);
+                    }
+                });
+                holder.start();
+                holders.add(holder);
+            }
+            assertTrue(permitsOccupied.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+            FutureTask<Boolean> interruptedWaiter = new FutureTask<>(() -> {
+                try {
+                    PluginSourceLoadExecutor.call(() -> true);
+                    return false;
+                } catch (InterruptedException exception) {
+                    return true;
+                }
+            });
+            Thread waiter = new Thread(interruptedWaiter);
+            waiter.start();
+            waiter.interrupt();
+            assertTrue(interruptedWaiter.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+            releasePermits.countDown();
+            for (Thread holder : holders) {
+                holder.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            }
+
+            AtomicInteger active = new AtomicInteger();
+            AtomicInteger maximum = new AtomicInteger();
+            List<Thread> probes = new java.util.ArrayList<>();
+            CountDownLatch probeRelease = new CountDownLatch(1);
+            CountDownLatch probesStarted = new CountDownLatch(PluginSourceLoadExecutor.MAX_CONCURRENCY);
+            for (int index = 0; index < PluginSourceLoadExecutor.MAX_CONCURRENCY + 1; index++) {
+                Thread probe = new Thread(() -> {
+                    try {
+                        PluginSourceLoadExecutor.call(() -> {
+                            updateMaximum(maximum, active.incrementAndGet());
+                            probesStarted.countDown();
+                            probeRelease.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                            active.decrementAndGet();
+                            return null;
+                        });
+                    } catch (Exception exception) {
+                        throw new AssertionError(exception);
+                    }
+                });
+                probe.start();
+                probes.add(probe);
+            }
+            assertTrue(probesStarted.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertEquals(PluginSourceLoadExecutor.MAX_CONCURRENCY, active.get());
+            assertEquals(PluginSourceLoadExecutor.MAX_CONCURRENCY, maximum.get());
+            probeRelease.countDown();
+            for (Thread probe : probes) {
+                probe.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            }
+        } finally {
+            releasePermits.countDown();
+        }
+    }
+
+    /// Keeps the global source-load permit available after an independently owned aggregator closes.
+    @Test
+    public void closingOneAggregatorDoesNotDisableLaterSourceLoads() throws Exception {
+        try (RegistryFixture fixture = RegistryFixture.start("Later", "dev.test.later", "1.0.0")) {
+            try (PluginStoreAggregator closed = new PluginStoreAggregator()) {
+                closed.refresh(List.of(source("first", fixture.registryUrl(), true)))
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            try (PluginStoreAggregator later = new PluginStoreAggregator()) {
+                PluginStoreSnapshot snapshot = later.refresh(List.of(source("later", fixture.registryUrl(), true)))
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                assertEquals("later", snapshot.getSourceResults().get(0).getSource().getId());
+            }
         }
     }
 
