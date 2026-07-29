@@ -32,8 +32,11 @@ import java.util.regex.Pattern;
 /// Immutable outcome of loading one configured plugin source during an aggregate refresh.
 @NotNullByDefault
 public final class PluginSourceLoadResult {
-    /// Matches HTTP(S) URLs embedded in transport error messages for sanitization.
-    private static final Pattern URL_PATTERN = Pattern.compile("https?://[^\\s]+", Pattern.CASE_INSENSITIVE);
+    /// Matches explicit hierarchical URI tokens embedded in transport error messages for sanitization.
+    private static final Pattern URI_TOKEN_PATTERN = Pattern.compile(
+            "\\b[a-z][a-z0-9+.-]*://[^\\s]+",
+            Pattern.CASE_INSENSITIVE
+    );
 
     /// Source configuration this outcome belongs to.
     private final PluginSource source;
@@ -126,8 +129,11 @@ public final class PluginSourceLoadResult {
     ) {
         Objects.requireNonNull(registry, "registry");
         Objects.requireNonNull(manager, "manager");
-        if (partialManifestFailureCount > items.size()) {
-            throw new IllegalArgumentException("partialManifestFailureCount exceeds loaded item count");
+        long actualPartialManifestFailureCount = items.stream().filter(item -> item.getManifest() == null).count();
+        if (partialManifestFailureCount != actualPartialManifestFailureCount) {
+            throw new IllegalArgumentException(
+                    "partialManifestFailureCount does not match items with unavailable manifests"
+            );
         }
         Status status = partialManifestFailureCount == 0 ? Status.SUCCESS : Status.PARTIAL_FAILURE;
         return new PluginSourceLoadResult(
@@ -240,7 +246,7 @@ public final class PluginSourceLoadResult {
         if (message == null || message.isBlank()) {
             return failure.getClass().getSimpleName();
         }
-        Matcher matcher = URL_PATTERN.matcher(message);
+        Matcher matcher = URI_TOKEN_PATTERN.matcher(message);
         StringBuffer sanitized = new StringBuffer();
         while (matcher.find()) {
             matcher.appendReplacement(sanitized, Matcher.quoteReplacement(sanitizeUrl(matcher.group())));
