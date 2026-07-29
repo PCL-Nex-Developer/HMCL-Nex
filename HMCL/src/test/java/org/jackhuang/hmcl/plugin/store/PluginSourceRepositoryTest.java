@@ -153,6 +153,30 @@ public final class PluginSourceRepositoryTest {
         assertTrue(preferences.getSources().get(0).isOfficial());
     }
 
+    /// Updates only a custom source alias while retaining its existing URL and stable ID.
+    @Test
+    public void updatesCustomSourceAliasWithoutChangingItsUrl(@TempDir Path localHome) throws Exception {
+        PluginStorePreferences preferences = new PluginStorePreferences(localHome);
+        PluginSource source = preferences.addSource("https://one.example/plugins.json", "One");
+
+        PluginSource updated = preferences.updateAlias(source.getId(), "Renamed");
+
+        assertEquals(source.getId(), updated.getId());
+        assertEquals(source.getUrl(), updated.getUrl());
+        assertEquals("Renamed", updated.getAlias());
+    }
+
+    /// Removes a custom source from the persisted source snapshot.
+    @Test
+    public void removesCustomSourceFromPersistedSnapshot(@TempDir Path localHome) throws Exception {
+        PluginStorePreferences preferences = new PluginStorePreferences(localHome);
+        PluginSource source = preferences.addSource("https://one.example/plugins.json", null);
+
+        preferences.removeSource(source.getId());
+
+        assertEquals(List.of(PluginSource.OFFICIAL_ID), sourceIds(new PluginStorePreferences(localHome).getSources()));
+    }
+
     /// Requires a reorder request to contain every current source ID exactly once.
     @Test
     public void requiresExactMembershipWhenReordering(@TempDir Path localHome) throws Exception {
