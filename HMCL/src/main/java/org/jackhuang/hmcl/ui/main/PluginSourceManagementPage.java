@@ -561,46 +561,61 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 .anyMatch(installedPluginIdsSupplier.get()::contains);
     }
 
-    /// Computes installed-plugin deletion impact from manual source IDs before current aggregate source IDs.
+    /// Computes installed-plugin deletion impact from the same current manual-first source-item selection used at runtime.
     ///
     /// @param source source whose deletion impact is queried
-    /// @param manualPluginIds manually tested source plugin IDs by source ID
-    /// @param aggregatePluginIds current aggregate source plugin IDs by source ID
+    /// @param manualResults latest manually tested source results by source ID
+    /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
+    /// @param sources current persisted source configuration
     /// @param installedPluginIds installed plugin IDs
-    /// @return whether the freshest source data intersects installed plugin IDs
-    static boolean shouldWarnInstalledPlugins(
+    /// @return whether the freshest successful source items intersect installed plugin IDs
+    static boolean sourceAffectsInstalledPlugins(
             PluginSource source,
-            @Unmodifiable Map<String, @Unmodifiable Set<String>> manualPluginIds,
-            @Unmodifiable Map<String, @Unmodifiable Set<String>> aggregatePluginIds,
+            @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
+            @Nullable PluginStoreSnapshot snapshot,
+            @Unmodifiable List<PluginSource> sources,
             @Unmodifiable Set<String> installedPluginIds
     ) {
-        @Nullable Set<String> sourcePluginIds = manualPluginIds.get(source.getId());
-        if (sourcePluginIds == null) {
-            sourcePluginIds = aggregatePluginIds.get(source.getId());
-        }
-        return sourcePluginIds != null && sourcePluginIds.stream().anyMatch(installedPluginIds::contains);
+        return selectLatestSourceItems(source, manualResults, snapshot, sources).stream()
+                .map(item -> item.getEntry().getId())
+                .anyMatch(installedPluginIds::contains);
     }
 
-    /// Retrieves source-bound items from the latest successful snapshot outcome for deletion impact checks.
+    /// Selects current successful manual source items before falling back to the current aggregate source result.
     ///
-    /// @param source source whose items are queried
-    /// @return immutable latest source item snapshot
-    private @Unmodifiable List<org.jackhuang.hmcl.plugin.store.PluginStoreItem> latestSourceItems(PluginSource source) {
-        @Nullable PluginSourceLoadResult manual = testedResults.get(source.getId());
-        if (manual != null && manual.isSuccessful() && containsCurrentSource(repository.getSources(), manual.getSource())) {
+    /// @param source source whose latest items are selected
+    /// @param manualResults latest manually tested source results by source ID
+    /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
+    /// @param sources current persisted source configuration
+    /// @return immutable selected source item snapshot
+    static @Unmodifiable List<org.jackhuang.hmcl.plugin.store.PluginStoreItem> selectLatestSourceItems(
+            PluginSource source,
+            @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
+            @Nullable PluginStoreSnapshot snapshot,
+            @Unmodifiable List<PluginSource> sources
+    ) {
+        @Nullable PluginSourceLoadResult manual = manualResults.get(source.getId());
+        if (manual != null && manual.isSuccessful() && containsCurrentSource(sources, manual.getSource())) {
             return manual.getItems();
         }
-        @Nullable PluginStoreSnapshot snapshot = snapshotSupplier.get();
         if (snapshot == null) {
             return List.of();
         }
         return snapshot.getSourceResults().stream()
                 .filter(result -> result.getSource().getId().equals(source.getId()))
-                .filter(result -> containsCurrentSource(repository.getSources(), result.getSource()))
+                .filter(result -> containsCurrentSource(sources, result.getSource()))
                 .filter(PluginSourceLoadResult::isSuccessful)
                 .findFirst()
                 .map(PluginSourceLoadResult::getItems)
                 .orElse(List.of());
+    }
+
+    /// Retrieves source-bound items from the latest successful manual or aggregate result for deletion impact checks.
+    ///
+    /// @param source source whose items are queried
+    /// @return immutable latest source item snapshot
+    private @Unmodifiable List<org.jackhuang.hmcl.plugin.store.PluginStoreItem> latestSourceItems(PluginSource source) {
+        return selectLatestSourceItems(source, testedResults, snapshotSupplier.get(), repository.getSources());
     }
 
     /// Runs a single repository write, rebuilding from persistence when the write fails.

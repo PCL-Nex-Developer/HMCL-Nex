@@ -175,18 +175,118 @@ public final class PluginSourceManagementPageTest {
         ).isEmpty());
     }
 
-    /// Gives custom source manual outcomes first priority for installed-plugin removal impact checks.
+    /// Uses current successful manual source data before an aggregate source result when checking deletion impact.
     @Test
-    public void manualSourceItemsArePreferredForInstalledPluginDeletionWarning() {
+    public void manualSourceItemsWinDeletionImpactSelection() {
         PluginSource source = new PluginSource(
                 "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult manual = successfulResult(source, "dev.hmclnex.manual");
+        PluginSourceLoadResult aggregate = successfulResult(source, "dev.hmclnex.aggregate");
 
-        assertTrue(PluginSourceManagementPage.shouldWarnInstalledPlugins(
+        assertTrue(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
                 source,
-                Map.of(source.getId(), Set.of("dev.hmclnex.installed")),
+                Map.of(source.getId(), manual),
+                new PluginStoreSnapshot(1, List.of(aggregate)),
+                List.of(source),
+                Set.of("dev.hmclnex.manual")
+        ));
+        assertFalse(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
+                Map.of(source.getId(), manual),
+                new PluginStoreSnapshot(1, List.of(aggregate)),
+                List.of(source),
+                Set.of("dev.hmclnex.aggregate")
+        ));
+    }
+
+    /// Falls back to a current successful aggregate result when no manual result is available.
+    @Test
+    public void aggregateSourceItemsProvideDeletionImpactFallback() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult aggregate = successfulResult(source, "dev.hmclnex.aggregate");
+
+        assertTrue(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
                 Map.of(),
+                new PluginStoreSnapshot(1, List.of(aggregate)),
+                List.of(source),
+                Set.of("dev.hmclnex.aggregate")
+        ));
+    }
+
+    /// Ignores manual outcomes whose URL no longer matches the configured source before checking deletion impact.
+    @Test
+    public void staleManualSourceItemsDoNotAffectDeletionWarning() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSource stale = source.withConfiguration("https://plugins.example.org/changed.json", null);
+        PluginSourceLoadResult staleManual = successfulResult(stale, "dev.hmclnex.installed");
+
+        assertFalse(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
+                Map.of(source.getId(), staleManual),
+                null,
+                List.of(source),
                 Set.of("dev.hmclnex.installed")
         ));
+    }
+
+    /// Falls back to a current aggregate result when the newest manual test result failed.
+    @Test
+    public void failedManualSourceResultFallsBackToAggregateDeletionImpact() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult failedManual = PluginSourceLoadResult.failed(
+                source, 3, new IOException("manual failure"));
+        PluginSourceLoadResult aggregate = successfulResult(source, "dev.hmclnex.aggregate");
+
+        assertTrue(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
+                Map.of(source.getId(), failedManual),
+                new PluginStoreSnapshot(1, List.of(aggregate)),
+                List.of(source),
+                Set.of("dev.hmclnex.aggregate")
+        ));
+    }
+
+    /// Requires a selected current source item to intersect installed plugin IDs before using the strong warning.
+    @Test
+    public void installedPluginIntersectionControlsDeletionWarning() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult manual = successfulResult(source, "dev.hmclnex.available");
+
+        assertFalse(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
+                Map.of(source.getId(), manual),
+                null,
+                List.of(source),
+                Set.of("dev.hmclnex.installed")
+        ));
+    }
+
+    /// Creates a successful one-item source result for manual and aggregate deletion-impact selection tests.
+    ///
+    /// @param source current source configuration
+    /// @param pluginId source plugin ID
+    /// @return successful source result containing the supplied plugin ID
+    private static PluginSourceLoadResult successfulResult(PluginSource source, String pluginId) {
+        PluginStoreRegistry registry = JsonUtils.GSON.fromJson("""
+                {
+                  "schemaVersion": 1,
+                  "name": "Registry",
+                  "plugins": [{
+                    "id": "%s",
+                    "name": "Plugin",
+                    "manifestUrl": "https://plugins.example.org/manifest.json"
+                  }]
+                }
+                """.formatted(pluginId), PluginStoreRegistry.class);
+        PluginStoreManager manager = new PluginStoreManager();
+        PluginStoreItem item = new PluginStoreItem(
+                source, registry, manager, registry.getPlugins().get(0), null);
+        return PluginSourceLoadResult.success(source, 1, List.of(item), 1, registry, manager);
     }
 
     /// Exposes explicit source diagnostics in details while retaining the full URL only there.
