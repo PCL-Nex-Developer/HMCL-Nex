@@ -28,12 +28,14 @@ import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies bounded, source-priority plugin catalog aggregation against deterministic local registries.
@@ -152,6 +154,63 @@ public final class PluginStoreAggregatorTest {
             assertEquals(1, result.getItems().size());
             assertEquals(null, result.getItems().get(0).getManifest());
             assertEquals("partial", snapshot.getWinningItems().get("dev.test.partial").getSource().getId());
+        }
+    }
+
+    /// Removes non-HTTP URL credentials, queries, and fragments from source failure diagnostics while retaining the original failure.
+    @Test
+    public void sourceFailureMessageSanitizesNonHttpUrlCredentialsAndParameters() {
+        IOException failure = new IOException(
+                "Unable to load ftp://user:secret@example.test/plugins.json?token=private#fragment"
+        );
+        PluginSourceLoadResult result = PluginSourceLoadResult.failed(
+                source("failed", "https://example.test/plugins.json", true),
+                0,
+                failure
+        );
+
+        assertEquals("Unable to load ftp://example.test/plugins.json", result.getFailureMessage());
+        assertSame(failure, result.getFailure());
+        assertTrue(Objects.requireNonNull(result.getFailureMessage()).contains("example.test"));
+        assertTrue(!result.getFailureMessage().contains("secret"));
+        assertTrue(!result.getFailureMessage().contains("token=private"));
+        assertTrue(!result.getFailureMessage().contains("fragment"));
+    }
+
+    /// Rejects success-result counts that do not match the source items with unresolved manifests.
+    @Test
+    public void sourceResultSuccessRejectsMismatchedPartialManifestCounts() throws Exception {
+        try (RegistryFixture fixture = RegistryFixture.start("Result", "dev.test.result", "1.0.0")) {
+            PluginSource source = source("result", fixture.registryUrl(), true);
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(source);
+            PluginStoreRegistry registry = Objects.requireNonNull(manager.getRegistry());
+            PluginStoreItem resolved = manager.getStoreItems().get(0);
+            PluginStoreItem unresolved = new PluginStoreItem(
+                    source,
+                    registry,
+                    manager,
+                    resolved.getEntry(),
+                    null
+            );
+
+            PluginSourceLoadResult success = PluginSourceLoadResult.success(
+                    source, 0, List.of(resolved), 0, registry, manager
+            );
+            PluginSourceLoadResult partial = PluginSourceLoadResult.success(
+                    source, 0, List.of(unresolved), 1, registry, manager
+            );
+
+            assertEquals(PluginSourceLoadResult.Status.SUCCESS, success.getStatus());
+            assertEquals(PluginSourceLoadResult.Status.PARTIAL_FAILURE, partial.getStatus());
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> PluginSourceLoadResult.success(source, 0, List.of(resolved), 1, registry, manager)
+            );
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> PluginSourceLoadResult.success(source, 0, List.of(unresolved), 0, registry, manager)
+            );
         }
     }
 
