@@ -154,6 +154,77 @@ public final class PluginStoreManagerTest {
         }
     }
 
+    /// Keeps same-URL README responses bound to the source context that started each request.
+    @Test
+    public void sourceReplacementDoesNotRetainStaleReadmeCache() throws Exception {
+        CountDownLatch oldReadmeStarted = new CountDownLatch(1);
+        CountDownLatch releaseOldReadme = new CountDownLatch(1);
+        AtomicInteger readmeRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        String pluginId = "dev.hmclnex.readme-context";
+        String readmeUrl = baseUrl + "/readme";
+        server.createContext("/old-registry", exchange -> respond(exchange, registryWithEntry(
+                "Old Store", pluginId, baseUrl + "/old-manifest"
+        )));
+        server.createContext("/replacement-registry", exchange -> respond(exchange, registryWithEntry(
+                "Replacement Store", pluginId, baseUrl + "/replacement-manifest"
+        )));
+        server.createContext("/old-manifest", exchange -> respond(exchange, manifestWithReadme(pluginId, readmeUrl)));
+        server.createContext("/replacement-manifest", exchange -> respond(
+                exchange,
+                manifestWithReadme(pluginId, readmeUrl)
+        ));
+        server.createContext("/readme", exchange -> {
+            if (readmeRequests.incrementAndGet() == 1) {
+                oldReadmeStarted.countDown();
+                awaitLatch(releaseOldReadme, "old README release");
+                respond(exchange, "Old README".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            respond(exchange, "Replacement README".getBytes(StandardCharsets.UTF_8));
+        });
+        ExecutorService serverExecutor = Executors.newCachedThreadPool();
+        server.setExecutor(serverExecutor);
+        server.start();
+
+        try {
+            PluginStoreManager manager = new PluginStoreManager();
+            PluginSource oldSource = new PluginSource(
+                    "source_old", baseUrl + "/old-registry", null, true, false
+            );
+            PluginSource replacementSource = new PluginSource(
+                    "source_replacement", baseUrl + "/replacement-registry", null, true, false
+            );
+            manager.loadSource(oldSource);
+            PluginStoreItem oldItem = manager.getStoreItems().get(0);
+            AtomicReference<@Nullable Throwable> oldRequestFailure = new AtomicReference<>();
+            Thread oldRequest = new Thread(() -> {
+                try {
+                    manager.fetchReadme(oldItem);
+                } catch (Throwable exception) {
+                    oldRequestFailure.set(exception);
+                }
+            }, "plugin-store-old-readme");
+
+            oldRequest.start();
+            assertTrue(oldReadmeStarted.await(CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            manager.loadSource(replacementSource);
+            PluginStoreItem replacementItem = manager.getStoreItems().get(0);
+            releaseOldReadme.countDown();
+            oldRequest.join(TimeUnit.SECONDS.toMillis(CONCURRENCY_TIMEOUT_SECONDS));
+
+            assertFalse(oldRequest.isAlive());
+            assertEquals(null, oldRequestFailure.get());
+            assertEquals("Replacement README", manager.fetchReadme(replacementItem));
+            assertEquals(2, readmeRequests.get());
+        } finally {
+            releaseOldReadme.countDown();
+            server.stop(0);
+            serverExecutor.shutdownNow();
+        }
+    }
+
     /// Keeps observed item source and registry values from the same replacement generation.
     @Test
     public void concurrentReadersNeverObserveMixedSourceAndRegistry() throws Exception {
@@ -863,6 +934,34 @@ public final class PluginStoreManagerTest {
                   ]
                 }
                 """.formatted(pluginId).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /// Serializes one valid schema-two manifest with a caller-selected README URL.
+    ///
+    /// @param pluginId expected plugin ID
+    /// @param readmeUrl README endpoint
+    /// @return manifest JSON
+    private static byte @Unmodifiable [] manifestWithReadme(String pluginId, String readmeUrl) {
+        return """
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "readmeUrl": "%s",
+                  "versions": [
+                    {
+                      "version": "1.0.0",
+                      "packageUrl": "https://example.com/plugin.npl",
+                      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                      "pluginApiVersion": 4,
+                      "permissions": [],
+                      "requiredPermissions": [],
+                      "launcherVersion": "*",
+                      "dependencies": [],
+                      "size": 1
+                    }
+                  ]
+                }
+                """.formatted(pluginId, readmeUrl).getBytes(StandardCharsets.UTF_8);
     }
 
     /// Owns a local registry fixture that can serve a valid catalog and repository manifest.
