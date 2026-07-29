@@ -803,13 +803,13 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Loads README text asynchronously and exposes loading, retry, unavailable, and error states.
     ///
-    /// @param sourceManager manager bound to the repository manifest
+    /// @param item source-bound item declaring the repository manifest
     /// @param manifest repository manifest
     /// @param container README section content
     /// @param status status label retained across retries
     /// @param retryButton retry action
     private void loadReadme(
-            PluginStoreManager sourceManager,
+            PluginStoreItem item,
             PluginStoreManifest manifest,
             VBox container,
             Label status,
@@ -828,7 +828,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
         Task.supplyAsync(() -> {
             try {
-                return sourceManager.fetchReadme(manifest);
+                return item.getSourceManager().fetchReadme(item);
             } catch (IOException exception) {
                 throw new RuntimeException(exception);
             }
@@ -1548,7 +1548,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             readmeStatus.setWrapText(true);
             JFXButton retryButton = new JFXButton(i18n("plugin.store.readme.retry"));
             retryButton.setOnAction(event ->
-                    loadReadme(sourceManager, manifest, readmeContainer, readmeStatus, retryButton));
+                    loadReadme(item, manifest, readmeContainer, readmeStatus, retryButton));
             content.getChildren().addAll(
                     ComponentList.createComponentListTitle(i18n("plugin.store.readme")),
                     readmeContainer
@@ -1574,7 +1574,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             } else {
                 versionSelector.setValue(initial);
             }
-            loadReadme(sourceManager, manifest, readmeContainer, readmeStatus, retryButton);
+            loadReadme(item, manifest, readmeContainer, readmeStatus, retryButton);
         }
 
         /// Builds the plugin identity, author, category, tags, installed version, and license rows.
