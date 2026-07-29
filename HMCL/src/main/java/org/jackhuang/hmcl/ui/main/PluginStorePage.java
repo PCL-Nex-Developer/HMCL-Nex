@@ -340,25 +340,39 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @param refreshInProgress whether a newer source refresh remains in flight
     /// @return immutable state used for catalog rows and banners
     static StorePresentation presentationFor(PluginStoreSnapshot snapshot, boolean refreshInProgress) {
-        int enabledSourceCount = (int) snapshot.getSourceResults().stream()
-                .map(PluginSourceLoadResult::getSource)
-                .filter(PluginSource::isEnabled)
+        @Unmodifiable List<PluginSourceLoadResult> enabledResults = snapshot.getSourceResults().stream()
+                .filter(result -> result.getSource().isEnabled())
+                .toList();
+        int enabledSourceCount = enabledResults.size();
+        int registryFailureCount = (int) enabledResults.stream()
+                .filter(result -> result.getStatus() == PluginSourceLoadResult.Status.FAILED)
                 .count();
-        int failedSourceCount = snapshot.getFailures().size();
+        int degradedSourceCount = (int) enabledResults.stream()
+                .filter(PluginStorePage::isDegradedSourceResult)
+                .count();
         boolean hasConflicts = !snapshot.getConflictCandidates().isEmpty();
         StoreState state;
         if (enabledSourceCount == 0) {
             state = StoreState.NO_ENABLED_SOURCES;
-        } else if (snapshot.getWinningItems().isEmpty() && failedSourceCount > 0) {
+        } else if (registryFailureCount == enabledSourceCount) {
             state = StoreState.ALL_FAILED;
-        } else if (failedSourceCount > 0) {
+        } else if (degradedSourceCount > 0) {
             state = StoreState.DEGRADED;
         } else if (hasConflicts) {
             state = StoreState.CONFLICTS;
         } else {
             state = StoreState.READY;
         }
-        return new StorePresentation(state, enabledSourceCount, failedSourceCount, hasConflicts, refreshInProgress);
+        return new StorePresentation(state, enabledSourceCount, degradedSourceCount, hasConflicts, refreshInProgress);
+    }
+
+    /// Returns whether one enabled source left the aggregate catalog incomplete or unavailable.
+    ///
+    /// @param result source load outcome
+    /// @return whether the source failed at registry level or has unavailable repository manifests
+    private static boolean isDegradedSourceResult(PluginSourceLoadResult result) {
+        return result.getStatus() == PluginSourceLoadResult.Status.FAILED
+                || result.getStatus() == PluginSourceLoadResult.Status.PARTIAL_FAILURE;
     }
 
     /// Returns whether a completed aggregate result may replace the page's accepted snapshot.
@@ -571,6 +585,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 );
                 default -> showStoreMessage(SVG.INFO, i18n("plugin.store.empty"), i18n("plugin.store.empty.description"));
             }
+            statusLabel.setText(statusTextFor(presentation, 0, 0, installedManifestFailure));
+            statusLabel.setVisible(true);
             return;
         }
 
@@ -602,21 +618,40 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             filtered.forEach(item -> pluginList.getContent().add(createPluginRow(item)));
         }
 
-        String loadedStatus = i18n("plugin.store.loaded") + ": " + filtered.size() + "/" + allItems.size()
-                + " " + i18n("plugin.store.plugins");
-        List<String> statusLines = new ArrayList<>(List.of(loadedStatus));
+        statusLabel.setText(statusTextFor(presentation, filtered.size(), allItems.size(), installedManifestFailure));
+        statusLabel.setVisible(true);
+    }
+
+    /// Builds current aggregate status text without allowing terminal states to retain a prior loaded counter.
+    ///
+    /// @param presentation accepted aggregate presentation
+    /// @param filteredCount currently visible winner count
+    /// @param totalCount accepted winner count before filtering
+    /// @param installedFailure installed-manifest read failure, or `null` when readable
+    /// @return current status text
+    static String statusTextFor(
+            StorePresentation presentation,
+            int filteredCount,
+            int totalCount,
+            @Nullable String installedFailure
+    ) {
+        String status = switch (presentation.state()) {
+            case NO_ENABLED_SOURCES -> "No plugin sources are enabled";
+            case ALL_FAILED -> "All plugin sources failed";
+            default -> i18n("plugin.store.loaded") + ": " + filteredCount + "/" + totalCount
+                    + " " + i18n("plugin.store.plugins");
+        };
+        List<String> statusLines = new ArrayList<>(List.of(status));
         if (presentation.state() == StoreState.DEGRADED) {
             statusLines.add("Some plugin sources are unavailable; displayed winners may change when they return.");
         }
         if (presentation.hasConflicts()) {
             statusLines.add("Some plugin IDs are published by multiple sources; the highest-priority source is shown.");
         }
-        @Nullable String installedFailure = installedManifestFailure;
         if (installedFailure != null) {
             statusLines.add(i18n("plugin.installed.load_failed") + ": " + installedFailure);
         }
-        statusLabel.setText(String.join("\n", statusLines));
-        statusLabel.setVisible(true);
+        return String.join("\n", statusLines);
     }
 
     /// Tests one item against the selected category.
@@ -1363,10 +1398,17 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @param snapshot aggregate snapshot used during dependency resolution, or `null` when unavailable
     /// @return warning without source URLs, or `null` when every enabled source is available
     static @Nullable String degradedCatalogWarning(@Nullable PluginStoreSnapshot snapshot) {
-        if (snapshot == null || snapshot.getFailures().isEmpty()) {
+        if (snapshot == null) {
             return null;
         }
-        String failedSources = snapshot.getFailures().stream()
+        @Unmodifiable List<PluginSourceLoadResult> degradedResults = snapshot.getSourceResults().stream()
+                .filter(result -> result.getSource().isEnabled())
+                .filter(PluginStorePage::isDegradedSourceResult)
+                .toList();
+        if (degradedResults.isEmpty()) {
+            return null;
+        }
+        String failedSources = degradedResults.stream()
                 .map(PluginSourceLoadResult::getSource)
                 .map(PluginStorePage::warningSourceLabel)
                 .collect(Collectors.joining(", "));
@@ -1388,16 +1430,22 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         return "configured source";
     }
 
-    /// Returns whether a source alias or ID can appear in a warning without being URL-shaped or credential-bearing.
+    /// Returns whether a source alias or ID is a bounded plain display name rather than a URL or credential token.
     ///
     /// @param label optional source label
-    /// @return whether the label is nonblank and free of URI-sensitive delimiter characters
+    /// @return whether every code point is a permitted plain-name character
     private static boolean isSafeWarningLabel(@Nullable String label) {
-        return StringUtils.isNotBlank(label)
-                && !label.contains("://")
-                && !label.contains("@")
-                && !label.contains("?")
-                && !label.contains("#");
+        if (StringUtils.isBlank(label)) {
+            return false;
+        }
+        String value = Objects.requireNonNull(label).trim();
+        if (value.isEmpty() || value.codePointCount(0, value.length()) > 80) {
+            return false;
+        }
+        return value.codePoints().allMatch(codePoint -> Character.isLetterOrDigit(codePoint)
+                || codePoint == ' '
+                || codePoint == '-'
+                || codePoint == '_');
     }
 
     /// Formats actions and dependency constraints for every plan entry in topological order.

@@ -385,6 +385,77 @@ public final class PluginStorePageTest {
         assertEquals(1, presentation.failedSourceCount());
     }
 
+    /// Treats a successful empty registry plus a failed source as degraded instead of claiming every source failed.
+    @Test
+    public void emptySuccessfulRegistryAlongsideFailureProducesDegradedEmptyState() {
+        PluginSource successfulSource = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginSource failedSource = new PluginSource(
+                "source_b", "https://source-b.example.test/plugins.json", "Source B", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
+                successfulEmptyResult(successfulSource),
+                PluginSourceLoadResult.failed(failedSource, 1, new IOException("offline"))
+        ));
+
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(snapshot);
+
+        assertEquals(PluginStorePage.StoreState.DEGRADED, presentation.state());
+        assertTrue(presentation.showPluginRows());
+        assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot)).contains("Source B"));
+    }
+
+    /// Treats a source with unavailable manifests as degraded even when its registry loaded successfully.
+    @Test
+    public void partialManifestFailureProducesDegradedStateAndWarning() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
+                partialResult(source, "dev.hmclnex.partial", "Partial Plugin")
+        ));
+
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(snapshot);
+
+        assertEquals(PluginStorePage.StoreState.DEGRADED, presentation.state());
+        assertEquals(1, presentation.failedSourceCount());
+        assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot)).contains("Source A"));
+    }
+
+    /// Keeps a lower-priority conflict visible while a winning partial source still degrades the catalog.
+    @Test
+    public void partialManifestFailureWithConflictRemainsDegradedAndReportsConflict() {
+        PluginSource partialSource = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginSource lowerPrioritySource = new PluginSource(
+                "source_b", "https://source-b.example.test/plugins.json", "Source B", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
+                partialResult(partialSource, "dev.hmclnex.partial.conflict", "Partial Conflict"),
+                successfulResult(lowerPrioritySource, "dev.hmclnex.partial.conflict", "Lower Candidate")
+        ));
+
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(snapshot);
+
+        assertEquals(PluginStorePage.StoreState.DEGRADED, presentation.state());
+        assertTrue(presentation.hasConflicts());
+        assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot)).contains("Source A"));
+    }
+
+    /// Replaces stale loaded counters with terminal aggregate status text.
+    @Test
+    public void terminalPresentationUsesCurrentStatusInsteadOfStaleLoadedCount() {
+        assertEquals(
+                "No plugin sources are enabled",
+                PluginStorePage.statusTextFor(
+                        PluginStorePage.presentationFor(noEnabledSnapshot()), 4, 4, null
+                )
+        );
+        assertEquals(
+                "All plugin sources failed",
+                PluginStorePage.statusTextFor(
+                        PluginStorePage.presentationFor(allFailedSnapshot()), 4, 4, null
+                )
+        );
+    }
+
     /// Identifies the winner's source for every remotely downloaded install-plan row.
     @Test
     public void everyDownloadedPlanRowIdentifiesItsWinningSource() throws IOException {
@@ -437,24 +508,41 @@ public final class PluginStorePageTest {
         assertNull(PluginStorePage.degradedCatalogWarning(laterSnapshot));
     }
 
-    /// Redacts hostile source aliases and IDs before displaying degraded catalog warnings.
+    /// Uses ordinary Unicode aliases in warnings while replacing URL-shaped or credential-shaped labels.
     @Test
-    public void degradedCatalogWarningNeverContainsSourceUrls() {
-        PluginSource hostile = new PluginSource(
+    public void degradedCatalogWarningUsesOnlyStrictPlainSourceNames() {
+        for (String hostileLabel : List.of(
                 "https://id.example.test/catalog?token=secret#fragment",
-                "https://source.example.test/plugins.json",
-                "https://user:password@alias.example.test/catalog?token=secret#fragment",
-                true,
-                false
-        );
-        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
-                PluginSourceLoadResult.failed(hostile, 1, new IOException("offline"))
-        ));
+                "Source%20Name",
+                "token=secret",
+                "password=secret",
+                "user%40source.example.test",
+                "source:name",
+                "source/name",
+                "Source\nName",
+                "x".repeat(81)
+        )) {
+            PluginSource hostile = new PluginSource(
+                    hostileLabel,
+                    "https://source.example.test/plugins.json",
+                    hostileLabel,
+                    true,
+                    false
+            );
+            PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
+                    PluginSourceLoadResult.failed(hostile, 1, new IOException("offline"))
+            ));
 
-        String warning = PluginStorePage.degradedCatalogWarning(snapshot);
-        assertFalse(warning.contains("://"));
-        assertFalse(warning.contains("password"));
-        assertFalse(warning.contains("token"));
+            assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot))
+                    .endsWith("configured source"));
+        }
+
+        PluginSource ordinary = new PluginSource(
+                "source_plain", "https://source.example.test/plugins.json", "社区 插件", true, false);
+        PluginStoreSnapshot ordinarySnapshot = new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.failed(ordinary, 1, new IOException("offline"))
+        ));
+        assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(ordinarySnapshot)).contains("社区 插件"));
     }
 
     /// Returns no plugin rows when every configured enabled source fails.
@@ -527,6 +615,24 @@ public final class PluginStorePageTest {
         assertFalse(PluginStorePage.presentationFor(new PluginStoreSnapshot(2, List.of())).showPluginRows());
     }
 
+    /// Creates an aggregate snapshot containing no enabled source.
+    ///
+    /// @return no-enabled aggregate snapshot
+    private static PluginStoreSnapshot noEnabledSnapshot() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", false, false);
+        return new PluginStoreSnapshot(1, List.of(PluginSourceLoadResult.disabled(source)));
+    }
+
+    /// Creates an aggregate snapshot containing only registry-level source failures.
+    ///
+    /// @return all-failed aggregate snapshot
+    private static PluginStoreSnapshot allFailedSnapshot() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        return new PluginStoreSnapshot(1, List.of(PluginSourceLoadResult.failed(source, 1, new IOException("offline"))));
+    }
+
     /// Creates an aggregate snapshot containing one successful winner and one unavailable enabled source.
     ///
     /// @return degraded aggregate snapshot
@@ -582,6 +688,32 @@ public final class PluginStorePageTest {
         )).resolveInstallPlan(root.getEntry().getId(), rootVersion, Map.of(), Map.of(), Map.of());
     }
 
+    /// Creates a successful source outcome with an empty registry.
+    ///
+    /// @param source source owning the empty registry
+    /// @return successful empty source outcome
+    private static PluginSourceLoadResult successfulEmptyResult(PluginSource source) {
+        PluginStoreRegistry registry = Objects.requireNonNull(JsonUtils.GSON.fromJson("""
+                {
+                  "schemaVersion": 1,
+                  "name": "%s",
+                  "plugins": []
+                }
+                """.formatted(source.getAlias()), PluginStoreRegistry.class));
+        return PluginSourceLoadResult.success(source, 1, List.of(), 0, registry, new PluginStoreManager());
+    }
+
+    /// Creates a successful source outcome with one unavailable repository manifest.
+    ///
+    /// @param source source owning the partial result
+    /// @param pluginId stable plugin ID
+    /// @param name display name
+    /// @return partial source outcome
+    private static PluginSourceLoadResult partialResult(PluginSource source, String pluginId, String name) {
+        PluginStoreItem item = successfulItem(source, pluginId, name);
+        return PluginSourceLoadResult.success(source, 1, List.of(item), 1, item.getRegistry(), item.getSourceManager());
+    }
+
     /// Creates one successful source result for a registry item without a repository manifest.
     ///
     /// @param source source owning the item
@@ -589,9 +721,13 @@ public final class PluginStorePageTest {
     /// @param name display name
     /// @return successful source result
     private static PluginSourceLoadResult successfulResult(PluginSource source, String pluginId, String name) {
-        PluginStoreItem item = successfulItem(source, pluginId, name);
-        return PluginSourceLoadResult.success(
-                source, 1, List.of(item), 1, item.getRegistry(), item.getSourceManager());
+        try {
+            PluginStoreItem item = itemWithManifest(source, pluginId, name, "[]", "a");
+            return PluginSourceLoadResult.success(
+                    source, 1, List.of(item), 0, item.getRegistry(), item.getSourceManager());
+        } catch (IOException exception) {
+            throw new IllegalStateException("Generated source fixture was invalid", exception);
+        }
     }
 
     /// Creates one source-bound registry item without a repository manifest.
