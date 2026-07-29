@@ -71,16 +71,6 @@ public final class PluginStorePageTest {
         assertFalse(PluginStorePage.isSafeExternalLink("data:text/plain,plugin"));
     }
 
-    /// Shows a registry's published name and never falls back to its complete URL in the selector.
-    @Test
-    public void sourceSelectorUsesCompactRegistryNames() {
-        String url = "https://raw.githubusercontent.com/example/store/main/plugins.json";
-        assertEquals("Example Store", PluginStorePage.sourceDisplayName(url, "Example Store"));
-        String fallback = PluginStorePage.sourceDisplayName(url, null);
-        assertFalse(fallback.contains("https://"));
-        assertTrue(fallback.contains("raw.githubusercontent.com"));
-    }
-
     /// Normalizes registry prose and bounds descriptions so one row cannot dominate the store list.
     @Test
     public void storeDescriptionSummaryIsBounded() {

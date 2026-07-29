@@ -162,8 +162,8 @@ public final class PluginStoreDependencyResolverTest {
         server.start();
 
         try {
-            PluginStoreManager manager = new PluginStoreManager(temporaryDirectory);
-            manager.loadRegistry(baseUrl + "/registry");
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(new PluginSource("test", baseUrl + "/registry", null, true, false));
             PluginStoreManifest manifest = manager.getPluginManifest(pluginId, baseUrl + "/plugin");
             PluginStoreManifest.PluginVersionEntry selectedVersion = manifest.getVersion("1.0.0");
             assertNotNull(selectedVersion);
@@ -230,8 +230,8 @@ public final class PluginStoreDependencyResolverTest {
         server.start();
 
         try {
-            PluginStoreManager manager = new PluginStoreManager(temporaryDirectory);
-            manager.loadRegistry(baseUrl + "/registry");
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(new PluginSource("test", baseUrl + "/registry", null, true, false));
             PluginStoreManifest rootManifest = manager.getPluginManifest(rootId, baseUrl + "/root");
             PluginStoreManifest.PluginVersionEntry rootVersion = rootManifest.getVersion("1.0.0");
             assertNotNull(rootVersion);
@@ -350,8 +350,8 @@ public final class PluginStoreDependencyResolverTest {
         server.start();
 
         try {
-            PluginStoreManager manager = new PluginStoreManager(temporaryDirectory);
-            manager.loadRegistry(baseUrl + "/registry");
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(new PluginSource("test", baseUrl + "/registry", null, true, false));
             PluginStoreManifest rootManifest = manager.getPluginManifest(rootId, baseUrl + "/root");
             PluginStoreManifest.PluginVersionEntry rootVersion = rootManifest.getVersion("1.0.0");
             assertNotNull(rootVersion);
@@ -429,8 +429,8 @@ public final class PluginStoreDependencyResolverTest {
         server.start();
 
         try {
-            PluginStoreManager manager = new PluginStoreManager(temporaryDirectory);
-            manager.loadRegistry(baseUrl + "/registry");
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(new PluginSource("test", baseUrl + "/registry", null, true, false));
             PluginStoreManifest rootManifest = manager.getPluginManifest("dev.test.root", baseUrl + "/root");
             PluginStoreManifest.PluginVersionEntry rootVersion = rootManifest.getVersion("1.0.0");
             assertNotNull(rootVersion);
@@ -476,8 +476,8 @@ public final class PluginStoreDependencyResolverTest {
         server.start();
 
         try {
-            PluginStoreManager manager = new PluginStoreManager(temporaryDirectory);
-            manager.loadRegistry(baseUrl + "/registry");
+            PluginStoreManager manager = new PluginStoreManager();
+            manager.loadSource(new PluginSource("test", baseUrl + "/registry", null, true, false));
             PluginStoreManifest rootManifest = manager.getPluginManifest("dev.test.root", baseUrl + "/root");
             PluginStoreManifest.PluginVersionEntry rootVersion = rootManifest.getVersion("1.0.0");
             assertNotNull(rootVersion);

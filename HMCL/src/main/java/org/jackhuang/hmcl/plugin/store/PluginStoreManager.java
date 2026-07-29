@@ -52,6 +52,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -89,75 +90,54 @@ public final class PluginStoreManager {
     /// Extracts the first Java feature number from registry text.
     private static final Pattern JAVA_VERSION_PATTERN = Pattern.compile("(\\d+)");
 
+    /// Immutable source configuration associated with the currently loaded registry.
+    private @Nullable PluginSource source;
+
     /// Currently loaded validated registry.
     private @Nullable PluginStoreRegistry registry;
 
-    /// Registry URL selected by this manager, restored from preferences until a request loads another source.
-    private String registryUrl = DEFAULT_REGISTRY_URL;
-
-    /// Known registry URLs displayed by the source selector.
-    private final List<String> registryUrls = new ArrayList<>();
-
-    /// Validated repository manifests cached by URL.
+    /// Validated repository manifests cached by URL for the currently loaded source.
     private final Map<String, PluginStoreManifest> manifestCache = new ConcurrentHashMap<>();
 
-    /// Bounded README text cached by validated URL.
+    /// Bounded README text cached by validated URL for the currently loaded source.
     private final Map<String, String> readmeCache = new ConcurrentHashMap<>();
 
-    /// User-owned favorite and registry-source preferences.
-    private final PluginStorePreferences preferences;
-
-    /// Creates a store manager configured with the official registry.
+    /// Creates an unloaded source-scoped store client.
     public PluginStoreManager() {
-        this(Metadata.HMCL_LOCAL_HOME);
     }
 
-    /// Creates a store manager with isolated preference storage for tests or alternate launcher homes.
+    /// Loads and validates one plugin source without persisting user configuration.
     ///
-    /// @param localHome launcher-local home
-    public PluginStoreManager(Path localHome) {
-        preferences = new PluginStorePreferences(localHome);
-        registryUrls.add(DEFAULT_REGISTRY_URL);
-        for (String customRegistry : preferences.getCustomRegistryUrls()) {
-            try {
-                validateRemoteUrl(customRegistry, "plugin registry");
-                if (!registryUrls.contains(customRegistry)) {
-                    registryUrls.add(customRegistry);
-                }
-            } catch (IOException exception) {
-                LOG.warning("Ignoring invalid persisted plugin registry: " + customRegistry, exception);
-            }
-        }
-        String persistedRegistry = preferences.getActiveRegistryUrl();
-        try {
-            validateRemoteUrl(persistedRegistry, "plugin registry");
-            registryUrl = persistedRegistry;
-            if (!registryUrls.contains(persistedRegistry)) {
-                registryUrls.add(persistedRegistry);
-            }
-        } catch (IOException exception) {
-            LOG.warning("Ignoring invalid active plugin registry: " + persistedRegistry, exception);
-        }
+    /// @param source immutable source configuration to load
+    /// @throws IOException if transport, parsing, URL policy, or validation fails
+    public void loadSource(PluginSource source) throws IOException {
+        Objects.requireNonNull(source, "source");
+        PluginStoreRegistry loadedRegistry = loadRegistryForRequest(source.getUrl());
+        registry = loadedRegistry;
+        this.source = source;
+        manifestCache.clear();
+        readmeCache.clear();
     }
 
-    /// Loads and validates a plugin registry from a secure remote URL, then persists it as the active source.
+    /// Returns the source associated with the currently loaded registry.
+    ///
+    /// @return loaded source
+    /// @throws IllegalStateException if no source has loaded successfully
+    public PluginSource getSource() {
+        if (source == null) {
+            throw new IllegalStateException("Plugin source is not loaded");
+        }
+        return source;
+    }
+
+    /// Loads and validates a registry response for the supplied source URL.
+    ///
+    /// The caller publishes source identity only after this validation succeeds, keeping failed requests from
+    /// replacing the previously loaded source context.
     ///
     /// @param registryUrl registry URL
     /// @throws IOException if transport, parsing, URL policy, or validation fails
-    public void loadRegistry(String registryUrl) throws IOException {
-        loadRegistryForRequest(registryUrl);
-        commitActiveRegistry();
-    }
-
-    /// Loads and validates a plugin registry without persisting it as the active source.
-    ///
-    /// This request-scoped operation lets callers discard stale asynchronous results without allowing an older
-    /// request to overwrite the source selected by a newer generation. Call [#commitActiveRegistry()] only after
-    /// the loaded result is accepted by the caller.
-    ///
-    /// @param registryUrl registry URL
-    /// @throws IOException if transport, parsing, URL policy, or validation fails
-    public void loadRegistryForRequest(String registryUrl) throws IOException {
+    private PluginStoreRegistry loadRegistryForRequest(String registryUrl) throws IOException {
         validateRemoteUrl(registryUrl, "plugin registry");
         LOG.info("Loading plugin registry from: " + registryUrl);
         try {
@@ -174,31 +154,24 @@ public final class PluginStoreManager {
                 validateRemoteUrl(entry.getManifestUrl(), "plugin manifest");
             }
 
-            registry = loadedRegistry;
-            this.registryUrl = registryUrl;
-            manifestCache.clear();
-            readmeCache.clear();
             LOG.info("Loaded " + loadedRegistry.getPlugins().size() + " plugins from registry");
+            return loadedRegistry;
         } catch (JsonParseException exception) {
             throw new IOException("Failed to parse plugin registry", exception);
         }
     }
 
-    /// Persists the source of the registry most recently loaded successfully by this manager.
-    ///
-    /// @throws IllegalStateException if this manager has not loaded a registry
-    public void commitActiveRegistry() {
-        if (registry == null) {
-            throw new IllegalStateException("Cannot commit an unloaded plugin registry");
-        }
-        preferences.setActiveRegistryUrl(registryUrl);
-    }
-
-    /// Loads the official plugin registry.
+    /// Loads the fixed official plugin source without persisting any selection state.
     ///
     /// @throws IOException if loading fails
     public void loadDefaultRegistry() throws IOException {
-        loadRegistry(registryUrls.get(0));
+        loadSource(new PluginSource(
+                PluginSource.OFFICIAL_ID,
+                DEFAULT_REGISTRY_URL,
+                null,
+                true,
+                true
+        ));
     }
 
     /// Resolves and validates one plugin repository manifest.
@@ -235,12 +208,13 @@ public final class PluginStoreManager {
         }
     }
 
-    /// Resolves all registry entries, retaining unavailable repositories as partial items.
+    /// Resolves all registry entries, retaining unavailable repositories as partial source-bound items.
     ///
     /// @return resolved store items
     public @Unmodifiable List<PluginStoreItem> getStoreItems() {
+        @Nullable PluginSource currentSource = source;
         @Nullable PluginStoreRegistry currentRegistry = registry;
-        if (currentRegistry == null) {
+        if (currentSource == null || currentRegistry == null) {
             return List.of();
         }
 
@@ -248,12 +222,15 @@ public final class PluginStoreManager {
         for (PluginStoreRegistry.PluginStoreEntry entry : currentRegistry.getPlugins()) {
             try {
                 items.add(new PluginStoreItem(
+                        currentSource,
+                        currentRegistry,
+                        this,
                         entry,
                         getPluginManifest(entry.getId(), entry.getManifestUrl())
                 ));
             } catch (IOException exception) {
                 LOG.warning("Failed to load plugin manifest: " + entry.getId(), exception);
-                items.add(new PluginStoreItem(entry, null));
+                items.add(new PluginStoreItem(currentSource, currentRegistry, this, entry, null));
             }
         }
         return List.copyOf(items);
@@ -997,87 +974,19 @@ public final class PluginStoreManager {
         return PluginVersion.compare(left, right);
     }
 
-    /// Returns whether a plugin is marked as a local favorite.
+    /// Returns the registry URL associated with the currently loaded source.
     ///
-    /// @param pluginId plugin ID
-    /// @return favorite state
-    public boolean isFavorite(String pluginId) {
-        return preferences.isFavorite(pluginId);
-    }
-
-    /// Updates a plugin favorite and persists the change immediately.
-    ///
-    /// @param pluginId plugin ID
-    /// @param favorite desired favorite state
-    public void setFavorite(String pluginId, boolean favorite) {
-        preferences.setFavorite(pluginId, favorite);
-    }
-
-    /// Toggles and returns the resulting favorite state.
-    ///
-    /// @param pluginId plugin ID
-    /// @return resulting favorite state
-    public boolean toggleFavorite(String pluginId) {
-        boolean favorite = !isFavorite(pluginId);
-        setFavorite(pluginId, favorite);
-        return favorite;
-    }
-
-    /// Returns an immutable snapshot of favorite plugin IDs.
-    ///
-    /// @return favorite plugin IDs
-    public @Unmodifiable Set<String> getFavoritePluginIds() {
-        return preferences.getFavoritePluginIds();
-    }
-
-    /// Adds a custom secure registry URL to the source selector.
-    ///
-    /// @param url registry URL
-    /// @throws IllegalArgumentException if the URL violates remote transport policy
-    public void addCustomRegistry(String url) {
-        try {
-            validateRemoteUrl(url, "plugin registry");
-        } catch (IOException exception) {
-            throw new IllegalArgumentException(exception.getMessage(), exception);
-        }
-        if (!registryUrls.contains(url)) {
-            registryUrls.add(url);
-        }
-        preferences.addCustomRegistryUrl(url);
-    }
-
-    /// Adds and loads a registry URL.
-    ///
-    /// @param url registry URL
-    /// @throws IOException if validation or loading fails
-    public void setActiveRegistryUrl(String url) throws IOException {
-        validateRemoteUrl(url, "plugin registry");
-        if (!registryUrls.contains(url)) {
-            registryUrls.add(url);
-            preferences.addCustomRegistryUrl(url);
-        }
-        loadRegistry(url);
-    }
-
-    /// Returns the registry URL currently selected or loaded by this manager.
-    ///
-    /// @return registry URL
+    /// @return loaded source URL
+    /// @throws IllegalStateException if no source has loaded successfully
     public String getRegistryUrl() {
-        return registryUrl;
+        return getSource().getUrl();
     }
 
     /// Returns the currently loaded registry.
     ///
-    /// @return registry or `null`
+    /// @return loaded registry, or `null` before the first successful source load
     public @Nullable PluginStoreRegistry getRegistry() {
         return registry;
-    }
-
-    /// Returns an immutable snapshot of known registry URLs.
-    ///
-    /// @return registry URLs
-    public @Unmodifiable List<String> getRegistryUrls() {
-        return List.copyOf(registryUrls);
     }
 
     /// Downloads and caches a bounded UTF-8 README from the explicit URL in a repository manifest.
