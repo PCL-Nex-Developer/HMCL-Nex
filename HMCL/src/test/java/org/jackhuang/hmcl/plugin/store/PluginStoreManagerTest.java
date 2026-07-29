@@ -225,6 +225,61 @@ public final class PluginStoreManagerTest {
         }
     }
 
+    /// Keeps an old item's README cache isolated when its first README fetch occurs after source replacement.
+    @Test
+    public void oldItemReadmeAfterSourceReplacementUsesOriginalContext() throws Exception {
+        AtomicInteger readmeRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        String pluginId = "dev.hmclnex.old-item-readme-context";
+        String readmeUrl = baseUrl + "/readme";
+        server.createContext("/source-a-registry", exchange -> respond(exchange, registryWithEntry(
+                "Source A Store", pluginId, baseUrl + "/source-a-manifest"
+        )));
+        server.createContext("/source-b-registry", exchange -> respond(exchange, registryWithEntry(
+                "Source B Store", pluginId, baseUrl + "/source-b-manifest"
+        )));
+        server.createContext("/source-a-manifest", exchange -> respond(
+                exchange,
+                manifestWithReadme(pluginId, readmeUrl)
+        ));
+        server.createContext("/source-b-manifest", exchange -> respond(
+                exchange,
+                manifestWithReadme(pluginId, readmeUrl)
+        ));
+        server.createContext("/readme", exchange -> respond(
+                exchange,
+                (readmeRequests.incrementAndGet() == 1 ? "Source A README" : "Source B README")
+                        .getBytes(StandardCharsets.UTF_8)
+        ));
+        server.start();
+
+        try {
+            PluginStoreManager manager = new PluginStoreManager();
+            PluginSource sourceA = new PluginSource(
+                    "source_a", baseUrl + "/source-a-registry", null, true, false
+            );
+            PluginSource sourceB = new PluginSource(
+                    "source_b", baseUrl + "/source-b-registry", null, true, false
+            );
+            manager.loadSource(sourceA);
+            PluginStoreItem oldItem = manager.getStoreItems().get(0);
+
+            manager.loadSource(sourceB);
+            PluginStoreItem sourceBItem = manager.getStoreItems().get(0);
+
+            assertEquals("Source A README", manager.fetchReadme(oldItem));
+            assertEquals(1, readmeRequests.get());
+            assertEquals("Source B README", manager.fetchReadme(sourceBItem));
+            assertEquals(2, readmeRequests.get());
+            assertEquals("Source A README", manager.fetchReadme(oldItem));
+            assertEquals("Source B README", manager.fetchReadme(sourceBItem));
+            assertEquals(2, readmeRequests.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
     /// Keeps observed item source and registry values from the same replacement generation.
     @Test
     public void concurrentReadersNeverObserveMixedSourceAndRegistry() throws Exception {
