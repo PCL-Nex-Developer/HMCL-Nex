@@ -90,17 +90,36 @@ public final class PluginStoreManager {
     /// Extracts the first Java feature number from registry text.
     private static final Pattern JAVA_VERSION_PATTERN = Pattern.compile("(\\d+)");
 
-    /// Immutable source configuration associated with the currently loaded registry.
-    private @Nullable PluginSource source;
+    /// Atomically published source, registry, and source-owned request caches.
+    private volatile @Nullable SourceContext context;
 
-    /// Currently loaded validated registry.
-    private @Nullable PluginStoreRegistry registry;
+    /// README cache retained only for the historical explicit-manifest API before a source has loaded.
+    private final Map<String, String> unloadedReadmeCache = new ConcurrentHashMap<>();
 
-    /// Validated repository manifests cached by URL for the currently loaded source.
-    private final Map<String, PluginStoreManifest> manifestCache = new ConcurrentHashMap<>();
+    /// Captures one source generation so readers cannot combine registry state or cache results across replacements.
+    @NotNullByDefault
+    static final class SourceContext {
+        /// Immutable source configuration validated for this generation.
+        private final PluginSource source;
 
-    /// Bounded README text cached by validated URL for the currently loaded source.
-    private final Map<String, String> readmeCache = new ConcurrentHashMap<>();
+        /// Registry validated for this source generation.
+        private final PluginStoreRegistry registry;
+
+        /// Validated manifests resolved only for this source generation.
+        private final Map<String, PluginStoreManifest> manifestCache = new ConcurrentHashMap<>();
+
+        /// Bounded README text resolved only for this source generation.
+        private final Map<String, String> readmeCache = new ConcurrentHashMap<>();
+
+        /// Creates a source context after the registry has completed validation.
+        ///
+        /// @param source immutable source configuration
+        /// @param registry validated registry
+        private SourceContext(PluginSource source, PluginStoreRegistry registry) {
+            this.source = source;
+            this.registry = registry;
+        }
+    }
 
     /// Creates an unloaded source-scoped store client.
     public PluginStoreManager() {
@@ -113,10 +132,7 @@ public final class PluginStoreManager {
     public void loadSource(PluginSource source) throws IOException {
         Objects.requireNonNull(source, "source");
         PluginStoreRegistry loadedRegistry = loadRegistryForRequest(source.getUrl());
-        registry = loadedRegistry;
-        this.source = source;
-        manifestCache.clear();
-        readmeCache.clear();
+        context = new SourceContext(source, loadedRegistry);
     }
 
     /// Returns the source associated with the currently loaded registry.
@@ -124,10 +140,19 @@ public final class PluginStoreManager {
     /// @return loaded source
     /// @throws IllegalStateException if no source has loaded successfully
     public PluginSource getSource() {
-        if (source == null) {
+        return requireContext().source;
+    }
+
+    /// Returns the current source context or rejects operations before a successful source load.
+    ///
+    /// @return atomically published source context
+    /// @throws IllegalStateException if no source has loaded successfully
+    private SourceContext requireContext() {
+        @Nullable SourceContext currentContext = context;
+        if (currentContext == null) {
             throw new IllegalStateException("Plugin source is not loaded");
         }
-        return source;
+        return currentContext;
     }
 
     /// Loads and validates a registry response for the supplied source URL.
@@ -181,7 +206,22 @@ public final class PluginStoreManager {
     /// @return validated repository manifest
     /// @throws IOException if transport, parsing, identity, or schema validation fails
     public PluginStoreManifest getPluginManifest(String pluginId, String manifestUrl) throws IOException {
-        @Nullable PluginStoreManifest cached = manifestCache.get(manifestUrl);
+        return getPluginManifest(requireContext(), pluginId, manifestUrl);
+    }
+
+    /// Resolves one repository manifest through the supplied source context only.
+    ///
+    /// @param sourceContext source context captured before the request begins
+    /// @param pluginId expected plugin ID
+    /// @param manifestUrl repository manifest URL
+    /// @return validated repository manifest
+    /// @throws IOException if transport, parsing, identity, or schema validation fails
+    private PluginStoreManifest getPluginManifest(
+            SourceContext sourceContext,
+            String pluginId,
+            String manifestUrl
+    ) throws IOException {
+        @Nullable PluginStoreManifest cached = sourceContext.manifestCache.get(manifestUrl);
         if (cached != null) {
             if (!pluginId.equals(cached.getId())) {
                 throw new IOException("Cached plugin manifest ID mismatch for " + pluginId);
@@ -201,7 +241,7 @@ public final class PluginStoreManager {
             for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersions()) {
                 validateRemoteUrl(version.getPackageUrl(), "plugin package");
             }
-            manifestCache.put(manifestUrl, manifest);
+            sourceContext.manifestCache.put(manifestUrl, manifest);
             return manifest;
         } catch (JsonParseException exception) {
             throw new IOException("Failed to parse plugin manifest", exception);
@@ -212,25 +252,32 @@ public final class PluginStoreManager {
     ///
     /// @return resolved store items
     public @Unmodifiable List<PluginStoreItem> getStoreItems() {
-        @Nullable PluginSource currentSource = source;
-        @Nullable PluginStoreRegistry currentRegistry = registry;
-        if (currentSource == null || currentRegistry == null) {
+        @Nullable SourceContext sourceContext = context;
+        if (sourceContext == null) {
             return List.of();
         }
 
         List<PluginStoreItem> items = new ArrayList<>();
-        for (PluginStoreRegistry.PluginStoreEntry entry : currentRegistry.getPlugins()) {
+        for (PluginStoreRegistry.PluginStoreEntry entry : sourceContext.registry.getPlugins()) {
             try {
                 items.add(new PluginStoreItem(
-                        currentSource,
-                        currentRegistry,
+                        sourceContext.source,
+                        sourceContext.registry,
                         this,
                         entry,
-                        getPluginManifest(entry.getId(), entry.getManifestUrl())
+                        getPluginManifest(sourceContext, entry.getId(), entry.getManifestUrl()),
+                        sourceContext
                 ));
             } catch (IOException exception) {
                 LOG.warning("Failed to load plugin manifest: " + entry.getId(), exception);
-                items.add(new PluginStoreItem(currentSource, currentRegistry, this, entry, null));
+                items.add(new PluginStoreItem(
+                        sourceContext.source,
+                        sourceContext.registry,
+                        this,
+                        entry,
+                        null,
+                        sourceContext
+                ));
             }
         }
         return List.copyOf(items);
@@ -321,16 +368,14 @@ public final class PluginStoreManager {
             @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifactIdentities,
             @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalledArtifacts
     ) throws IOException {
-        @Nullable PluginStoreRegistry currentRegistry = registry;
-        if (currentRegistry == null) {
-            throw new IOException("Plugin registry is not loaded");
-        }
+        SourceContext sourceContext = requireContext();
+        PluginStoreRegistry currentRegistry = sourceContext.registry;
 
         @Nullable PluginStoreRegistry.PluginStoreEntry rootStoreEntry = currentRegistry.findPlugin(pluginId);
         if (rootStoreEntry == null) {
             throw new IOException("Plugin is not published by the active registry: " + pluginId);
         }
-        PluginStoreManifest rootManifest = getPluginManifest(pluginId, rootStoreEntry.getManifestUrl());
+        PluginStoreManifest rootManifest = getPluginManifest(sourceContext, pluginId, rootStoreEntry.getManifestUrl());
         PluginStoreManifest.PluginVersionEntry rootVersion = requirePublishedVersion(
                 pluginId,
                 rootManifest,
@@ -371,7 +416,7 @@ public final class PluginStoreManager {
         List<IOException> failures = new ArrayList<>();
         if (!solvePlanSelections(
                 pluginId,
-                currentRegistry,
+                sourceContext,
                 installed,
                 reusableInstalled.keySet(),
                 selected,
@@ -418,7 +463,7 @@ public final class PluginStoreManager {
     /// revise an earlier version choice.
     ///
     /// @param rootPluginId requested root plugin ID
-    /// @param currentRegistry active registry
+    /// @param sourceContext source context captured for the complete resolution
     /// @param installedManifests installed manifests
     /// @param reusableInstalledPluginIds exact installed artifacts approved for reuse
     /// @param selected mutable candidate assignment for the current branch
@@ -427,7 +472,7 @@ public final class PluginStoreManager {
     /// @return whether a complete, acyclic assignment was found
     private boolean solvePlanSelections(
             String rootPluginId,
-            PluginStoreRegistry currentRegistry,
+            SourceContext sourceContext,
             Map<String, PluginManifest> installedManifests,
             Set<String> reusableInstalledPluginIds,
             Map<String, PluginInstallPlan.Entry> selected,
@@ -470,7 +515,7 @@ public final class PluginStoreManager {
             candidates = getCandidateEntries(
                     unresolvedPluginId,
                     requirements.getOrDefault(unresolvedPluginId, List.of()),
-                    currentRegistry,
+                    sourceContext,
                     installedManifests,
                     reusableInstalledPluginIds
             );
@@ -488,7 +533,7 @@ public final class PluginStoreManager {
             selected.put(unresolvedPluginId, candidate);
             if (solvePlanSelections(
                     rootPluginId,
-                    currentRegistry,
+                    sourceContext,
                     installedManifests,
                     reusableInstalledPluginIds,
                     selected,
@@ -541,7 +586,7 @@ public final class PluginStoreManager {
     ///
     /// @param pluginId dependency plugin ID
     /// @param requirements all incoming version requirements
-    /// @param currentRegistry active registry
+    /// @param sourceContext source context captured for the complete resolution
     /// @param installedManifests installed manifests
     /// @param reusableInstalledPluginIds exact installed artifacts approved for reuse
     /// @return immutable candidate list, with an approved compatible installed package first
@@ -549,7 +594,7 @@ public final class PluginStoreManager {
     private @Unmodifiable List<PluginInstallPlan.Entry> getCandidateEntries(
             String pluginId,
             List<PluginDependency> requirements,
-            PluginStoreRegistry currentRegistry,
+            SourceContext sourceContext,
             Map<String, PluginManifest> installedManifests,
             Set<String> reusableInstalledPluginIds
     ) throws IOException {
@@ -572,7 +617,7 @@ public final class PluginStoreManager {
             ));
         }
 
-        @Nullable PluginStoreRegistry.PluginStoreEntry storeEntry = currentRegistry.findPlugin(pluginId);
+        @Nullable PluginStoreRegistry.PluginStoreEntry storeEntry = sourceContext.registry.findPlugin(pluginId);
         if (storeEntry == null) {
             if (candidates.isEmpty()) {
                 if (installedVersionMatches) {
@@ -585,7 +630,7 @@ public final class PluginStoreManager {
             return List.copyOf(candidates);
         }
 
-        PluginStoreManifest manifest = getPluginManifest(pluginId, storeEntry.getManifestUrl());
+        PluginStoreManifest manifest = getPluginManifest(sourceContext, pluginId, storeEntry.getManifestUrl());
         for (PluginStoreManifest.PluginVersionEntry version : getCompatibleVersions(manifest)) {
             if (matchesAll(version.getVersion(), requirements)) {
                 candidates.add(createRemotePlanEntry(pluginId, storeEntry, version, installedManifests));
@@ -986,19 +1031,56 @@ public final class PluginStoreManager {
     ///
     /// @return loaded registry, or `null` before the first successful source load
     public @Nullable PluginStoreRegistry getRegistry() {
-        return registry;
+        @Nullable SourceContext currentContext = context;
+        return currentContext == null ? null : currentContext.registry;
     }
 
-    /// Downloads and caches a bounded UTF-8 README from the explicit URL in a repository manifest.
+    /// Downloads and caches a bounded UTF-8 README from one source-bound store item.
+    ///
+    /// @param item source-bound item declaring the repository manifest
+    /// @return README Markdown text, or an empty string when no URL is declared
+    /// @throws IOException if transport, URL policy, response status, or size validation fails
+    public String fetchReadme(PluginStoreItem item) throws IOException {
+        if (item.getSourceManager() != this) {
+            throw new IllegalArgumentException("Plugin store item belongs to a different source manager");
+        }
+        @Nullable PluginStoreManifest manifest = item.getManifest();
+        if (manifest == null) {
+            throw new IOException("Plugin store item has no resolved manifest: " + item.getEntry().getId());
+        }
+        @Nullable SourceContext sourceContext = item.getSourceContext();
+        if (sourceContext == null) {
+            throw new IllegalArgumentException("Plugin store item has no source context");
+        }
+        return fetchReadme(sourceContext, manifest);
+    }
+
+    /// Downloads and caches a bounded UTF-8 README through the legacy explicit-manifest compatibility API.
+    ///
+    /// This overload never uses a loaded source context because a manifest alone cannot prove which source
+    /// produced it. Source-bound callers must use [#fetchReadme(PluginStoreItem)].
     ///
     /// @param manifest plugin repository manifest
     /// @return README Markdown text, or an empty string when no URL is declared
     /// @throws IOException if transport, URL policy, response status, or size validation fails
     public String fetchReadme(PluginStoreManifest manifest) throws IOException {
+        return fetchReadme(null, manifest);
+    }
+
+    /// Downloads and caches a bounded UTF-8 README through one captured context.
+    ///
+    /// @param sourceContext captured source context, or `null` before any source loads
+    /// @param manifest plugin repository manifest
+    /// @return README Markdown text, or an empty string when no URL is declared
+    /// @throws IOException if transport, URL policy, response status, or size validation fails
+    private String fetchReadme(@Nullable SourceContext sourceContext, PluginStoreManifest manifest) throws IOException {
         String readmeUrl = manifest.getReadmeUrl();
         if (readmeUrl.isBlank()) {
             return "";
         }
+        Map<String, String> readmeCache = sourceContext == null
+                ? unloadedReadmeCache
+                : sourceContext.readmeCache;
         @Nullable String cached = readmeCache.get(readmeUrl);
         if (cached != null) {
             return cached;
@@ -1009,10 +1091,15 @@ public final class PluginStoreManager {
         return readme;
     }
 
-    /// Clears resolved repository manifests.
+    /// Clears request caches for the currently published source context or the unloaded README compatibility cache.
     public void clearCache() {
-        manifestCache.clear();
-        readmeCache.clear();
+        @Nullable SourceContext currentContext = context;
+        if (currentContext == null) {
+            unloadedReadmeCache.clear();
+            return;
+        }
+        currentContext.manifestCache.clear();
+        currentContext.readmeCache.clear();
     }
 
     /// Enforces HTTPS for remote hosts while allowing loopback HTTP registries used for local development.

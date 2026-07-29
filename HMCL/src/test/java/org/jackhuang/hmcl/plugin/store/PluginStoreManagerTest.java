@@ -39,6 +39,10 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.ZipEntry;
@@ -57,6 +61,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public final class PluginStoreManagerTest {
     /// README size boundary mirrored from the store transport contract.
     private static final int README_LIMIT_BYTES = 2 * 1024 * 1024;
+
+    /// Bounded wait used by deterministic HTTP concurrency coordination.
+    private static final long CONCURRENCY_TIMEOUT_SECONDS = 5;
 
     /// Binds loaded registry items to the source and manager that produced their manifest caches.
     @Test
@@ -80,6 +87,135 @@ public final class PluginStoreManagerTest {
             assertThrows(IOException.class, () -> manager.loadSource(replacement));
             assertEquals(source, manager.getSource());
             assertEquals("Bound Store", manager.getRegistry().getName());
+        }
+    }
+
+    /// Keeps a new source context free of a manifest result that began under the old source.
+    @Test
+    public void sourceReplacementDoesNotRetainStaleManifestCache() throws Exception {
+        CountDownLatch oldManifestStarted = new CountDownLatch(1);
+        CountDownLatch releaseOldManifest = new CountDownLatch(1);
+        AtomicInteger manifestRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        String pluginId = "dev.hmclnex.context";
+        String manifestUrl = baseUrl + "/manifest";
+        server.createContext("/old-registry", exchange -> respond(exchange, registryWithEntry(
+                "Old Store", pluginId, manifestUrl
+        )));
+        server.createContext("/replacement-registry", exchange -> respond(exchange, registryWithEntry(
+                "Replacement Store", pluginId, manifestUrl
+        )));
+        server.createContext("/manifest", exchange -> {
+            if (manifestRequests.incrementAndGet() == 1) {
+                oldManifestStarted.countDown();
+                awaitLatch(releaseOldManifest, "old manifest release");
+            }
+            respond(exchange, validManifest(pluginId));
+        });
+        ExecutorService serverExecutor = Executors.newCachedThreadPool();
+        server.setExecutor(serverExecutor);
+        server.start();
+
+        try {
+            PluginStoreManager manager = new PluginStoreManager();
+            PluginSource oldSource = new PluginSource(
+                    "source_old", baseUrl + "/old-registry", null, true, false
+            );
+            PluginSource replacementSource = new PluginSource(
+                    "source_replacement", baseUrl + "/replacement-registry", null, true, false
+            );
+            manager.loadSource(oldSource);
+            AtomicReference<@Nullable Throwable> oldRequestFailure = new AtomicReference<>();
+            Thread oldRequest = new Thread(() -> {
+                try {
+                    manager.getPluginManifest(pluginId, manifestUrl);
+                } catch (Throwable exception) {
+                    oldRequestFailure.set(exception);
+                }
+            }, "plugin-store-old-manifest");
+
+            oldRequest.start();
+            assertTrue(oldManifestStarted.await(CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            manager.loadSource(replacementSource);
+            releaseOldManifest.countDown();
+            oldRequest.join(TimeUnit.SECONDS.toMillis(CONCURRENCY_TIMEOUT_SECONDS));
+
+            assertFalse(oldRequest.isAlive());
+            assertEquals(null, oldRequestFailure.get());
+            PluginStoreItem replacementItem = manager.getStoreItems().get(0);
+            assertEquals(replacementSource, replacementItem.getSource());
+            assertEquals("Replacement Store", replacementItem.getRegistry().getName());
+            assertEquals(2, manifestRequests.get());
+        } finally {
+            releaseOldManifest.countDown();
+            server.stop(0);
+            serverExecutor.shutdownNow();
+        }
+    }
+
+    /// Keeps observed item source and registry values from the same replacement generation.
+    @Test
+    public void concurrentReadersNeverObserveMixedSourceAndRegistry() throws Exception {
+        CountDownLatch replacementRegistryStarted = new CountDownLatch(1);
+        CountDownLatch releaseReplacementRegistry = new CountDownLatch(1);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        String oldPluginId = "dev.hmclnex.old";
+        String replacementPluginId = "dev.hmclnex.replacement";
+        server.createContext("/old-registry", exchange -> respond(exchange, registryWithEntry(
+                "Old Store", oldPluginId, baseUrl + "/old-manifest"
+        )));
+        server.createContext("/replacement-registry", exchange -> {
+            replacementRegistryStarted.countDown();
+            awaitLatch(releaseReplacementRegistry, "replacement registry release");
+            respond(exchange, registryWithEntry(
+                    "Replacement Store", replacementPluginId, baseUrl + "/replacement-manifest"
+            ));
+        });
+        server.createContext("/old-manifest", exchange -> respond(exchange, validManifest(oldPluginId)));
+        server.createContext("/replacement-manifest", exchange -> respond(exchange, validManifest(replacementPluginId)));
+        ExecutorService serverExecutor = Executors.newCachedThreadPool();
+        server.setExecutor(serverExecutor);
+        server.start();
+
+        try {
+            PluginStoreManager manager = new PluginStoreManager();
+            PluginSource oldSource = new PluginSource(
+                    "source_old", baseUrl + "/old-registry", null, true, false
+            );
+            PluginSource replacementSource = new PluginSource(
+                    "source_replacement", baseUrl + "/replacement-registry", null, true, false
+            );
+            manager.loadSource(oldSource);
+            AtomicReference<@Nullable Throwable> replacementFailure = new AtomicReference<>();
+            Thread replacement = new Thread(() -> {
+                try {
+                    manager.loadSource(replacementSource);
+                } catch (Throwable exception) {
+                    replacementFailure.set(exception);
+                }
+            }, "plugin-store-replacement");
+
+            replacement.start();
+            assertTrue(replacementRegistryStarted.await(CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            for (int index = 0; index < 100; index++) {
+                PluginStoreItem item = manager.getStoreItems().get(0);
+                assertEquals("source_old", item.getSource().getId());
+                assertEquals("Old Store", item.getRegistry().getName());
+            }
+            releaseReplacementRegistry.countDown();
+            replacement.join(TimeUnit.SECONDS.toMillis(CONCURRENCY_TIMEOUT_SECONDS));
+
+            assertFalse(replacement.isAlive());
+            assertEquals(null, replacementFailure.get());
+            PluginStoreItem replacementItem = manager.getStoreItems().get(0);
+            assertEquals("source_replacement", replacementItem.getSource().getId());
+            assertEquals("Replacement Store", replacementItem.getRegistry().getName());
+        } finally {
+            releaseReplacementRegistry.countDown();
+            server.stop(0);
+            serverExecutor.shutdownNow();
         }
     }
 
@@ -663,6 +799,70 @@ public final class PluginStoreManagerTest {
         );
         assertTrue(exception.getMessage().contains(expectedMessage), exception.getMessage());
         assertArrayEquals(existingPackage, Files.readAllBytes(installedPackage));
+    }
+
+    /// Awaits a concurrency gate and turns timeouts into deterministic test failures.
+    ///
+    /// @param latch gate to await
+    /// @param description gate description for diagnostics
+    /// @throws IOException if waiting times out or is interrupted
+    private static void awaitLatch(CountDownLatch latch, String description) throws IOException {
+        try {
+            if (!latch.await(CONCURRENCY_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IOException("Timed out waiting for " + description);
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for " + description, exception);
+        }
+    }
+
+    /// Serializes one valid registry with a single manifest entry.
+    ///
+    /// @param name registry display name
+    /// @param pluginId indexed plugin ID
+    /// @param manifestUrl manifest endpoint
+    /// @return registry JSON
+    private static byte @Unmodifiable [] registryWithEntry(String name, String pluginId, String manifestUrl) {
+        return """
+                {
+                  "schemaVersion": 1,
+                  "name": "%s",
+                  "plugins": [
+                    {
+                      "id": "%s",
+                      "name": "Context Plugin",
+                      "manifestUrl": "%s"
+                    }
+                  ]
+                }
+                """.formatted(name, pluginId, manifestUrl).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /// Serializes one valid schema-two manifest for the supplied registry ID.
+    ///
+    /// @param pluginId expected plugin ID
+    /// @return manifest JSON
+    private static byte @Unmodifiable [] validManifest(String pluginId) {
+        return """
+                {
+                  "schemaVersion": 2,
+                  "id": "%s",
+                  "versions": [
+                    {
+                      "version": "1.0.0",
+                      "packageUrl": "https://example.com/plugin.npl",
+                      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                      "pluginApiVersion": 4,
+                      "permissions": [],
+                      "requiredPermissions": [],
+                      "launcherVersion": "*",
+                      "dependencies": [],
+                      "size": 1
+                    }
+                  ]
+                }
+                """.formatted(pluginId).getBytes(StandardCharsets.UTF_8);
     }
 
     /// Owns a local registry fixture that can serve a valid catalog and repository manifest.
