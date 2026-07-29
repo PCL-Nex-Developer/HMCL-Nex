@@ -284,6 +284,25 @@ public final class PluginStoreDependencyResolverTest {
             assertEquals("Root Alias", installedRoot.getSourceDisplayName());
             assertSame(root.getSourceManager(), installedRoot.requireSourceManager());
 
+            PluginManifest outdatedDependencyManifest = packageManifest(dependencyId, "0.9.0", "[]");
+            PluginArtifactIdentity outdatedDependencyIdentity = PluginArtifactIdentity.of(
+                    outdatedDependencyManifest,
+                    "9".repeat(64)
+            );
+            PluginInstallPlan updatePlan = resolver.resolveInstallPlan(
+                    rootId,
+                    rootVersion,
+                    Map.of(dependencyId, outdatedDependencyManifest),
+                    Map.of(dependencyId, outdatedDependencyIdentity),
+                    Map.of()
+            );
+            PluginInstallPlan.Entry updatedDependency = updatePlan.getEntries().get(0);
+
+            assertEquals(PluginInstallPlan.Action.UPDATE, updatedDependency.getAction());
+            assertEquals(dependencySource.getId(), updatedDependency.getSourceId());
+            assertEquals("Dependency Alias", updatedDependency.getSourceDisplayName());
+            assertSame(dependency.getSourceManager(), updatedDependency.requireSourceManager());
+
             PluginManifest installedDependencyManifest = packageManifest(dependencyId, "1.0.0", "[]");
             PluginArtifactIdentity dependencyIdentity = PluginArtifactIdentity.of(installedDependencyManifest, "a".repeat(64));
             PluginInstallPlan reusePlan = resolver.resolveInstallPlan(
