@@ -52,6 +52,57 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies README sanitization and mandatory fail-closed permission review in the plugin store UI model.
 @NotNullByDefault
 public final class PluginStorePageTest {
+    /// Requires every source-management message used by the aggregate plugin store to have an English fallback.
+    @Test
+    public void everyPluginSourceManagementKeyExists() {
+        for (String key : List.of(
+                "plugin.store.manage_sources",
+                "plugin.store.id",
+                "plugin.store.sources.summary",
+                "plugin.store.sources.none_enabled",
+                "plugin.store.sources.none_enabled.description",
+                "plugin.store.sources.all_failed",
+                "plugin.store.sources.all_failed.description",
+                "plugin.store.sources.degraded",
+                "plugin.store.sources.conflicts",
+                "plugin.store.source",
+                "plugin.store.source.official",
+                "plugin.store.source.third_party",
+                "plugin.store.source.label",
+                "plugin.store.source.conflict",
+                "plugin.store.source.unavailable",
+                "plugin.store.source.configured",
+                "plugin.store.source.other_candidates",
+                "plugin.store.source.plan_entry",
+                "plugin.store.source.status.unchecked",
+                "plugin.store.source.status.loading",
+                "plugin.store.source.status.loaded",
+                "plugin.store.source.status.partial_failure",
+                "plugin.store.source.status.failed",
+                "plugin.store.source.details.url",
+                "plugin.store.source.details.alias",
+                "plugin.store.source.details.registry",
+                "plugin.store.source.details.description",
+                "plugin.store.source.details.homepage",
+                "plugin.store.source.details.type",
+                "plugin.store.source.details.enabled",
+                "plugin.store.source.details.priority",
+                "plugin.store.source.details.status",
+                "plugin.store.source.details.failure",
+                "plugin.store.source.details.plugins",
+                "plugin.store.source.details.duration",
+                "plugin.store.source.details.partial_manifest_failures",
+                "plugin.store.source.details.conflicts",
+                "plugin.store.source.preview.homepage",
+                "plugin.store.source.preview.confirm",
+                "plugin.store.source.delete.confirm",
+                "plugin.store.source.delete.installed_confirm",
+                "plugin.store.install.degraded_sources_warning"
+        )) {
+            assertTrue(org.jackhuang.hmcl.util.i18n.I18n.hasKey(key), key);
+        }
+    }
+
     /// Removes every resource-loading element while retaining text and explicit hyperlinks.
     @Test
     public void stripAutomaticReadmeResources() {
@@ -351,7 +402,7 @@ public final class PluginStorePageTest {
     @Test
     public void sourceSummaryReportsEnabledSourceCount() {
         assertEquals(
-                "1 of 2 plugin sources enabled",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.sources.summary", 1, 2),
                 PluginStorePage.sourceSummary(List.of(
                         new PluginSource(PluginSource.OFFICIAL_ID, PluginStoreManager.DEFAULT_REGISTRY_URL, null, true, true),
                         new PluginSource("source_one", "https://plugins.example.org/plugins.json", null, false, false)
@@ -443,13 +494,13 @@ public final class PluginStorePageTest {
     @Test
     public void terminalPresentationUsesCurrentStatusInsteadOfStaleLoadedCount() {
         assertEquals(
-                "No plugin sources are enabled",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.sources.none_enabled"),
                 PluginStorePage.statusTextFor(
                         PluginStorePage.presentationFor(noEnabledSnapshot()), 4, 4, null
                 )
         );
         assertEquals(
-                "All plugin sources failed",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.sources.all_failed"),
                 PluginStorePage.statusTextFor(
                         PluginStorePage.presentationFor(allFailedSnapshot()), 4, 4, null
                 )
@@ -534,7 +585,7 @@ public final class PluginStorePageTest {
             ));
 
             assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot))
-                    .endsWith("configured source"));
+                    .endsWith(org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.configured")));
         }
 
         PluginSource ordinary = new PluginSource(
@@ -589,7 +640,9 @@ public final class PluginStorePageTest {
                 "Badge Plugin"
         );
 
-        assertTrue(PluginStorePage.buildPluginRowSubtitle(item, null).contains("Source: Source A"));
+        assertTrue(PluginStorePage.buildPluginRowSubtitle(item, null).contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.label", "Source A")
+        ));
     }
 
     /// Keeps favorites attached to plugin identity regardless of the source that currently wins that identity.

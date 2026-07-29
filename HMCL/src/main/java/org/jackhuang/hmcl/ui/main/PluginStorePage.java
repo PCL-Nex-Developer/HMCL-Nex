@@ -209,13 +209,14 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 SVG.REFRESH,
                 this::loadPluginStore
         );
+        String manageSources = i18n("plugin.store.manage_sources");
         JFXButton settingsButton = createToolbarButton2(
-                "Manage plugin sources",
+                manageSources,
                 SVG.SETTINGS,
                 this::showSourceManagement
         );
-        sourceSummaryLabel.setTooltip(new Tooltip("Manage plugin sources"));
-        sourceSummaryLabel.setAccessibleText("Manage plugin sources");
+        sourceSummaryLabel.setTooltip(new Tooltip(manageSources));
+        sourceSummaryLabel.setAccessibleText(manageSources);
         refreshSourceSummary();
         favoritesOnlyButton.getStyleClass().add("jfx-tool-bar-button");
         favoritesOnlyButton.setMinSize(40, 40);
@@ -323,7 +324,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @return compact enabled-source summary
     static String sourceSummary(List<PluginSource> sources) {
         long enabled = sources.stream().filter(PluginSource::isEnabled).count();
-        return enabled + " of " + sources.size() + " plugin sources enabled";
+        return i18n("plugin.store.sources.summary", enabled, sources.size());
     }
 
     /// Selects the aggregate presentation state without discarding a prior accepted snapshot during refresh.
@@ -575,13 +576,13 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             switch (presentation.state()) {
                 case NO_ENABLED_SOURCES -> showStoreMessage(
                         SVG.SETTINGS,
-                        "No plugin sources are enabled",
-                        "Enable a plugin source in source management to browse plugins."
+                        i18n("plugin.store.sources.none_enabled"),
+                        i18n("plugin.store.sources.none_enabled.description")
                 );
                 case ALL_FAILED -> showStoreMessage(
                         SVG.ERROR,
-                        "All plugin sources failed",
-                        "Check source management for source status and retry the refresh."
+                        i18n("plugin.store.sources.all_failed"),
+                        i18n("plugin.store.sources.all_failed.description")
                 );
                 default -> showStoreMessage(SVG.INFO, i18n("plugin.store.empty"), i18n("plugin.store.empty.description"));
             }
@@ -636,17 +637,17 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             @Nullable String installedFailure
     ) {
         String status = switch (presentation.state()) {
-            case NO_ENABLED_SOURCES -> "No plugin sources are enabled";
-            case ALL_FAILED -> "All plugin sources failed";
+            case NO_ENABLED_SOURCES -> i18n("plugin.store.sources.none_enabled");
+            case ALL_FAILED -> i18n("plugin.store.sources.all_failed");
             default -> i18n("plugin.store.loaded") + ": " + filteredCount + "/" + totalCount
                     + " " + i18n("plugin.store.plugins");
         };
         List<String> statusLines = new ArrayList<>(List.of(status));
         if (presentation.state() == StoreState.DEGRADED) {
-            statusLines.add("Some plugin sources are unavailable; displayed winners may change when they return.");
+            statusLines.add(i18n("plugin.store.sources.degraded"));
         }
         if (presentation.hasConflicts()) {
-            statusLines.add("Some plugin IDs are published by multiple sources; the highest-priority source is shown.");
+            statusLines.add(i18n("plugin.store.sources.conflicts"));
         }
         if (installedFailure != null) {
             statusLines.add(i18n("plugin.installed.load_failed") + ": " + installedFailure);
@@ -746,7 +747,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         }
         row.setTrailingText(null);
         row.setTrailingIcon(createPluginTrailingActions(entry.getId(),
-                hasConflict ? status + "\nSource conflict" : status, hasUpdate));
+                hasConflict ? status + "\n" + i18n("plugin.store.source.conflict") : status, hasUpdate));
         row.setOnAction(event -> showPluginDetails(item));
         return row;
     }
@@ -776,7 +777,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     ) {
         PluginStoreRegistry.PluginStoreEntry entry = item.getEntry();
         List<String> metadataLines = new ArrayList<>();
-        metadataLines.add("Source: " + sourceDisplayName(item));
+        metadataLines.add(i18n("plugin.store.source.label", sourceDisplayName(item)));
         String description = summarizeDescription(entry.getDescription());
         if (StringUtils.isNotBlank(entry.getAuthor())) {
             metadataLines.add(i18n("plugin.author") + ": " + entry.getAuthor());
@@ -812,7 +813,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     private static String latestVersionText(PluginStoreItem item) {
         @Nullable PluginStoreManifest.PluginVersionEntry version = item.getSourceManager()
                 .getLatestCompatibleVersion(item.getManifest());
-        return version == null ? "unavailable" : versionText(version);
+        return version == null ? i18n("plugin.store.source.unavailable") : versionText(version);
     }
 
     /// Separates descriptive prose from scan-friendly metadata without producing empty edge lines.
@@ -1412,7 +1413,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 .map(PluginSourceLoadResult::getSource)
                 .map(PluginStorePage::warningSourceLabel)
                 .collect(Collectors.joining(", "));
-        return "Unavailable higher-priority sources may have changed catalog winners: " + failedSources;
+        return i18n("plugin.store.install.degraded_sources_warning", failedSources);
     }
 
     /// Returns a source warning label that cannot disclose a configured URL, credential, query, or fragment.
@@ -1427,7 +1428,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         if (isSafeWarningLabel(source.getId())) {
             return source.getId();
         }
-        return "configured source";
+        return i18n("plugin.store.source.configured");
     }
 
     /// Returns whether a source alias or ID is a bounded plain display name rather than a URL or credential token.
@@ -1462,18 +1463,26 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                         entry.getVersion()
                 ));
                 case INSTALL -> rows.add(i18n(
-                        "plugin.store.plan.install",
-                        entry.getDisplayName(),
-                        entry.getVersion()
-                ) + " (" + Objects.requireNonNull(entry.getSourceDisplayName()) + ")");
+                        "plugin.store.source.plan_entry",
+                        i18n(
+                                "plugin.store.plan.install",
+                                entry.getDisplayName(),
+                                entry.getVersion()
+                        ),
+                        Objects.requireNonNull(entry.getSourceDisplayName())
+                ));
                 case UPDATE -> {
                     @Nullable PluginManifest installed = entry.getInstalledManifest();
                     rows.add(i18n(
-                            "plugin.store.plan.update",
-                            entry.getDisplayName(),
-                            installed == null ? "?" : installed.getVersion(),
-                            entry.getVersion()
-                    ) + " (" + Objects.requireNonNull(entry.getSourceDisplayName()) + ")");
+                            "plugin.store.source.plan_entry",
+                            i18n(
+                                    "plugin.store.plan.update",
+                                    entry.getDisplayName(),
+                                    installed == null ? "?" : installed.getVersion(),
+                                    entry.getVersion()
+                            ),
+                            Objects.requireNonNull(entry.getSourceDisplayName())
+                    ));
                 }
             }
             for (PluginDependency dependency : entry.getDependencies()) {
@@ -1894,13 +1903,13 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             identityList.getContent().add(identity);
             identityList.getContent().add(createReadOnlyRow(
                     SVG.INFO,
-                    "ID",
+                    i18n("plugin.store.id"),
                     entry.getId()
             ));
 
             identityList.getContent().add(createReadOnlyRow(
                     SVG.EXTENSION,
-                    "Source",
+                    i18n("plugin.store.source"),
                     sourceDisplayName(item)
             ));
             @Nullable PluginStoreSnapshot snapshot = currentSnapshot;
@@ -1911,7 +1920,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                     String candidates = conflicts.stream()
                             .map(candidate -> sourceDisplayName(candidate) + " " + latestVersionText(candidate))
                             .collect(Collectors.joining("\n"));
-                    identityList.getContent().add(createReadOnlyRow(SVG.WARNING, "Other source candidates", candidates));
+                    identityList.getContent().add(createReadOnlyRow(
+                            SVG.WARNING,
+                            i18n("plugin.store.source.other_candidates"),
+                            candidates
+                    ));
                 }
             }
             if (StringUtils.isNotBlank(entry.getAuthor())) {

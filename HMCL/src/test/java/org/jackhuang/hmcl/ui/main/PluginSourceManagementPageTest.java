@@ -102,7 +102,9 @@ public final class PluginSourceManagementPageTest {
 
         PluginSourceManagementPage.SourceRow row = PluginSourceManagementPage.sourceRow(source, null, null);
 
-        assertTrue(row.subtitle().contains("0 " + org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.plugins")));
+        assertTrue(row.subtitle().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.plugins", 0)
+        ));
         assertTrue(row.subtitle().endsWith("· -"));
     }
 
@@ -110,9 +112,20 @@ public final class PluginSourceManagementPageTest {
     @Test
     public void sourcePreviewIncludesConfigurationRegistryMetadataAndPluginCount() {
         assertEquals(
-                "URL: https://plugins.example.org/catalog/plugins.json\nAlias: Local\nRemote\n"
-                        + "A curated plugin registry\nHomepage: plugins.example.org\n3 "
-                        + org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.plugins"),
+                String.join("\n",
+                        org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                                "plugin.store.source.details.url",
+                                "https://plugins.example.org/catalog/plugins.json"
+                        ),
+                        org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.alias", "Local"),
+                        "Remote",
+                        "A curated plugin registry",
+                        org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                                "plugin.store.source.preview.homepage",
+                                "plugins.example.org"
+                        ),
+                        org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.plugins", 3)
+                ),
                 PluginSourceManagementPage.previewMessage(
                         "https://plugins.example.org/catalog/plugins.json",
                         "Local",
@@ -313,17 +326,41 @@ public final class PluginSourceManagementPageTest {
 
         assertEquals("Local", details.title());
         assertTrue(details.message().contains(source.getUrl()));
-        assertTrue(details.message().contains("Alias: Local"));
-        assertTrue(details.message().contains("Registry: Remote"));
-        assertTrue(details.message().contains("Description: A curated plugin registry"));
-        assertTrue(details.message().contains("Homepage: plugins.example.org"));
-        assertTrue(details.message().contains("Priority: 2"));
-        assertTrue(details.message().contains("Duration: 42 ms"));
-        assertTrue(details.message().contains("Plugins: 0"));
-        assertTrue(details.message().contains("Partial manifest failures: 0"));
-        assertTrue(details.message().contains("Conflicts: 0"));
-        assertTrue(details.message().contains("Type: Third-party"));
-        assertTrue(details.message().contains("Enabled: true"));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.alias", "Local")
+        ));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.registry", "Remote")
+        ));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.description", "A curated plugin registry"
+        )));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.homepage", "plugins.example.org")
+        ));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.priority", 2)
+        ));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.duration", 42)
+        ));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.plugins", 0)
+        ));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.partial_manifest_failures", 0
+        )));
+        assertTrue(details.message().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.details.conflicts", 0)
+        ));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.type",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.third_party")
+        )));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.enabled",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.enabled")
+        )));
     }
 
     /// Keeps URL-bearing failure diagnostics out of compact rows while retaining them in details.
@@ -341,10 +378,21 @@ public final class PluginSourceManagementPageTest {
         PluginSourceManagementPage.SourceDetails details = PluginSourceManagementPage.sourceDetails(source, null, failed);
 
         assertFalse(row.subtitle().contains("https://"));
-        assertTrue(row.subtitle().contains("FAILED"));
-        assertTrue(details.message().contains("Failure: Cannot read https://plugins.example.org/catalog/plugins.json"));
-        assertTrue(details.message().contains("Type: Third-party"));
-        assertTrue(details.message().contains("Enabled: true"));
+        assertTrue(row.subtitle().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.status.failed")
+        ));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.failure",
+                "Cannot read https://plugins.example.org/catalog/plugins.json"
+        )));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.type",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.third_party")
+        )));
+        assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
+                "plugin.store.source.details.enabled",
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.enabled")
+        )));
     }
 
     /// Presents separate enabled and source result statuses for compact source rows.
@@ -358,8 +406,10 @@ public final class PluginSourceManagementPageTest {
         PluginSourceManagementPage.SourceRow loaded = PluginSourceManagementPage.sourceRow(source, null, disabled);
 
         assertTrue(unavailable.subtitle().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.disabled")));
-        assertTrue(unavailable.subtitle().contains("Unavailable"));
-        assertTrue(loaded.subtitle().contains("DISABLED"));
+        assertTrue(unavailable.subtitle().contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.status.unchecked")
+        ));
+        assertTrue(loaded.subtitle().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.disabled")));
     }
 
     /// Rejects stale source-test completions after a newer request or source configuration mutation.
