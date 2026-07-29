@@ -50,6 +50,7 @@ import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
+import org.jackhuang.hmcl.plugin.store.PluginSourceLoadExecutor;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
 import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
@@ -93,6 +94,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.jackhuang.hmcl.ui.ToolbarListPageSkin.createToolbarButton2;
@@ -175,8 +177,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Current generation's load failure, or `null` outside the error state.
     private @Nullable String storeLoadFailure;
 
-    /// Latest official-only source result exposed to source management until Task 6 adopts aggregate catalog loading.
+    /// Latest source result exposed to source management until Task 6 adopts aggregate catalog loading.
     private @Nullable PluginStoreSnapshot currentSnapshot;
+
+    /// Current source-management page waiting for explicit source snapshot publication.
+    private @Nullable PluginSourceManagementPage sourceManagementPage;
 
     /// Whether the first visible-page registry request has already been started.
     private boolean initialLoadRequested;
@@ -325,17 +330,20 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Opens the independent source-management page while retaining the store catalog on this page.
     private void showSourceManagement() {
-        Controllers.navigate(new PluginSourceManagementPage(
+        PluginSourceManagementPage page = new PluginSourceManagementPage(
                 sourceRepository,
                 () -> currentSnapshot,
                 () -> Set.copyOf(installedManifests.keySet()),
                 this::loadPluginStore
-        ));
+        );
+        sourceManagementPage = page;
+        Controllers.navigate(page);
     }
 
     /// Loads the fixed official source and its repository manifests on a background thread.
     private void loadPluginStore() {
         long generation = ++storeLoadGeneration;
+        currentSnapshot = null;
         refreshSourceSummary();
         storeLoaded = false;
         storeLoadFailure = null;
@@ -355,16 +363,18 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 true
         );
 
+        long startedAt = System.nanoTime();
         Task.supplyAsync(() -> {
-            long startedAt = System.nanoTime();
             try {
-                requestManager.loadSource(officialSource);
-                return new StoreLoadResult(
-                        requestManager,
-                        requestManager.getStoreItems(),
-                        Math.max(0, (System.nanoTime() - startedAt) / 1_000_000)
-                );
-            } catch (IOException exception) {
+                return PluginSourceLoadExecutor.call(() -> {
+                    requestManager.loadSource(officialSource);
+                    return new StoreLoadResult(
+                            requestManager,
+                            requestManager.getStoreItems(),
+                            Math.max(0, (System.nanoTime() - startedAt) / 1_000_000)
+                    );
+                });
+            } catch (Exception exception) {
                 LOG.error("Failed to load plugin store", exception);
                 throw new RuntimeException(exception);
             }
@@ -376,6 +386,12 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             if (exception != null) {
                 String message = failureMessage(exception);
                 storeLoadFailure = message;
+                publishCurrentSnapshot(failureSnapshot(
+                        generation,
+                        officialSource,
+                        Math.max(0, (System.nanoTime() - startedAt) / 1_000_000),
+                        new IOException(message, exception)
+                ));
                 showStoreMessage(
                         SVG.ERROR,
                         i18n("plugin.store.load_failed"),
@@ -384,7 +400,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 return;
             }
             storeManager = result.manager;
-            currentSnapshot = new PluginStoreSnapshot(
+            publishCurrentSnapshot(new PluginStoreSnapshot(
                     generation,
                     List.of(PluginSourceLoadResult.success(
                             result.manager.getSource(),
@@ -394,7 +410,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                             Objects.requireNonNull(result.manager.getRegistry()),
                             result.manager
                     ))
-            );
+            ));
             storeLoaded = true;
             storeLoadFailure = null;
             allItems.clear();
@@ -402,6 +418,63 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             refreshCategories();
             applyFilter();
         }).start();
+    }
+
+    /// Creates a source snapshot that records a failed current refresh instead of retaining stale success data.
+    ///
+    /// @param generation current store refresh generation
+    /// @param source requested official source
+    /// @param durationMillis elapsed failed request duration
+    /// @param failure current source load failure
+    /// @return snapshot containing the current generation failure
+    static PluginStoreSnapshot failureSnapshot(
+            long generation,
+            PluginSource source,
+            long durationMillis,
+            IOException failure
+    ) {
+        return new PluginStoreSnapshot(
+                generation,
+                List.of(PluginSourceLoadResult.failed(source, durationMillis, failure))
+        );
+    }
+
+    /// Replaces the current source snapshot before rebuilding the open source-management page.
+    ///
+    /// @param snapshot newly published current source snapshot
+    private void publishCurrentSnapshot(PluginStoreSnapshot snapshot) {
+        publishSnapshotThenNotify(
+                published -> currentSnapshot = published,
+                snapshot,
+                ignored -> publishSnapshotThenRefresh(currentSnapshot, sourceManagementPage)
+        );
+    }
+
+    /// Publishes a source snapshot and then refreshes the open source-management page in strict publication order.
+    ///
+    /// @param snapshot new current source snapshot
+    /// @param page open source-management page, or `null` when the page is not visible
+    static void publishSnapshotThenRefresh(
+            @Nullable PluginStoreSnapshot snapshot,
+            @Nullable PluginSourceManagementPage page
+    ) {
+        if (snapshot != null && page != null) {
+            page.refreshSourceRows();
+        }
+    }
+
+    /// Replaces a snapshot target before notifying its consumer, preserving observable publication order.
+    ///
+    /// @param target current source snapshot replacement callback
+    /// @param snapshot newly published snapshot
+    /// @param onPublished consumer invoked after the target contains the snapshot
+    static void publishSnapshotThenNotify(
+            Consumer<PluginStoreSnapshot> target,
+            PluginStoreSnapshot snapshot,
+            Consumer<PluginStoreSnapshot> onPublished
+    ) {
+        target.accept(snapshot);
+        onPublished.accept(snapshot);
     }
 
     /// Refreshes disk-level installation state without depending on successful lifecycle loading.

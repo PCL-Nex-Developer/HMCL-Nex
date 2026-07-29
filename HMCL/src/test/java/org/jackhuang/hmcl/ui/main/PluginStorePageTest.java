@@ -22,7 +22,9 @@ import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
+import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
+import org.jackhuang.hmcl.plugin.store.PluginStoreSnapshot;
 import org.jackhuang.hmcl.ui.SVG;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jsoup.nodes.Document;
@@ -343,6 +345,45 @@ public final class PluginStorePageTest {
                         new PluginSource("source_one", "https://plugins.example.org/plugins.json", null, false, false)
                 ))
         );
+    }
+
+    /// Publishes the current snapshot before source-management refresh callbacks read it.
+    @Test
+    public void snapshotPublicationPrecedesSourceManagementRefresh() {
+        java.util.concurrent.atomic.AtomicReference<PluginStoreSnapshot> current = new java.util.concurrent.atomic.AtomicReference<>();
+        PluginSource source = new PluginSource(
+                PluginSource.OFFICIAL_ID, PluginStoreManager.DEFAULT_REGISTRY_URL, null, true, true);
+        PluginStoreSnapshot snapshot = PluginStorePage.failureSnapshot(
+                1, source, 2, new java.io.IOException("failure"));
+        java.util.concurrent.atomic.AtomicLong observedGeneration = new java.util.concurrent.atomic.AtomicLong(-1);
+
+        PluginStorePage.publishSnapshotThenNotify(
+                current::set,
+                snapshot,
+                published -> observedGeneration.set(current.get().getGeneration())
+        );
+
+        assertEquals(1, observedGeneration.get());
+    }
+
+    /// Replaces a previous success with a current-generation source failure snapshot.
+    @Test
+    public void currentGenerationFailureReplacesPriorSuccessfulSourceSnapshot() {
+        PluginSource source = new PluginSource(
+                PluginSource.OFFICIAL_ID, PluginStoreManager.DEFAULT_REGISTRY_URL, null, true, true);
+        PluginStoreSnapshot previous = new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.failed(source, 1, new java.io.IOException("previous"))));
+        PluginStoreSnapshot failure = PluginStorePage.failureSnapshot(
+                2,
+                source,
+                3,
+                new java.io.IOException("current")
+        );
+
+        assertEquals(1, previous.getGeneration());
+        assertEquals(2, failure.getGeneration());
+        assertEquals(PluginSourceLoadResult.Status.FAILED, failure.getSourceResults().get(0).getStatus());
+        assertEquals("current", failure.getSourceResults().get(0).getFailureMessage());
     }
 
     /// Keeps source load durations nonnegative for source-management presentation.
