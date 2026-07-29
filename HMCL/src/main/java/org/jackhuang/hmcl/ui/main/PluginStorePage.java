@@ -50,14 +50,14 @@ import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
-import org.jackhuang.hmcl.plugin.store.PluginSourceLoadExecutor;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
+import org.jackhuang.hmcl.plugin.store.PluginStoreAggregator;
+import org.jackhuang.hmcl.plugin.store.PluginStoreDependencyResolver;
 import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
 import org.jackhuang.hmcl.plugin.store.PluginStorePreferences;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManifest;
 import org.jackhuang.hmcl.plugin.store.PluginStoreSnapshot;
-import org.jackhuang.hmcl.plugin.store.PluginSourceRepository;
 import org.jackhuang.hmcl.plugin.store.PluginStoreRegistry;
 import org.jackhuang.hmcl.task.Schedulers;
 import org.jackhuang.hmcl.task.Task;
@@ -94,6 +94,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -120,14 +121,11 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     private final ReadOnlyObjectWrapper<State> state =
             new ReadOnlyObjectWrapper<>(State.fromTitle(i18n("plugin.store")));
 
-    /// Remote registry, compatibility, README, and download service for the fixed official source.
-    private PluginStoreManager storeManager = new PluginStoreManager();
+    /// Page-owned persistence for ordered sources and favorite plugin IDs.
+    private final PluginStorePreferences sourceRepository = new PluginStorePreferences(Metadata.HMCL_LOCAL_HOME);
 
-    /// Page-owned persistence for sources and favorite plugin IDs.
-    private final PluginStorePreferences storePreferences = new PluginStorePreferences(Metadata.HMCL_LOCAL_HOME);
-
-    /// Shared ordered source repository used by the source-management page.
-    private final PluginSourceRepository sourceRepository = storePreferences;
+    /// Persistent aggregate loader shared by every refresh while this cached page exists.
+    private final PluginStoreAggregator storeAggregator = new PluginStoreAggregator();
 
     /// Summary of enabled sources displayed beside the store toolbar.
     private final Label sourceSummaryLabel = new Label();
@@ -168,17 +166,17 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Installed-package read failure, or `null` when update and installation state is trustworthy.
     private @Nullable String installedManifestFailure;
 
-    /// Monotonic request generation preventing stale registry loads from replacing a newer selection.
-    private long storeLoadGeneration;
-
-    /// Whether the current generation has published a complete registry result.
-    private boolean storeLoaded;
-
-    /// Current generation's load failure, or `null` outside the error state.
-    private @Nullable String storeLoadFailure;
-
-    /// Latest source result exposed to source management until Task 6 adopts aggregate catalog loading.
+    /// Latest accepted aggregate catalog, or `null` before the first refresh completes.
     private @Nullable PluginStoreSnapshot currentSnapshot;
+
+    /// Whether a newer aggregate source refresh is underway while prior rows remain usable.
+    private boolean storeRefreshInProgress;
+
+    /// Latest page refresh request generation used to reject stale JavaFX completions.
+    private long storeRefreshGeneration;
+
+    /// Guards the single application-lifetime shutdown of the persistent aggregate loader.
+    private final AtomicBoolean storeAggregatorClosed = new AtomicBoolean();
 
     /// Current source-management page waiting for explicit source snapshot publication.
     private @Nullable PluginSourceManagementPage sourceManagementPage;
@@ -328,6 +326,89 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         return enabled + " of " + sources.size() + " plugin sources enabled";
     }
 
+    /// Selects the aggregate presentation state without discarding a prior accepted snapshot during refresh.
+    ///
+    /// @param snapshot accepted aggregate snapshot
+    /// @return immutable state used for catalog rows and banners
+    static StorePresentation presentationFor(PluginStoreSnapshot snapshot) {
+        return presentationFor(snapshot, false);
+    }
+
+    /// Selects the aggregate presentation state while documenting that a newer refresh may still be active.
+    ///
+    /// @param snapshot accepted aggregate snapshot
+    /// @param refreshInProgress whether a newer source refresh remains in flight
+    /// @return immutable state used for catalog rows and banners
+    static StorePresentation presentationFor(PluginStoreSnapshot snapshot, boolean refreshInProgress) {
+        int enabledSourceCount = (int) snapshot.getSourceResults().stream()
+                .map(PluginSourceLoadResult::getSource)
+                .filter(PluginSource::isEnabled)
+                .count();
+        int failedSourceCount = snapshot.getFailures().size();
+        boolean hasConflicts = !snapshot.getConflictCandidates().isEmpty();
+        StoreState state;
+        if (enabledSourceCount == 0) {
+            state = StoreState.NO_ENABLED_SOURCES;
+        } else if (snapshot.getWinningItems().isEmpty() && failedSourceCount > 0) {
+            state = StoreState.ALL_FAILED;
+        } else if (failedSourceCount > 0) {
+            state = StoreState.DEGRADED;
+        } else if (hasConflicts) {
+            state = StoreState.CONFLICTS;
+        } else {
+            state = StoreState.READY;
+        }
+        return new StorePresentation(state, enabledSourceCount, failedSourceCount, hasConflicts, refreshInProgress);
+    }
+
+    /// Returns whether a completed aggregate result may replace the page's accepted snapshot.
+    ///
+    /// @param requestGeneration page refresh generation captured at request start
+    /// @param currentGeneration latest page refresh generation
+    /// @param completed completed aggregate result
+    /// @param published newest snapshot admitted by the aggregator
+    /// @return whether the completion is current in both the page and aggregator gates
+    static boolean canPublishSnapshot(
+            long requestGeneration,
+            long currentGeneration,
+            PluginStoreSnapshot completed,
+            @Nullable PluginStoreSnapshot published
+    ) {
+        return requestGeneration == currentGeneration && completed == published;
+    }
+
+    /// Tests whether a source-independent favorite ID includes the supplied aggregate winner.
+    ///
+    /// @param favoritePluginIds persisted favorite IDs
+    /// @param item aggregate winner
+    /// @return whether the winner is favorited by its stable plugin ID
+    static boolean matchesFavorite(@Unmodifiable Set<String> favoritePluginIds, PluginStoreItem item) {
+        return favoritePluginIds.contains(item.getEntry().getId());
+    }
+
+    /// Closes the persistent aggregate loader once after the owning application reports shutdown.
+    ///
+    /// This method intentionally does nothing while the cached tab is merely hidden, because tab reuse requires the
+    /// same aggregator and source refresh executor to remain available until the application lifetime ends.
+    void closeAtApplicationShutdown(boolean applicationStopped) {
+        closeAggregatorWhenApplicationStops(applicationStopped, storeAggregatorClosed, storeAggregator::close);
+    }
+
+    /// Applies the same one-time shutdown rule to testable application and close callbacks.
+    ///
+    /// @param applicationStopped whether the application lifetime has ended
+    /// @param closed whether the aggregate loader was already closed
+    /// @param closeAggregator callback closing the page-owned aggregator
+    static void closeAggregatorWhenApplicationStops(
+            boolean applicationStopped,
+            AtomicBoolean closed,
+            Runnable closeAggregator
+    ) {
+        if (applicationStopped && closed.compareAndSet(false, true)) {
+            closeAggregator.run();
+        }
+    }
+
     /// Opens the independent source-management page while retaining the store catalog on this page.
     private void showSourceManagement() {
         PluginSourceManagementPage page = new PluginSourceManagementPage(
@@ -340,102 +421,48 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         Controllers.navigate(page);
     }
 
-    /// Loads the fixed official source and its repository manifests on a background thread.
+    /// Refreshes the aggregate catalog without clearing an accepted snapshot while requests are in flight.
     private void loadPluginStore() {
-        long generation = ++storeLoadGeneration;
-        currentSnapshot = null;
+        long requestGeneration = ++storeRefreshGeneration;
+        storeRefreshInProgress = true;
         refreshSourceSummary();
-        storeLoaded = false;
-        storeLoadFailure = null;
-        statusLabel.setVisible(false);
-        statusLabel.setText("");
-        pluginList.getContent().clear();
-        loadingSpinner.setVisible(true);
-        allItems.clear();
+        loadingSpinner.setVisible(currentSnapshot == null);
         refreshInstalledManifests();
-
-        PluginStoreManager requestManager = new PluginStoreManager();
-        PluginSource officialSource = new PluginSource(
-                PluginSource.OFFICIAL_ID,
-                PluginStoreManager.DEFAULT_REGISTRY_URL,
-                null,
-                true,
-                true
-        );
-
-        long startedAt = System.nanoTime();
-        Task.supplyAsync(() -> {
-            try {
-                return PluginSourceLoadExecutor.call(() -> {
-                    requestManager.loadSource(officialSource);
-                    return new StoreLoadResult(
-                            requestManager,
-                            requestManager.getStoreItems(),
-                            Math.max(0, (System.nanoTime() - startedAt) / 1_000_000)
-                    );
-                });
-            } catch (Exception exception) {
-                LOG.error("Failed to load plugin store", exception);
-                throw new RuntimeException(exception);
-            }
-        }).whenComplete(Schedulers.javafx(), (@Nullable var result, @Nullable var exception) -> {
-            if (generation != storeLoadGeneration) {
-                return;
-            }
-            loadingSpinner.setVisible(false);
-            if (exception != null) {
-                String message = failureMessage(exception);
-                storeLoadFailure = message;
-                publishCurrentSnapshot(failureSnapshot(
-                        generation,
-                        officialSource,
-                        Math.max(0, (System.nanoTime() - startedAt) / 1_000_000),
-                        new IOException(message, exception)
-                ));
-                showStoreMessage(
-                        SVG.ERROR,
-                        i18n("plugin.store.load_failed"),
-                        i18n("plugin.store.load_failed.detail", message)
-                );
-                return;
-            }
-            storeManager = result.manager;
-            publishCurrentSnapshot(new PluginStoreSnapshot(
-                    generation,
-                    List.of(PluginSourceLoadResult.success(
-                            result.manager.getSource(),
-                            result.durationMillis,
-                            result.items,
-                            (int) result.items.stream().filter(item -> item.getManifest() == null).count(),
-                            Objects.requireNonNull(result.manager.getRegistry()),
-                            result.manager
-                    ))
-            ));
-            storeLoaded = true;
-            storeLoadFailure = null;
-            allItems.clear();
-            allItems.addAll(result.items);
-            refreshCategories();
-            applyFilter();
-        }).start();
-    }
-
-    /// Creates a source snapshot that records a failed current refresh instead of retaining stale success data.
-    ///
-    /// @param generation current store refresh generation
-    /// @param source requested official source
-    /// @param durationMillis elapsed failed request duration
-    /// @param failure current source load failure
-    /// @return snapshot containing the current generation failure
-    static PluginStoreSnapshot failureSnapshot(
-            long generation,
-            PluginSource source,
-            long durationMillis,
-            IOException failure
-    ) {
-        return new PluginStoreSnapshot(
-                generation,
-                List.of(PluginSourceLoadResult.failed(source, durationMillis, failure))
+        storeAggregator.refresh(sourceRepository.getSources()).whenCompleteAsync(
+                (@Nullable var snapshot, @Nullable var exception) -> {
+                    if (exception != null) {
+                        if (requestGeneration != storeRefreshGeneration) {
+                            return;
+                        }
+                        if (currentSnapshot == null) {
+                            showStoreMessage(
+                                    SVG.ERROR,
+                                    i18n("plugin.store.load_failed"),
+                                    i18n("plugin.store.load_failed.detail", failureMessage(exception))
+                            );
+                        }
+                        storeRefreshInProgress = false;
+                        loadingSpinner.setVisible(false);
+                        return;
+                    }
+                    PluginStoreSnapshot completed = Objects.requireNonNull(snapshot);
+                    if (!canPublishSnapshot(
+                            requestGeneration,
+                            storeRefreshGeneration,
+                            completed,
+                            storeAggregator.getCurrentSnapshot()
+                    )) {
+                        return;
+                    }
+                    publishCurrentSnapshot(completed);
+                    allItems.clear();
+                    allItems.addAll(completed.getWinningItems().values());
+                    storeRefreshInProgress = false;
+                    loadingSpinner.setVisible(false);
+                    refreshCategories();
+                    applyFilter();
+                },
+                Schedulers.javafx()
         );
     }
 
@@ -521,16 +548,28 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Applies search, category, and favorites filters without resetting any filter control.
     private void applyFilter() {
-        if (!storeLoaded) {
-            @Nullable String failure = storeLoadFailure;
-            if (failure == null) {
+        @Nullable PluginStoreSnapshot snapshot = currentSnapshot;
+        if (snapshot == null) {
+            if (!storeRefreshInProgress) {
                 pluginList.getContent().clear();
-            } else {
-                showStoreMessage(
-                        SVG.ERROR,
-                        i18n("plugin.store.load_failed"),
-                        i18n("plugin.store.load_failed.detail", failure)
+            }
+            return;
+        }
+
+        StorePresentation presentation = presentationFor(snapshot, storeRefreshInProgress);
+        if (!presentation.showPluginRows()) {
+            switch (presentation.state()) {
+                case NO_ENABLED_SOURCES -> showStoreMessage(
+                        SVG.SETTINGS,
+                        "No plugin sources are enabled",
+                        "Enable a plugin source in source management to browse plugins."
                 );
+                case ALL_FAILED -> showStoreMessage(
+                        SVG.ERROR,
+                        "All plugin sources failed",
+                        "Check source management for source status and retry the refresh."
+                );
+                default -> showStoreMessage(SVG.INFO, i18n("plugin.store.empty"), i18n("plugin.store.empty.description"));
             }
             return;
         }
@@ -546,7 +585,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 .filter(item -> matchesCategory(item, category))
                 .filter(item -> matchesKeyword(item, keyword))
                 .filter(item -> !favoritesOnly.get()
-                        || storePreferences.isFavorite(item.getEntry().getId()))
+                        || matchesFavorite(sourceRepository.getFavoritePluginIds(), item))
                 .sorted((left, right) -> displayName(left).compareToIgnoreCase(displayName(right)))
                 .toList();
 
@@ -563,14 +602,20 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             filtered.forEach(item -> pluginList.getContent().add(createPluginRow(item)));
         }
 
-        @Nullable PluginStoreRegistry registry = storeManager.getRegistry();
-        String registryName = registry == null ? PluginStoreManager.DEFAULT_REGISTRY_URL : registry.getName();
         String loadedStatus = i18n("plugin.store.loaded") + ": " + filtered.size() + "/" + allItems.size()
-                + " " + i18n("plugin.store.plugins") + " - " + registryName;
+                + " " + i18n("plugin.store.plugins");
+        List<String> statusLines = new ArrayList<>(List.of(loadedStatus));
+        if (presentation.state() == StoreState.DEGRADED) {
+            statusLines.add("Some plugin sources are unavailable; displayed winners may change when they return.");
+        }
+        if (presentation.hasConflicts()) {
+            statusLines.add("Some plugin IDs are published by multiple sources; the highest-priority source is shown.");
+        }
         @Nullable String installedFailure = installedManifestFailure;
-        statusLabel.setText(installedFailure == null
-                ? loadedStatus
-                : loadedStatus + "\n" + i18n("plugin.installed.load_failed") + ": " + installedFailure);
+        if (installedFailure != null) {
+            statusLines.add(i18n("plugin.installed.load_failed") + ": " + installedFailure);
+        }
+        statusLabel.setText(String.join("\n", statusLines));
         statusLabel.setVisible(true);
     }
 
@@ -633,6 +678,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 sourceManager.getLatestCompatibleVersion(item.getManifest());
         @Nullable PluginManifest installed = installedManifests.get(entry.getId());
         boolean hasUpdate = sourceManager.hasUpdate(installed, compatibleVersion);
+        boolean hasConflict = currentSnapshot != null
+                && currentSnapshot.getConflictCandidates().containsKey(entry.getId());
         boolean manifestLoadFailed = item.getManifest() == null;
         boolean installedStateUnavailable = installedManifestFailure != null;
         @Nullable PluginRuntimeStatus runtimeStatus = installed == null
@@ -663,7 +710,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             status = versionText(compatibleVersion);
         }
         row.setTrailingText(null);
-        row.setTrailingIcon(createPluginTrailingActions(entry.getId(), status, hasUpdate));
+        row.setTrailingIcon(createPluginTrailingActions(entry.getId(),
+                hasConflict ? status + "\nSource conflict" : status, hasUpdate));
         row.setOnAction(event -> showPluginDetails(item));
         return row;
     }
@@ -687,12 +735,13 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// @param item resolved store item
     /// @param version newest compatible version or `null`
     /// @return wrapped row subtitle
-    private static String buildPluginRowSubtitle(
+    static String buildPluginRowSubtitle(
             PluginStoreItem item,
             @Nullable PluginStoreManifest.PluginVersionEntry version
     ) {
         PluginStoreRegistry.PluginStoreEntry entry = item.getEntry();
         List<String> metadataLines = new ArrayList<>();
+        metadataLines.add("Source: " + sourceDisplayName(item));
         String description = summarizeDescription(entry.getDescription());
         if (StringUtils.isNotBlank(entry.getAuthor())) {
             metadataLines.add(i18n("plugin.author") + ": " + entry.getAuthor());
@@ -710,6 +759,25 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         }
         metadataLines.add(i18n("plugin.store.version") + ": " + versionSummary);
         return composePluginRowSubtitle(description, metadataLines);
+    }
+
+    /// Returns the source alias when configured, otherwise the publishing registry name.
+    ///
+    /// @param item source-bound aggregate winner
+    /// @return compact source provenance label
+    private static String sourceDisplayName(PluginStoreItem item) {
+        @Nullable String alias = item.getSource().getAlias();
+        return StringUtils.isBlank(alias) ? item.getRegistry().getName() : Objects.requireNonNull(alias);
+    }
+
+    /// Returns the newest compatible version label for a conflict candidate.
+    ///
+    /// @param item lower-priority candidate
+    /// @return compact compatible version label or an unavailable marker
+    private static String latestVersionText(PluginStoreItem item) {
+        @Nullable PluginStoreManifest.PluginVersionEntry version = item.getSourceManager()
+                .getLatestCompatibleVersion(item.getManifest());
+        return version == null ? "unavailable" : versionText(version);
     }
 
     /// Separates descriptive prose from scan-friendly metadata without producing empty edge lines.
@@ -833,12 +901,12 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         button.setMinSize(36, 36);
         button.setPrefSize(36, 36);
         button.setMaxSize(36, 36);
-        updateFavoriteButton(button, storePreferences.isFavorite(pluginId));
+        updateFavoriteButton(button, sourceRepository.isFavorite(pluginId));
         button.setOnMouseClicked(event -> event.consume());
         button.setOnAction(event -> {
-            boolean favorite = !storePreferences.isFavorite(pluginId);
-            storePreferences.setFavorite(pluginId, favorite);
-            updateFavoriteButton(button, storePreferences.isFavorite(pluginId));
+            boolean favorite = !sourceRepository.isFavorite(pluginId);
+            sourceRepository.setFavorite(pluginId, favorite);
+            updateFavoriteButton(button, sourceRepository.isFavorite(pluginId));
             if (favoritesOnly.get() && !favorite) {
                 applyFilter();
             }
@@ -1080,13 +1148,27 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Returns whether a host denotes the local machine for development-only HTTP links.
     ///
     /// @param host parsed URI host
-    /// @return whether the host is loopback
+    /// @return whether the host is the literal loopback hostname or an exact loopback address
     private static boolean isLoopbackHost(String host) {
         String normalized = host.toLowerCase(Locale.ROOT);
-        return "localhost".equals(normalized)
-                || "::1".equals(normalized)
-                || "[::1]".equals(normalized)
-                || normalized.startsWith("127.");
+        if ("localhost".equals(normalized) || "::1".equals(normalized) || "[::1]".equals(normalized)) {
+            return true;
+        }
+        String[] octets = normalized.split("\\.", -1);
+        if (octets.length != 4 || !"127".equals(octets[0])) {
+            return false;
+        }
+        for (int index = 1; index < octets.length; index++) {
+            try {
+                int octet = Integer.parseInt(octets[index]);
+                if (octet < 0 || octet > 255 || !Integer.toString(octet).equals(octets[index])) {
+                    return false;
+                }
+            } catch (NumberFormatException exception) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /// Detects content that is already HTML instead of Markdown or plain text.
@@ -1114,13 +1196,18 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             try {
                 PluginInstallationPlanningSnapshot planningSnapshot =
                         pluginManager.getInstallationPlanningSnapshot();
-                return item.getSourceManager().resolveInstallPlan(
+                @Nullable PluginStoreSnapshot snapshot = currentSnapshot;
+                if (snapshot == null) {
+                    throw new IOException("Plugin catalog is not available");
+                }
+                PluginInstallPlan plan = new PluginStoreDependencyResolver(snapshot.getWinningItems()).resolveInstallPlan(
                         item.getEntry().getId(),
                         version,
                         planningSnapshot.getManifests(),
                         planningSnapshot.getInstalledArtifacts(),
                         planningSnapshot.getReusableArtifacts()
                 );
+                return new ResolvedInstallPlan(plan, snapshot);
             } catch (IOException exception) {
                 throw new RuntimeException(exception);
             }
@@ -1133,7 +1220,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 );
                 return;
             }
-            confirmInstallPlan(plan, item.getSourceManager());
+            ResolvedInstallPlan resolved = Objects.requireNonNull(plan);
+            confirmInstallPlan(resolved.plan, resolved.snapshot);
         }).start();
     }
 
@@ -1144,8 +1232,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// in the plan but cannot modify permission state.
     ///
     /// @param plan dependency-first resolved plan
-    /// @param sourceManager manager bound to every downloaded plan entry
-    private void confirmInstallPlan(PluginInstallPlan plan, PluginStoreManager sourceManager) {
+    /// @param snapshot immutable aggregate snapshot that selected the plan's winners
+    private void confirmInstallPlan(PluginInstallPlan plan, PluginStoreSnapshot snapshot) {
         PluginInstallPlan.Entry root = plan.getRootEntry();
         List<PluginPermissionRequest> requests = new ArrayList<>();
         try {
@@ -1181,7 +1269,8 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 root.getAction() == PluginInstallPlan.Action.UPDATE,
                 List.copyOf(requests),
                 formatInstallPlan(plan),
-                grantsByPluginId -> executeInstallPlan(plan, sourceManager, grantsByPluginId)
+                degradedCatalogWarning(snapshot),
+                grantsByPluginId -> executeInstallPlan(plan, grantsByPluginId)
         );
     }
 
@@ -1269,11 +1358,53 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         );
     }
 
+    /// Builds a compact warning from the exact immutable snapshot that selected an installation plan.
+    ///
+    /// @param snapshot aggregate snapshot used during dependency resolution, or `null` when unavailable
+    /// @return warning without source URLs, or `null` when every enabled source is available
+    static @Nullable String degradedCatalogWarning(@Nullable PluginStoreSnapshot snapshot) {
+        if (snapshot == null || snapshot.getFailures().isEmpty()) {
+            return null;
+        }
+        String failedSources = snapshot.getFailures().stream()
+                .map(PluginSourceLoadResult::getSource)
+                .map(PluginStorePage::warningSourceLabel)
+                .collect(Collectors.joining(", "));
+        return "Unavailable higher-priority sources may have changed catalog winners: " + failedSources;
+    }
+
+    /// Returns a source warning label that cannot disclose a configured URL, credential, query, or fragment.
+    ///
+    /// @param source failed source configuration
+    /// @return display-safe source label
+    private static String warningSourceLabel(PluginSource source) {
+        @Nullable String alias = source.getAlias();
+        if (isSafeWarningLabel(alias)) {
+            return Objects.requireNonNull(alias).trim();
+        }
+        if (isSafeWarningLabel(source.getId())) {
+            return source.getId();
+        }
+        return "configured source";
+    }
+
+    /// Returns whether a source alias or ID can appear in a warning without being URL-shaped or credential-bearing.
+    ///
+    /// @param label optional source label
+    /// @return whether the label is nonblank and free of URI-sensitive delimiter characters
+    private static boolean isSafeWarningLabel(@Nullable String label) {
+        return StringUtils.isNotBlank(label)
+                && !label.contains("://")
+                && !label.contains("@")
+                && !label.contains("?")
+                && !label.contains("#");
+    }
+
     /// Formats actions and dependency constraints for every plan entry in topological order.
     ///
     /// @param plan resolved plan
     /// @return immutable plan rows
-    private static @Unmodifiable List<String> formatInstallPlan(PluginInstallPlan plan) {
+    static @Unmodifiable List<String> formatInstallPlan(PluginInstallPlan plan) {
         List<String> rows = new ArrayList<>();
         for (PluginInstallPlan.Entry entry : plan.getEntries()) {
             switch (entry.getAction()) {
@@ -1286,7 +1417,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                         "plugin.store.plan.install",
                         entry.getDisplayName(),
                         entry.getVersion()
-                ));
+                ) + " (" + Objects.requireNonNull(entry.getSourceDisplayName()) + ")");
                 case UPDATE -> {
                     @Nullable PluginManifest installed = entry.getInstalledManifest();
                     rows.add(i18n(
@@ -1294,7 +1425,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                             entry.getDisplayName(),
                             installed == null ? "?" : installed.getVersion(),
                             entry.getVersion()
-                    ));
+                    ) + " (" + Objects.requireNonNull(entry.getSourceDisplayName()) + ")");
                 }
             }
             for (PluginDependency dependency : entry.getDependencies()) {
@@ -1312,11 +1443,9 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Downloads every mutable plan entry into isolated staging before any installed file is touched.
     ///
     /// @param plan confirmed installation plan
-    /// @param sourceManager manager bound to the resolved dependency plan
     /// @param grantsByPluginId immutable grants chosen for every changed plugin
     private void executeInstallPlan(
             PluginInstallPlan plan,
-            PluginStoreManager sourceManager,
             @Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>> grantsByPluginId
     ) {
         PluginDialogs.ProgressDialog progressDialog = PluginDialogs.showProgress(
@@ -1341,7 +1470,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                     ));
                     PluginStoreManifest.PluginVersionEntry remoteVersion =
                             Objects.requireNonNull(entry.getRemoteVersion(), "Download entry has no remote version");
-                    Path staged = sourceManager.downloadPluginToStaging(
+                    Path staged = entry.requireSourceManager().downloadPluginToStaging(
                             entry.getPluginId(),
                             remoteVersion,
                             stagingDirectory
@@ -1721,6 +1850,22 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                     entry.getId()
             ));
 
+            identityList.getContent().add(createReadOnlyRow(
+                    SVG.EXTENSION,
+                    "Source",
+                    sourceDisplayName(item)
+            ));
+            @Nullable PluginStoreSnapshot snapshot = currentSnapshot;
+            if (snapshot != null) {
+                @Unmodifiable List<PluginStoreItem> conflicts = snapshot.getConflictCandidates()
+                        .getOrDefault(entry.getId(), List.of());
+                if (!conflicts.isEmpty()) {
+                    String candidates = conflicts.stream()
+                            .map(candidate -> sourceDisplayName(candidate) + " " + latestVersionText(candidate))
+                            .collect(Collectors.joining("\n"));
+                    identityList.getContent().add(createReadOnlyRow(SVG.WARNING, "Other source candidates", candidates));
+                }
+            }
             if (StringUtils.isNotBlank(entry.getAuthor())) {
                 identityList.getContent().add(createReadOnlyRow(
                         SVG.PERSON,
@@ -1878,30 +2023,58 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         return row;
     }
 
-    /// Immutable result of one isolated registry load request.
+    /// Enumerates aggregate catalog states that require distinct row and warning presentation.
     @NotNullByDefault
-    static final class StoreLoadResult {
-        /// Manager containing the exact registry and caches produced by this request.
-        private final PluginStoreManager manager;
+    enum StoreState {
+        /// No configured source currently participates in catalog loading.
+        NO_ENABLED_SOURCES,
 
-        /// Resolved store items belonging to the same manager and registry.
-        private final @Unmodifiable List<PluginStoreItem> items;
+        /// Every enabled source failed to provide catalog winners.
+        ALL_FAILED,
 
-        /// Monotonic elapsed source request time in milliseconds.
-        private final long durationMillis;
+        /// Successful winners remain visible while one or more enabled sources failed.
+        DEGRADED,
 
-        /// Creates an atomic manager, items, and duration result for generation-checked publication.
+        /// Winners are visible and one or more lower-priority candidates conflict.
+        CONFLICTS,
+
+        /// Winners are visible without source failures or conflicts.
+        READY
+    }
+
+    /// Couples an immutable aggregate snapshot to the dependency plan it selected.
+    @NotNullByDefault
+    private static final class ResolvedInstallPlan {
+        /// Dependency-first resolved install plan.
+        private final PluginInstallPlan plan;
+
+        /// Aggregate snapshot whose winners selected every remote plan entry.
+        private final PluginStoreSnapshot snapshot;
+
+        /// Creates one immutable plan and snapshot pair.
         ///
-        /// @param manager isolated manager that completed the request
-        /// @param items resolved registry items
-        /// @param durationMillis elapsed source request time in milliseconds
-        StoreLoadResult(PluginStoreManager manager, List<PluginStoreItem> items, long durationMillis) {
-            if (durationMillis < 0) {
-                throw new IllegalArgumentException("durationMillis must not be negative");
-            }
-            this.manager = manager;
-            this.items = List.copyOf(items);
-            this.durationMillis = durationMillis;
+        /// @param plan dependency-first plan
+        /// @param snapshot winner snapshot used for resolution
+        private ResolvedInstallPlan(PluginInstallPlan plan, PluginStoreSnapshot snapshot) {
+            this.plan = plan;
+            this.snapshot = snapshot;
+        }
+    }
+
+    /// Immutable aggregate page state derived from the accepted source snapshot.
+    @NotNullByDefault
+    record StorePresentation(
+            StoreState state,
+            int enabledSourceCount,
+            int failedSourceCount,
+            boolean hasConflicts,
+            boolean refreshInProgress
+    ) {
+        /// Returns whether aggregate winner rows remain appropriate for this page state.
+        ///
+        /// @return whether plugin rows should remain visible
+        boolean showPluginRows() {
+            return state != StoreState.NO_ENABLED_SOURCES && state != StoreState.ALL_FAILED;
         }
     }
 
