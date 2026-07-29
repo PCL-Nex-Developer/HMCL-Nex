@@ -296,7 +296,10 @@ public final class PluginStoreDependencyResolverTest {
                     Map.of(dependencyId, outdatedDependencyIdentity),
                     Map.of()
             );
-            PluginInstallPlan.Entry updatedDependency = updatePlan.getEntries().get(0);
+            PluginInstallPlan.Entry updatedDependency = updatePlan.getEntries().stream()
+                    .filter(entry -> entry.getPluginId().equals(dependencyId))
+                    .findFirst()
+                    .orElseThrow();
 
             assertEquals(PluginInstallPlan.Action.UPDATE, updatedDependency.getAction());
             assertEquals(dependencySource.getId(), updatedDependency.getSourceId());
