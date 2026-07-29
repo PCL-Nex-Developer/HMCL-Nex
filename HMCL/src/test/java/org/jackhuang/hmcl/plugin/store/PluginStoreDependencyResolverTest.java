@@ -221,57 +221,75 @@ public final class PluginStoreDependencyResolverTest {
         }
     }
 
-    /// Retains source metadata for every download while leaving reused entries without a remote source.
+    /// Retains each winner's source metadata for downloads while leaving reused entries without a remote source.
     @Test
     public void downloadableEntriesRetainTheirWinningSource(@TempDir Path temporaryDirectory) throws Exception {
         String rootId = "dev.test.source-root";
         String dependencyId = "dev.test.source-dependency";
-        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
-        server.createContext("/registry", exchange -> respond(exchange, """
+        HttpServer rootServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        HttpServer dependencyServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String rootUrl = "http://127.0.0.1:" + rootServer.getAddress().getPort();
+        String dependencyUrl = "http://127.0.0.1:" + dependencyServer.getAddress().getPort();
+        rootServer.createContext("/registry", exchange -> respond(exchange, """
                 {
                   "schemaVersion": 1,
-                  "name": "Source Identity Store",
+                  "name": "Root Store",
                   "plugins": [
-                    {"id":"%s","name":"Root","manifestUrl":"%s/root"},
-                    {"id":"%s","name":"Dependency","manifestUrl":"%s/dependency"}
+                    {"id":"%s","name":"Root","manifestUrl":"%s/root"}
                   ]
                 }
-                """.formatted(rootId, baseUrl, dependencyId, baseUrl)));
-        server.createContext("/root", exchange -> respond(exchange, repositoryManifest(
+                """.formatted(rootId, rootUrl)));
+        rootServer.createContext("/root", exchange -> respond(exchange, repositoryManifest(
                 rootId,
-                version(baseUrl, "root", "1.0.0", "4", """
+                version(rootUrl, "root", "1.0.0", "4", """
                         [{"id":"%s","version":"1.0.0"}]
                         """.formatted(dependencyId))
         )));
-        server.createContext("/dependency", exchange -> respond(exchange, repositoryManifest(
+        dependencyServer.createContext("/registry", exchange -> respond(exchange, """
+                {
+                  "schemaVersion": 1,
+                  "name": "Dependency Store",
+                  "plugins": [
+                    {"id":"%s","name":"Dependency","manifestUrl":"%s/dependency"}
+                  ]
+                }
+                """.formatted(dependencyId, dependencyUrl)));
+        dependencyServer.createContext("/dependency", exchange -> respond(exchange, repositoryManifest(
                 dependencyId,
-                version(baseUrl, "dependency", "1.0.0", "5", "[]")
+                version(dependencyUrl, "dependency", "1.0.0", "5", "[]")
         )));
-        server.start();
+        rootServer.start();
+        dependencyServer.start();
 
         try (PluginStoreAggregator aggregator = new PluginStoreAggregator()) {
-            PluginSource source = new PluginSource("source-identity", baseUrl + "/registry", "Source Alias", true, false);
-            PluginStoreSnapshot snapshot = aggregator.refresh(List.of(source)).get();
+            PluginSource rootSource = new PluginSource(
+                    "root-source", rootUrl + "/registry", "Root Alias", true, false);
+            PluginSource dependencySource = new PluginSource(
+                    "dependency-source", dependencyUrl + "/registry", "Dependency Alias", true, false);
+            PluginStoreSnapshot snapshot = aggregator.refresh(List.of(rootSource, dependencySource)).get();
             PluginStoreItem root = Objects.requireNonNull(snapshot.getWinningItems().get(rootId));
+            PluginStoreItem dependency = Objects.requireNonNull(snapshot.getWinningItems().get(dependencyId));
             PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
                     Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
             );
             PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
 
             PluginInstallPlan installPlan = resolver.resolveInstallPlan(rootId, rootVersion, Map.of(), Map.of(), Map.of());
-            for (PluginInstallPlan.Entry entry : installPlan.getDownloadEntries()) {
-                assertEquals(source.getId(), entry.getSourceId());
-                assertEquals("Source Alias", entry.getSourceDisplayName());
-                assertSame(root.getSourceManager(), entry.requireSourceManager());
-            }
+            PluginInstallPlan.Entry installedDependency = installPlan.getEntries().get(0);
+            PluginInstallPlan.Entry installedRoot = installPlan.getRootEntry();
+            assertEquals(dependencySource.getId(), installedDependency.getSourceId());
+            assertEquals("Dependency Alias", installedDependency.getSourceDisplayName());
+            assertSame(dependency.getSourceManager(), installedDependency.requireSourceManager());
+            assertEquals(rootSource.getId(), installedRoot.getSourceId());
+            assertEquals("Root Alias", installedRoot.getSourceDisplayName());
+            assertSame(root.getSourceManager(), installedRoot.requireSourceManager());
 
-            PluginManifest installedDependency = packageManifest(dependencyId, "1.0.0", "[]");
-            PluginArtifactIdentity dependencyIdentity = PluginArtifactIdentity.of(installedDependency, "a".repeat(64));
+            PluginManifest installedDependencyManifest = packageManifest(dependencyId, "1.0.0", "[]");
+            PluginArtifactIdentity dependencyIdentity = PluginArtifactIdentity.of(installedDependencyManifest, "a".repeat(64));
             PluginInstallPlan reusePlan = resolver.resolveInstallPlan(
                     rootId,
                     rootVersion,
-                    Map.of(dependencyId, installedDependency),
+                    Map.of(dependencyId, installedDependencyManifest),
                     Map.of(dependencyId, dependencyIdentity),
                     Map.of(dependencyId, dependencyIdentity)
             );
@@ -286,11 +304,12 @@ public final class PluginStoreDependencyResolverTest {
             assertNull(reusedDependency.getSourceDisplayName());
             assertNull(reusedDependency.getSourceManager());
             assertThrows(IllegalStateException.class, reusedDependency::requireSourceManager);
-            assertEquals(source.getId(), updatedRoot.getSourceId());
-            assertEquals("Source Alias", updatedRoot.getSourceDisplayName());
+            assertEquals(rootSource.getId(), updatedRoot.getSourceId());
+            assertEquals("Root Alias", updatedRoot.getSourceDisplayName());
             assertSame(root.getSourceManager(), updatedRoot.requireSourceManager());
         } finally {
-            server.stop(0);
+            rootServer.stop(0);
+            dependencyServer.stop(0);
         }
     }
 
