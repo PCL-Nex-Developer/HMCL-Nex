@@ -537,9 +537,9 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             return;
         }
         boolean affectsInstalledPlugins = latestSourceAffectsInstalledPlugins(source);
-        String message = affectsInstalledPlugins
-                ? "Installed plugins remain installed, but their updates may be affected. Remove this plugin source?"
-                : "Remove this plugin source?";
+        String message = i18n(affectsInstalledPlugins
+                ? "plugin.store.source.delete.installed_confirm"
+                : "plugin.store.source.delete.confirm");
         PluginDialogs.confirmAction(
                 i18n("button.delete"),
                 message,
@@ -719,14 +719,31 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         if (StringUtils.isNotBlank(remoteName) && !remoteName.equals(title)) {
             details.add(remoteName);
         }
-        details.add(i18n(source.isOfficial() ? "plugin.store.source.official" : "plugin.store.source.custom"));
+        details.add(i18n(source.isOfficial() ? "plugin.store.source.official" : "plugin.store.source.third_party"));
         details.add(i18n(source.isEnabled() ? "plugin.enabled" : "plugin.disabled"));
-        details.add(result == null ? "Unavailable" : result.getStatus().toString());
-        details.add(result == null
-                ? "0 " + i18n("plugin.store.plugins")
-                : result.getItems().size() + " " + i18n("plugin.store.plugins"));
-        details.add(result == null ? "-" : result.getDurationMillis() + " ms");
+        details.add(sourceStatusLabel(result));
+        details.add(i18n("plugin.store.source.details.plugins", result == null ? 0 : result.getItems().size()));
+        details.add(result == null ? "-" : i18n("plugin.store.source.details.duration", result.getDurationMillis()));
         return new SourceRow(title, String.join(" · ", details));
+    }
+
+    /// Returns a localized compact label for the latest source load outcome.
+    ///
+    /// @param result latest source result, or `null` before a refresh completes
+    /// @return localized source status label
+    private static String sourceStatusLabel(@Nullable PluginSourceLoadResult result) {
+        if (result == null) {
+            return i18n("plugin.store.source.status.unchecked");
+        }
+        return switch (result.getStatus()) {
+            case DISABLED -> i18n("plugin.disabled");
+            case SUCCESS -> i18n("plugin.store.source.status.loaded");
+            case PARTIAL_FAILURE -> i18n(
+                    "plugin.store.source.status.partial_failure",
+                    result.getPartialManifestFailureCount()
+            );
+            case FAILED -> i18n("plugin.store.source.status.failed");
+        };
     }
 
     /// Returns explicit source details including the full URL and latest source status.
@@ -760,7 +777,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
     ) {
         @Nullable PluginStoreRegistry registry = result == null ? null : result.getRegistry();
         @Nullable String alias = source.getAlias();
-        String status = result == null ? "Unavailable" : result.getStatus().toString();
+        String status = sourceStatusLabel(result);
         @Nullable String failureMessage = result == null ? null : result.getFailureMessage();
         int pluginCount = result == null ? 0 : result.getItems().size();
         long durationMillis = result == null ? 0 : result.getDurationMillis();
@@ -834,18 +851,18 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             int pluginCount
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("URL: " + url);
+        lines.add(i18n("plugin.store.source.details.url", url));
         if (alias != null) {
-            lines.add("Alias: " + alias);
+            lines.add(i18n("plugin.store.source.details.alias", alias));
         }
         lines.add(name);
         if (StringUtils.isNotBlank(description)) {
             lines.add(description);
         }
         if (homepageHost != null) {
-            lines.add("Homepage: " + homepageHost);
+            lines.add(i18n("plugin.store.source.preview.homepage", homepageHost));
         }
-        lines.add(pluginCount + " " + i18n("plugin.store.plugins"));
+        lines.add(i18n("plugin.store.source.details.plugins", pluginCount));
         return String.join("\n", lines);
     }
 
@@ -1032,32 +1049,35 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         /// @return complete source details message
         String message() {
             List<String> fields = new ArrayList<>();
-            fields.add("URL: " + url);
+            fields.add(i18n("plugin.store.source.details.url", url));
             if (alias != null) {
-                fields.add("Alias: " + alias);
+                fields.add(i18n("plugin.store.source.details.alias", alias));
             }
             if (remoteName != null) {
-                fields.add("Registry: " + remoteName);
+                fields.add(i18n("plugin.store.source.details.registry", remoteName));
             }
             if (description != null) {
-                fields.add("Description: " + description);
+                fields.add(i18n("plugin.store.source.details.description", description));
             }
             if (homepageHost != null) {
-                fields.add("Homepage: " + homepageHost);
+                fields.add(i18n("plugin.store.source.details.homepage", homepageHost));
             }
-            fields.add("Type: " + (official ? "Official" : "Third-party"));
-            fields.add("Enabled: " + enabled);
+            fields.add(i18n(
+                    "plugin.store.source.details.type",
+                    i18n(official ? "plugin.store.source.official" : "plugin.store.source.third_party")
+            ));
+            fields.add(i18n("plugin.store.source.details.enabled", i18n(enabled ? "plugin.enabled" : "plugin.disabled")));
             if (priority > 0) {
-                fields.add("Priority: " + priority);
+                fields.add(i18n("plugin.store.source.details.priority", priority));
             }
-            fields.add("Status: " + status);
+            fields.add(i18n("plugin.store.source.details.status", status));
             if (failureMessage != null) {
-                fields.add("Failure: " + failureMessage);
+                fields.add(i18n("plugin.store.source.details.failure", failureMessage));
             }
-            fields.add("Plugins: " + pluginCount);
-            fields.add("Duration: " + durationMillis + " ms");
-            fields.add("Partial manifest failures: " + partialManifestFailures);
-            fields.add("Conflicts: " + conflicts);
+            fields.add(i18n("plugin.store.source.details.plugins", pluginCount));
+            fields.add(i18n("plugin.store.source.details.duration", durationMillis));
+            fields.add(i18n("plugin.store.source.details.partial_manifest_failures", partialManifestFailures));
+            fields.add(i18n("plugin.store.source.details.conflicts", conflicts));
             return String.join("\n", fields);
         }
     }
@@ -1187,7 +1207,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             }
             previewing = true;
             long requestGeneration = ++generation;
-            feedback.setText(i18n("plugin.store.loading"));
+            feedback.setText(i18n("plugin.store.source.status.loading"));
             Task.supplyAsync(() -> preview(url, alias)).whenComplete(Schedulers.javafx(),
                     (@Nullable var preview, @Nullable var exception) -> {
                         if (!active || requestGeneration != generation) {
@@ -1237,7 +1257,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                     preview.pluginCount()
             ));
             PluginDialogs.confirmAction(
-                    i18n("button.save"),
+                    i18n("plugin.store.source.preview.confirm"),
                     feedback.getText(),
                     i18n("button.save"),
                     () -> persistPreview(preview)
