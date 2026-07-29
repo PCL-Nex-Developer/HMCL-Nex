@@ -50,10 +50,13 @@ import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
+import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
 import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
 import org.jackhuang.hmcl.plugin.store.PluginStorePreferences;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManifest;
+import org.jackhuang.hmcl.plugin.store.PluginStoreSnapshot;
+import org.jackhuang.hmcl.plugin.store.PluginSourceRepository;
 import org.jackhuang.hmcl.plugin.store.PluginStoreRegistry;
 import org.jackhuang.hmcl.task.Schedulers;
 import org.jackhuang.hmcl.task.Task;
@@ -118,8 +121,14 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Remote registry, compatibility, README, and download service for the fixed official source.
     private PluginStoreManager storeManager = new PluginStoreManager();
 
-    /// Page-owned persistence for favorite plugin IDs.
+    /// Page-owned persistence for sources and favorite plugin IDs.
     private final PluginStorePreferences storePreferences = new PluginStorePreferences(Metadata.HMCL_LOCAL_HOME);
+
+    /// Shared ordered source repository used by the source-management page.
+    private final PluginSourceRepository sourceRepository = storePreferences;
+
+    /// Summary of enabled sources displayed beside the store toolbar.
+    private final Label sourceSummaryLabel = new Label();
 
     /// Process-wide plugin lifecycle manager used to inspect and publish downloaded packages.
     private final PluginManager pluginManager = PluginManager.getInstance();
@@ -166,6 +175,9 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
     /// Current generation's load failure, or `null` outside the error state.
     private @Nullable String storeLoadFailure;
 
+    /// Latest official-only source result exposed to source management until Task 6 adopts aggregate catalog loading.
+    private @Nullable PluginStoreSnapshot currentSnapshot;
+
     /// Whether the first visible-page registry request has already been started.
     private boolean initialLoadRequested;
 
@@ -194,15 +206,14 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 SVG.REFRESH,
                 this::loadPluginStore
         );
-        JFXButton settingsButton = createIconButton(
-                i18n("plugin.store.settings"),
+        JFXButton settingsButton = createToolbarButton2(
+                "Manage plugin sources",
                 SVG.SETTINGS,
-                () -> {
-                }
+                this::showSourceManagement
         );
-        settingsButton.setDisable(true);
-        settingsButton.setTooltip(new Tooltip(i18n("plugin.store.settings")));
-        settingsButton.setAccessibleHelp(i18n("plugin.store.settings"));
+        sourceSummaryLabel.setTooltip(new Tooltip("Manage plugin sources"));
+        sourceSummaryLabel.setAccessibleText("Manage plugin sources");
+        refreshSourceSummary();
         favoritesOnlyButton.getStyleClass().add("jfx-tool-bar-button");
         favoritesOnlyButton.setMinSize(40, 40);
         favoritesOnlyButton.setPrefSize(40, 40);
@@ -213,7 +224,7 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
             applyFilter();
         });
         refreshFavoritesFilterButton();
-        toolbar.getChildren().addAll(searchField, favoritesOnlyButton, refreshButton, settingsButton);
+        toolbar.getChildren().addAll(searchField, sourceSummaryLabel, favoritesOnlyButton, refreshButton, settingsButton);
 
         FlowPane filters = new FlowPane(12, 8);
         filters.setAlignment(Pos.CENTER_LEFT);
@@ -298,9 +309,34 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         pluginList.getContent().setAll(message);
     }
 
+    /// Rebuilds the enabled-source summary without selecting or loading an individual custom source.
+    private void refreshSourceSummary() {
+        sourceSummaryLabel.setText(sourceSummary(sourceRepository.getSources()));
+    }
+
+    /// Counts enabled sources for the toolbar summary.
+    ///
+    /// @param sources configured source snapshot
+    /// @return compact enabled-source summary
+    static String sourceSummary(List<PluginSource> sources) {
+        long enabled = sources.stream().filter(PluginSource::isEnabled).count();
+        return enabled + " of " + sources.size() + " plugin sources enabled";
+    }
+
+    /// Opens the independent source-management page while retaining the store catalog on this page.
+    private void showSourceManagement() {
+        Controllers.navigate(new PluginSourceManagementPage(
+                sourceRepository,
+                () -> currentSnapshot,
+                () -> Set.copyOf(installedManifests.keySet()),
+                this::loadPluginStore
+        ));
+    }
+
     /// Loads the fixed official source and its repository manifests on a background thread.
     private void loadPluginStore() {
         long generation = ++storeLoadGeneration;
+        refreshSourceSummary();
         storeLoaded = false;
         storeLoadFailure = null;
         statusLabel.setVisible(false);
@@ -320,9 +356,14 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
         );
 
         Task.supplyAsync(() -> {
+            long startedAt = System.nanoTime();
             try {
                 requestManager.loadSource(officialSource);
-                return new StoreLoadResult(requestManager, requestManager.getStoreItems());
+                return new StoreLoadResult(
+                        requestManager,
+                        requestManager.getStoreItems(),
+                        Math.max(0, (System.nanoTime() - startedAt) / 1_000_000)
+                );
             } catch (IOException exception) {
                 LOG.error("Failed to load plugin store", exception);
                 throw new RuntimeException(exception);
@@ -343,6 +384,17 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
                 return;
             }
             storeManager = result.manager;
+            currentSnapshot = new PluginStoreSnapshot(
+                    generation,
+                    List.of(PluginSourceLoadResult.success(
+                            result.manager.getSource(),
+                            result.durationMillis,
+                            result.items,
+                            (int) result.items.stream().filter(item -> item.getManifest() == null).count(),
+                            Objects.requireNonNull(result.manager.getRegistry()),
+                            result.manager
+                    ))
+            );
             storeLoaded = true;
             storeLoadFailure = null;
             allItems.clear();
@@ -1755,20 +1807,28 @@ public class PluginStorePage extends VBox implements DecoratorPage, PageAware {
 
     /// Immutable result of one isolated registry load request.
     @NotNullByDefault
-    private static final class StoreLoadResult {
+    static final class StoreLoadResult {
         /// Manager containing the exact registry and caches produced by this request.
         private final PluginStoreManager manager;
 
         /// Resolved store items belonging to the same manager and registry.
         private final @Unmodifiable List<PluginStoreItem> items;
 
-        /// Creates an atomic manager-and-items result for generation-checked publication.
+        /// Monotonic elapsed source request time in milliseconds.
+        private final long durationMillis;
+
+        /// Creates an atomic manager, items, and duration result for generation-checked publication.
         ///
         /// @param manager isolated manager that completed the request
         /// @param items resolved registry items
-        private StoreLoadResult(PluginStoreManager manager, List<PluginStoreItem> items) {
+        /// @param durationMillis elapsed source request time in milliseconds
+        StoreLoadResult(PluginStoreManager manager, List<PluginStoreItem> items, long durationMillis) {
+            if (durationMillis < 0) {
+                throw new IllegalArgumentException("durationMillis must not be negative");
+            }
             this.manager = manager;
             this.items = List.copyOf(items);
+            this.durationMillis = durationMillis;
         }
     }
 

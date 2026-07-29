@@ -21,6 +21,8 @@ import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
+import org.jackhuang.hmcl.plugin.store.PluginSource;
+import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
 import org.jackhuang.hmcl.ui.SVG;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jsoup.nodes.Document;
@@ -329,6 +331,25 @@ public final class PluginStorePageTest {
                     () -> "Missing plugin UI translation for " + key
             );
         }
+    }
+
+    /// Summarizes the persisted enabled-source count without selecting an active registry URL.
+    @Test
+    public void sourceSummaryReportsEnabledSourceCount() {
+        assertEquals(
+                "1 of 2 plugin sources enabled",
+                PluginStorePage.sourceSummary(List.of(
+                        new PluginSource(PluginSource.OFFICIAL_ID, PluginStoreManager.DEFAULT_REGISTRY_URL, null, true, true),
+                        new PluginSource("source_one", "https://plugins.example.org/plugins.json", null, false, false)
+                ))
+        );
+    }
+
+    /// Keeps source load durations nonnegative for source-management presentation.
+    @Test
+    public void storeLoadResultRejectsNegativeDuration() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new PluginStorePage.StoreLoadResult(new PluginStoreManager(), List.of(), -1));
     }
 
     /// Requires every runtime state used by plugin rows and permission details to have a localized label.
