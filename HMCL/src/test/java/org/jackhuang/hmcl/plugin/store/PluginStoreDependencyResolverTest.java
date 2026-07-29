@@ -45,6 +45,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -76,7 +78,10 @@ public final class PluginStoreDependencyResolverTest {
                 PluginInstallPlan.Action.INSTALL,
                 null,
                 remoteVersion("dev.test.install", "1.0.0", "1", "[\"clipboard\"]"),
-                null
+                null,
+                "test",
+                "Test Source",
+                new PluginStoreManager()
         );
         PluginInstallPlan.Entry unchangedUpdate = new PluginInstallPlan.Entry(
                 "dev.test.update.unchanged",
@@ -85,7 +90,10 @@ public final class PluginStoreDependencyResolverTest {
                 PluginInstallPlan.Action.UPDATE,
                 null,
                 remoteVersion("dev.test.update.unchanged", "1.0.0", "2", "[\"network\"]"),
-                unchangedInstalled
+                unchangedInstalled,
+                "test",
+                "Test Source",
+                new PluginStoreManager()
         );
         PluginInstallPlan.Entry emptyUpdate = new PluginInstallPlan.Entry(
                 "dev.test.update.empty",
@@ -94,7 +102,10 @@ public final class PluginStoreDependencyResolverTest {
                 PluginInstallPlan.Action.UPDATE,
                 null,
                 remoteVersion("dev.test.update.empty", "1.0.0", "3", "[]"),
-                emptyInstalled
+                emptyInstalled,
+                "test",
+                "Test Source",
+                new PluginStoreManager()
         );
         PluginInstallPlan.Entry reuse = new PluginInstallPlan.Entry(
                 "dev.test.reuse",
@@ -103,7 +114,10 @@ public final class PluginStoreDependencyResolverTest {
                 PluginInstallPlan.Action.REUSE,
                 null,
                 null,
-                reusedInstalled
+                reusedInstalled,
+                null,
+                null,
+                null
         );
         PluginInstallPlan plan = new PluginInstallPlan(
                 "dev.test.update.unchanged",
@@ -137,6 +151,147 @@ public final class PluginStoreDependencyResolverTest {
         assertEquals(List.of(installation, unchangedUpdate, emptyUpdate), plan.getPermissionReviewEntries());
         assertEquals(List.of(PluginPermission.NETWORK), unchangedUpdate.getPermissions());
         assertTrue(emptyUpdate.getPermissions().isEmpty());
+    }
+
+    /// Rejects a conflict candidate when the selected catalog winner cannot satisfy a dependency constraint.
+    @Test
+    public void resolvesDependenciesFromWinnersWithoutConflictFallback(@TempDir Path temporaryDirectory) throws Exception {
+        String rootId = "dev.test.root";
+        String dependencyId = "dev.test.dependency";
+        HttpServer highPriority = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        HttpServer lowPriority = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String highUrl = "http://127.0.0.1:" + highPriority.getAddress().getPort();
+        String lowUrl = "http://127.0.0.1:" + lowPriority.getAddress().getPort();
+        highPriority.createContext("/registry", exchange -> respond(exchange, """
+                {
+                  "schemaVersion": 1,
+                  "name": "High Priority",
+                  "plugins": [
+                    {"id":"%s","name":"Root","manifestUrl":"%s/root"},
+                    {"id":"%s","name":"High Dependency","manifestUrl":"%s/dependency"}
+                  ]
+                }
+                """.formatted(rootId, highUrl, dependencyId, highUrl)));
+        highPriority.createContext("/root", exchange -> respond(exchange, repositoryManifest(
+                rootId,
+                version(highUrl, "root", "1.0.0", "1", """
+                        [{"id":"%s","version":">=2.0.0"}]
+                        """.formatted(dependencyId))
+        )));
+        highPriority.createContext("/dependency", exchange -> respond(exchange, repositoryManifest(
+                dependencyId,
+                version(highUrl, "dependency", "1.0.0", "2", "[]")
+        )));
+        lowPriority.createContext("/registry", exchange -> respond(exchange, """
+                {
+                  "schemaVersion": 1,
+                  "name": "Low Priority",
+                  "plugins": [
+                    {"id":"%s","name":"Low Dependency","manifestUrl":"%s/dependency"}
+                  ]
+                }
+                """.formatted(dependencyId, lowUrl)));
+        lowPriority.createContext("/dependency", exchange -> respond(exchange, repositoryManifest(
+                dependencyId,
+                version(lowUrl, "dependency", "2.0.0", "3", "[]")
+        )));
+        highPriority.start();
+        lowPriority.start();
+
+        try (PluginStoreAggregator aggregator = new PluginStoreAggregator()) {
+            PluginStoreSnapshot snapshot = aggregator.refresh(List.of(
+                    new PluginSource("high", highUrl + "/registry", null, true, false),
+                    new PluginSource("low", lowUrl + "/registry", null, true, false)
+            )).get();
+            PluginStoreItem root = Objects.requireNonNull(snapshot.getWinningItems().get(rootId));
+            PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
+                    Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
+            );
+
+            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
+            IOException failure = assertThrows(IOException.class, () -> resolver.resolveInstallPlan(
+                    rootId, rootVersion, Map.of(), Map.of(), Map.of()
+            ));
+
+            assertTrue(Objects.requireNonNull(failure.getMessage()).contains(dependencyId));
+            assertTrue(failure.getMessage().contains("High Priority"));
+        } finally {
+            highPriority.stop(0);
+            lowPriority.stop(0);
+        }
+    }
+
+    /// Retains source metadata for every download while leaving reused entries without a remote source.
+    @Test
+    public void downloadableEntriesRetainTheirWinningSource(@TempDir Path temporaryDirectory) throws Exception {
+        String rootId = "dev.test.source-root";
+        String dependencyId = "dev.test.source-dependency";
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        server.createContext("/registry", exchange -> respond(exchange, """
+                {
+                  "schemaVersion": 1,
+                  "name": "Source Identity Store",
+                  "plugins": [
+                    {"id":"%s","name":"Root","manifestUrl":"%s/root"},
+                    {"id":"%s","name":"Dependency","manifestUrl":"%s/dependency"}
+                  ]
+                }
+                """.formatted(rootId, baseUrl, dependencyId, baseUrl)));
+        server.createContext("/root", exchange -> respond(exchange, repositoryManifest(
+                rootId,
+                version(baseUrl, "root", "1.0.0", "4", """
+                        [{"id":"%s","version":"1.0.0"}]
+                        """.formatted(dependencyId))
+        )));
+        server.createContext("/dependency", exchange -> respond(exchange, repositoryManifest(
+                dependencyId,
+                version(baseUrl, "dependency", "1.0.0", "5", "[]")
+        )));
+        server.start();
+
+        try (PluginStoreAggregator aggregator = new PluginStoreAggregator()) {
+            PluginSource source = new PluginSource("source-identity", baseUrl + "/registry", "Source Alias", true, false);
+            PluginStoreSnapshot snapshot = aggregator.refresh(List.of(source)).get();
+            PluginStoreItem root = Objects.requireNonNull(snapshot.getWinningItems().get(rootId));
+            PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
+                    Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
+            );
+            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
+
+            PluginInstallPlan installPlan = resolver.resolveInstallPlan(rootId, rootVersion, Map.of(), Map.of(), Map.of());
+            for (PluginInstallPlan.Entry entry : installPlan.getDownloadEntries()) {
+                assertEquals(source.getId(), entry.getSourceId());
+                assertEquals("Source Alias", entry.getSourceDisplayName());
+                assertSame(root.getSourceManager(), entry.requireSourceManager());
+            }
+
+            PluginManifest installedDependency = packageManifest(dependencyId, "1.0.0", "[]");
+            PluginArtifactIdentity dependencyIdentity = PluginArtifactIdentity.of(installedDependency, "a".repeat(64));
+            PluginInstallPlan reusePlan = resolver.resolveInstallPlan(
+                    rootId,
+                    rootVersion,
+                    Map.of(dependencyId, installedDependency),
+                    Map.of(dependencyId, dependencyIdentity),
+                    Map.of(dependencyId, dependencyIdentity)
+            );
+            PluginInstallPlan.Entry reusedDependency = reusePlan.getEntries().stream()
+                    .filter(entry -> entry.getPluginId().equals(dependencyId))
+                    .findFirst()
+                    .orElseThrow();
+            PluginInstallPlan.Entry updatedRoot = reusePlan.getRootEntry();
+
+            assertEquals(PluginInstallPlan.Action.REUSE, reusedDependency.getAction());
+            assertNull(reusedDependency.getSourceId());
+            assertNull(reusedDependency.getSourceDisplayName());
+            assertNull(reusedDependency.getSourceManager());
+            assertThrows(IllegalStateException.class, reusedDependency::requireSourceManager);
+            assertEquals(source.getId(), updatedRoot.getSourceId());
+            assertEquals("Source Alias", updatedRoot.getSourceDisplayName());
+            assertSame(root.getSourceManager(), updatedRoot.requireSourceManager());
+        } finally {
+            server.stop(0);
+        }
     }
 
     /// Treats a selected remote artifact as an update even when its version string matches the installed package.

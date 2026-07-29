@@ -210,6 +210,15 @@ public final class PluginInstallPlan {
         /// Existing installed manifest when one is available.
         private final @Nullable PluginManifest installedManifest;
 
+        /// Stable identifier of the source that selected a downloadable package.
+        private final @Nullable String sourceId;
+
+        /// Human-readable name of the source that selected a downloadable package.
+        private final @Nullable String sourceDisplayName;
+
+        /// Source-scoped manager that must download a downloadable package.
+        private final @Nullable PluginStoreManager sourceManager;
+
         /// Creates one immutable effective plan entry.
         ///
         /// @param pluginId effective plugin ID
@@ -219,6 +228,9 @@ public final class PluginInstallPlan {
         /// @param storeEntry registry metadata or `null` for a reused installed plugin
         /// @param remoteVersion remote metadata or `null` for a reused installed plugin
         /// @param installedManifest previous installed manifest or `null`
+        /// @param sourceId selected source ID or `null` for a reused installed plugin
+        /// @param sourceDisplayName selected source display name or `null` for a reused installed plugin
+        /// @param sourceManager selected source manager or `null` for a reused installed plugin
         Entry(
                 String pluginId,
                 String displayName,
@@ -226,7 +238,10 @@ public final class PluginInstallPlan {
                 Action action,
                 @Nullable PluginStoreRegistry.PluginStoreEntry storeEntry,
                 @Nullable PluginStoreManifest.PluginVersionEntry remoteVersion,
-                @Nullable PluginManifest installedManifest
+                @Nullable PluginManifest installedManifest,
+                @Nullable String sourceId,
+                @Nullable String sourceDisplayName,
+                @Nullable PluginStoreManager sourceManager
         ) {
             this.pluginId = pluginId;
             this.displayName = displayName;
@@ -235,6 +250,18 @@ public final class PluginInstallPlan {
             this.storeEntry = storeEntry;
             this.remoteVersion = remoteVersion;
             this.installedManifest = installedManifest;
+            this.sourceId = sourceId;
+            this.sourceDisplayName = sourceDisplayName;
+            this.sourceManager = sourceManager;
+
+            boolean hasCompleteSource = sourceId != null && sourceDisplayName != null && sourceManager != null;
+            boolean hasNoSource = sourceId == null && sourceDisplayName == null && sourceManager == null;
+            if (requiresDownload() && !hasCompleteSource) {
+                throw new IllegalArgumentException("Downloadable plan entry has no complete source: " + pluginId);
+            }
+            if (!requiresDownload() && !hasNoSource) {
+                throw new IllegalArgumentException("Reused plan entry must not have a remote source: " + pluginId);
+            }
         }
 
         /// Returns the effective plugin ID.
@@ -301,6 +328,38 @@ public final class PluginInstallPlan {
         /// @return installed manifest or `null`
         public @Nullable PluginManifest getInstalledManifest() {
             return installedManifest;
+        }
+
+        /// Returns the stable selected source ID for a downloadable package.
+        ///
+        /// @return source ID or `null` for a reused artifact
+        public @Nullable String getSourceId() {
+            return sourceId;
+        }
+
+        /// Returns the selected source's human-readable display name for a downloadable package.
+        ///
+        /// @return source display name or `null` for a reused artifact
+        public @Nullable String getSourceDisplayName() {
+            return sourceDisplayName;
+        }
+
+        /// Returns the source-scoped manager for a downloadable package.
+        ///
+        /// @return source manager or `null` for a reused artifact
+        public @Nullable PluginStoreManager getSourceManager() {
+            return sourceManager;
+        }
+
+        /// Returns the source-scoped manager required to download this entry.
+        ///
+        /// @return source manager for an installation or update
+        /// @throws IllegalStateException if this entry reuses an installed artifact
+        public PluginStoreManager requireSourceManager() {
+            if (!requiresDownload() || sourceManager == null) {
+                throw new IllegalStateException("Plan entry has no downloadable source: " + pluginId);
+            }
+            return sourceManager;
         }
 
         /// Returns the effective permission declaration.
