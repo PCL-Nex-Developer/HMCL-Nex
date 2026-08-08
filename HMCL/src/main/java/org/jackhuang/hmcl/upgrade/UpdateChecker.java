@@ -92,7 +92,9 @@ public final class UpdateChecker {
         query.put("version", Metadata.VERSION);
         query.put("channel", preview ? channel.channelName + "-preview" : channel.channelName);
 
-        String url = NetworkUtils.withQuery(Metadata.HMCL_UPDATE_URL, query);
+        String url = Metadata.GITHUB_RELEASES_API_URL.equals(Metadata.HMCL_UPDATE_URL)
+                ? Metadata.HMCL_UPDATE_URL
+                : NetworkUtils.withQuery(Metadata.HMCL_UPDATE_URL, query);
         return RemoteVersion.fetch(channel, preview, url);
     }
 

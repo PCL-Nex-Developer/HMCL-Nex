@@ -44,10 +44,12 @@ public final class Metadata {
     public static final int MINIMUM_SUPPORTED_JAVA_VERSION = 17;
     public static final int RECOMMENDED_JAVA_VERSION = 21;
 
-    public static final String PUBLISH_URL = "https://hmcl.huangyuhui.net";
-    public static final String DOWNLOAD_URL = PUBLISH_URL + "/download";
-    public static final String HMCL_UPDATE_URL = System.getProperty("hmcl.update_source.override", PUBLISH_URL + "/api/update_link");
-    public static final String MANUAL_UPDATE_URL = "https://github.com/HMCL-dev/HMCL/releases";
+    public static final String PUBLISH_URL = "https://github.com/PCL-Nex-Developer/HMCL-Nex";
+    public static final String DOWNLOAD_URL = PUBLISH_URL + "/releases";
+    /// GitHub Releases API used by the Nex default update checker.
+    public static final String GITHUB_RELEASES_API_URL = "https://api.github.com/repos/PCL-Nex-Developer/HMCL-Nex/releases";
+    public static final String HMCL_UPDATE_URL = System.getProperty("hmcl.update_source.override", GITHUB_RELEASES_API_URL);
+    public static final String MANUAL_UPDATE_URL = PUBLISH_URL + "/releases";
 
     public static final String DOCS_URL = "https://docs.hmcl.net";
     public static final String CONTACT_URL = DOCS_URL + "/help.html";
