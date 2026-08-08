@@ -217,8 +217,12 @@ public final class Controllers {
         return decorator;
     }
 
+    /// Releases cached controller resources while the application is stopping or restarting.
     public static void onApplicationStop() {
         stageSizeChangeListener = null;
+        if (settingsPage != null) {
+            settingsPage.closePluginStoreAtApplicationShutdown();
+        }
     }
 
     public static void initialize(Stage stage) {
@@ -685,6 +689,7 @@ public final class Controllers {
     }
 
     public static void shutdown() {
+        onApplicationStop();
         rootPage = null;
         versionPage = null;
         gameListPage = null;
@@ -695,7 +700,6 @@ public final class Controllers {
         decorator = null;
         stage = null;
         scene = null;
-        onApplicationStop();
 
         FXUtils.shutdown();
     }

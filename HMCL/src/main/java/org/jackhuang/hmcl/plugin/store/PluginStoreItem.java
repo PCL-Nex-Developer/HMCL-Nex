@@ -23,22 +23,91 @@ import org.jetbrains.annotations.Nullable;
 /// Combines one registry entry with its resolved repository manifest.
 @NotNullByDefault
 public final class PluginStoreItem {
+    /// Immutable source configuration that produced this catalog entry.
+    private final PluginSource source;
+
+    /// Validated registry that published this catalog entry.
+    private final PluginStoreRegistry registry;
+
+    /// Source-scoped client retaining the entry's trusted transport and manifest caches.
+    private final PluginStoreManager sourceManager;
+
     /// Registry metadata used for listing and search.
     private final PluginStoreRegistry.PluginStoreEntry entry;
 
     /// Resolved repository manifest, or `null` when that repository is temporarily unavailable.
     private final @Nullable PluginStoreManifest manifest;
 
-    /// Creates a resolved or partially resolved store item.
+    /// Opaque source-context token used by the producing manager for source-bound cache operations.
+    private final @Nullable PluginStoreManager.SourceContext sourceContext;
+
+    /// Creates a resolved or partially resolved store item without exposing manager cache state.
     ///
+    /// @param source immutable source configuration
+    /// @param registry validated registry that published the entry
+    /// @param sourceManager source-scoped manager retaining resolved remote state
     /// @param entry registry entry
     /// @param manifest repository manifest or `null`
     public PluginStoreItem(
+            PluginSource source,
+            PluginStoreRegistry registry,
+            PluginStoreManager sourceManager,
             PluginStoreRegistry.PluginStoreEntry entry,
             @Nullable PluginStoreManifest manifest
     ) {
+        this(source, registry, sourceManager, entry, manifest, null);
+    }
+
+    /// Creates a resolved or partially resolved store item for one manager-internal source context.
+    ///
+    /// @param source immutable source configuration
+    /// @param registry validated registry that published the entry
+    /// @param sourceManager source-scoped manager retaining resolved remote state
+    /// @param entry registry entry
+    /// @param manifest repository manifest or `null`
+    /// @param sourceContext producing manager's opaque source-context token
+    PluginStoreItem(
+            PluginSource source,
+            PluginStoreRegistry registry,
+            PluginStoreManager sourceManager,
+            PluginStoreRegistry.PluginStoreEntry entry,
+            @Nullable PluginStoreManifest manifest,
+            PluginStoreManager.SourceContext sourceContext
+    ) {
+        this.source = source;
+        this.registry = registry;
+        this.sourceManager = sourceManager;
         this.entry = entry;
         this.manifest = manifest;
+        this.sourceContext = sourceContext;
+    }
+
+    /// Returns the immutable source configuration that produced this entry.
+    ///
+    /// @return producing source
+    public PluginSource getSource() {
+        return source;
+    }
+
+    /// Returns the validated registry that published this entry.
+    ///
+    /// @return producing registry
+    public PluginStoreRegistry getRegistry() {
+        return registry;
+    }
+
+    /// Returns the source-scoped manager that resolved this entry.
+    ///
+    /// @return producing manager
+    public PluginStoreManager getSourceManager() {
+        return sourceManager;
+    }
+
+    /// Returns the producing source context for package-local source-bound operations.
+    ///
+    /// @return producing source context, or `null` for externally constructed compatibility items
+    @Nullable PluginStoreManager.SourceContext getSourceContext() {
+        return sourceContext;
     }
 
     /// Returns registry metadata.

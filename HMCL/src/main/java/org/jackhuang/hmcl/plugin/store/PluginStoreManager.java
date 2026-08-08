@@ -20,7 +20,6 @@ package org.jackhuang.hmcl.plugin.store;
 import com.google.gson.JsonParseException;
 import org.jackhuang.hmcl.Metadata;
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
-import org.jackhuang.hmcl.plugin.PluginDependency;
 import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginVersion;
 import org.jackhuang.hmcl.util.gson.JsonUtils;
@@ -46,12 +45,11 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -89,77 +87,81 @@ public final class PluginStoreManager {
     /// Extracts the first Java feature number from registry text.
     private static final Pattern JAVA_VERSION_PATTERN = Pattern.compile("(\\d+)");
 
-    /// Currently loaded validated registry.
-    private @Nullable PluginStoreRegistry registry;
+    /// Atomically published source, registry, and source-owned request caches.
+    private volatile @Nullable SourceContext context;
 
-    /// Registry URL selected by this manager, restored from preferences until a request loads another source.
-    private String registryUrl = DEFAULT_REGISTRY_URL;
+    /// README cache retained only for the historical explicit-manifest API before a source has loaded.
+    private final Map<String, String> unloadedReadmeCache = new ConcurrentHashMap<>();
 
-    /// Known registry URLs displayed by the source selector.
-    private final List<String> registryUrls = new ArrayList<>();
+    /// Captures one source generation so readers cannot combine registry state or cache results across replacements.
+    @NotNullByDefault
+    static final class SourceContext {
+        /// Immutable source configuration validated for this generation.
+        private final PluginSource source;
 
-    /// Validated repository manifests cached by URL.
-    private final Map<String, PluginStoreManifest> manifestCache = new ConcurrentHashMap<>();
+        /// Registry validated for this source generation.
+        private final PluginStoreRegistry registry;
 
-    /// Bounded README text cached by validated URL.
-    private final Map<String, String> readmeCache = new ConcurrentHashMap<>();
+        /// Validated manifests resolved only for this source generation.
+        private final Map<String, PluginStoreManifest> manifestCache = new ConcurrentHashMap<>();
 
-    /// User-owned favorite and registry-source preferences.
-    private final PluginStorePreferences preferences;
+        /// Bounded README text resolved only for this source generation.
+        private final Map<String, String> readmeCache = new ConcurrentHashMap<>();
 
-    /// Creates a store manager configured with the official registry.
+        /// Creates a source context after the registry has completed validation.
+        ///
+        /// @param source immutable source configuration
+        /// @param registry validated registry
+        private SourceContext(PluginSource source, PluginStoreRegistry registry) {
+            this.source = source;
+            this.registry = registry;
+        }
+    }
+
+    /// Creates an unloaded source-scoped store client.
     public PluginStoreManager() {
-        this(Metadata.HMCL_LOCAL_HOME);
     }
 
-    /// Creates a store manager with isolated preference storage for tests or alternate launcher homes.
+    /// Loads and validates one plugin source without persisting user configuration.
     ///
-    /// @param localHome launcher-local home
-    public PluginStoreManager(Path localHome) {
-        preferences = new PluginStorePreferences(localHome);
-        registryUrls.add(DEFAULT_REGISTRY_URL);
-        for (String customRegistry : preferences.getCustomRegistryUrls()) {
-            try {
-                validateRemoteUrl(customRegistry, "plugin registry");
-                if (!registryUrls.contains(customRegistry)) {
-                    registryUrls.add(customRegistry);
-                }
-            } catch (IOException exception) {
-                LOG.warning("Ignoring invalid persisted plugin registry: " + customRegistry, exception);
-            }
-        }
-        String persistedRegistry = preferences.getActiveRegistryUrl();
-        try {
-            validateRemoteUrl(persistedRegistry, "plugin registry");
-            registryUrl = persistedRegistry;
-            if (!registryUrls.contains(persistedRegistry)) {
-                registryUrls.add(persistedRegistry);
-            }
-        } catch (IOException exception) {
-            LOG.warning("Ignoring invalid active plugin registry: " + persistedRegistry, exception);
-        }
+    /// @param source immutable source configuration to load
+    /// @throws IOException if transport, parsing, URL policy, or validation fails
+    public void loadSource(PluginSource source) throws IOException {
+        Objects.requireNonNull(source, "source");
+        PluginStoreRegistry loadedRegistry = loadRegistryForRequest(source.getUrl());
+        context = new SourceContext(source, loadedRegistry);
     }
 
-    /// Loads and validates a plugin registry from a secure remote URL, then persists it as the active source.
+    /// Returns the source associated with the currently loaded registry.
+    ///
+    /// @return loaded source
+    /// @throws IllegalStateException if no source has loaded successfully
+    public PluginSource getSource() {
+        return requireContext().source;
+    }
+
+    /// Returns the current source context or rejects operations before a successful source load.
+    ///
+    /// @return atomically published source context
+    /// @throws IllegalStateException if no source has loaded successfully
+    private SourceContext requireContext() {
+        @Nullable SourceContext currentContext = context;
+        if (currentContext == null) {
+            throw new IllegalStateException("Plugin source is not loaded");
+        }
+        return currentContext;
+    }
+
+    /// Loads and validates a registry response for the supplied source URL.
+    ///
+    /// The caller publishes source identity only after this validation succeeds, keeping failed requests from
+    /// replacing the previously loaded source context.
     ///
     /// @param registryUrl registry URL
     /// @throws IOException if transport, parsing, URL policy, or validation fails
-    public void loadRegistry(String registryUrl) throws IOException {
-        loadRegistryForRequest(registryUrl);
-        commitActiveRegistry();
-    }
-
-    /// Loads and validates a plugin registry without persisting it as the active source.
-    ///
-    /// This request-scoped operation lets callers discard stale asynchronous results without allowing an older
-    /// request to overwrite the source selected by a newer generation. Call [#commitActiveRegistry()] only after
-    /// the loaded result is accepted by the caller.
-    ///
-    /// @param registryUrl registry URL
-    /// @throws IOException if transport, parsing, URL policy, or validation fails
-    public void loadRegistryForRequest(String registryUrl) throws IOException {
+    private PluginStoreRegistry loadRegistryForRequest(String registryUrl) throws IOException {
         validateRemoteUrl(registryUrl, "plugin registry");
-        LOG.info("Loading plugin registry from: " + registryUrl);
+        LOG.info("Loading plugin registry from: " + PluginSourceLabels.diagnosticUrl(registryUrl));
         try {
             String content = fetchBoundedUtf8(registryUrl, "plugin registry", MAX_REGISTRY_BYTES);
             @Nullable PluginStoreRegistry loadedRegistry = JsonUtils.GSON.fromJson(
@@ -167,38 +169,31 @@ public final class PluginStoreManager {
                     PluginStoreRegistry.class
             );
             if (loadedRegistry == null) {
-                throw new IOException("Empty plugin registry: " + registryUrl);
+                throw new IOException("Empty plugin registry: " + PluginSourceLabels.diagnosticUrl(registryUrl));
             }
             loadedRegistry.validate();
             for (PluginStoreRegistry.PluginStoreEntry entry : loadedRegistry.getPlugins()) {
                 validateRemoteUrl(entry.getManifestUrl(), "plugin manifest");
             }
 
-            registry = loadedRegistry;
-            this.registryUrl = registryUrl;
-            manifestCache.clear();
-            readmeCache.clear();
             LOG.info("Loaded " + loadedRegistry.getPlugins().size() + " plugins from registry");
+            return loadedRegistry;
         } catch (JsonParseException exception) {
             throw new IOException("Failed to parse plugin registry", exception);
         }
     }
 
-    /// Persists the source of the registry most recently loaded successfully by this manager.
-    ///
-    /// @throws IllegalStateException if this manager has not loaded a registry
-    public void commitActiveRegistry() {
-        if (registry == null) {
-            throw new IllegalStateException("Cannot commit an unloaded plugin registry");
-        }
-        preferences.setActiveRegistryUrl(registryUrl);
-    }
-
-    /// Loads the official plugin registry.
+    /// Loads the fixed official plugin source without persisting any selection state.
     ///
     /// @throws IOException if loading fails
     public void loadDefaultRegistry() throws IOException {
-        loadRegistry(registryUrls.get(0));
+        loadSource(new PluginSource(
+                PluginSource.OFFICIAL_ID,
+                DEFAULT_REGISTRY_URL,
+                null,
+                true,
+                true
+        ));
     }
 
     /// Resolves and validates one plugin repository manifest.
@@ -208,7 +203,22 @@ public final class PluginStoreManager {
     /// @return validated repository manifest
     /// @throws IOException if transport, parsing, identity, or schema validation fails
     public PluginStoreManifest getPluginManifest(String pluginId, String manifestUrl) throws IOException {
-        @Nullable PluginStoreManifest cached = manifestCache.get(manifestUrl);
+        return getPluginManifest(requireContext(), pluginId, manifestUrl);
+    }
+
+    /// Resolves one repository manifest through the supplied source context only.
+    ///
+    /// @param sourceContext source context captured before the request begins
+    /// @param pluginId expected plugin ID
+    /// @param manifestUrl repository manifest URL
+    /// @return validated repository manifest
+    /// @throws IOException if transport, parsing, identity, or schema validation fails
+    private PluginStoreManifest getPluginManifest(
+            SourceContext sourceContext,
+            String pluginId,
+            String manifestUrl
+    ) throws IOException {
+        @Nullable PluginStoreManifest cached = sourceContext.manifestCache.get(manifestUrl);
         if (cached != null) {
             if (!pluginId.equals(cached.getId())) {
                 throw new IOException("Cached plugin manifest ID mismatch for " + pluginId);
@@ -217,43 +227,54 @@ public final class PluginStoreManager {
         }
 
         validateRemoteUrl(manifestUrl, "plugin manifest");
-        LOG.info("Fetching plugin manifest from: " + manifestUrl);
+        LOG.info("Fetching plugin manifest from: " + PluginSourceLabels.diagnosticUrl(manifestUrl));
         try {
             String content = fetchBoundedUtf8(manifestUrl, "plugin manifest", MAX_STORE_MANIFEST_BYTES);
             @Nullable PluginStoreManifest manifest = JsonUtils.GSON.fromJson(content, PluginStoreManifest.class);
             if (manifest == null) {
-                throw new IOException("Empty plugin manifest: " + manifestUrl);
+                throw new IOException("Empty plugin manifest: " + PluginSourceLabels.diagnosticUrl(manifestUrl));
             }
             manifest.validate(pluginId);
             for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersions()) {
                 validateRemoteUrl(version.getPackageUrl(), "plugin package");
             }
-            manifestCache.put(manifestUrl, manifest);
+            sourceContext.manifestCache.put(manifestUrl, manifest);
             return manifest;
         } catch (JsonParseException exception) {
             throw new IOException("Failed to parse plugin manifest", exception);
         }
     }
 
-    /// Resolves all registry entries, retaining unavailable repositories as partial items.
+    /// Resolves all registry entries, retaining unavailable repositories as partial source-bound items.
     ///
     /// @return resolved store items
     public @Unmodifiable List<PluginStoreItem> getStoreItems() {
-        @Nullable PluginStoreRegistry currentRegistry = registry;
-        if (currentRegistry == null) {
+        @Nullable SourceContext sourceContext = context;
+        if (sourceContext == null) {
             return List.of();
         }
 
         List<PluginStoreItem> items = new ArrayList<>();
-        for (PluginStoreRegistry.PluginStoreEntry entry : currentRegistry.getPlugins()) {
+        for (PluginStoreRegistry.PluginStoreEntry entry : sourceContext.registry.getPlugins()) {
             try {
                 items.add(new PluginStoreItem(
+                        sourceContext.source,
+                        sourceContext.registry,
+                        this,
                         entry,
-                        getPluginManifest(entry.getId(), entry.getManifestUrl())
+                        getPluginManifest(sourceContext, entry.getId(), entry.getManifestUrl()),
+                        sourceContext
                 ));
             } catch (IOException exception) {
-                LOG.warning("Failed to load plugin manifest: " + entry.getId(), exception);
-                items.add(new PluginStoreItem(entry, null));
+                LOG.warning("Failed to load plugin manifest: " + entry.getId());
+                items.add(new PluginStoreItem(
+                        sourceContext.source,
+                        sourceContext.registry,
+                        this,
+                        entry,
+                        null,
+                        sourceContext
+                ));
             }
         }
         return List.copyOf(items);
@@ -326,9 +347,8 @@ public final class PluginStoreManager {
 
     /// Resolves a requested version and all transitive dependencies using one complete exact-artifact snapshot.
     ///
-    /// Every installed manifest must have one exact prior identity, including disabled or unauthorized artifacts that
-    /// will be updated rather than reused. Reusable artifacts must be an exact subset of that same snapshot. Selected
-    /// identities are retained so final publication can compare both replacement prior state and reused dependencies.
+    /// This compatibility facade derives a single-source winner map from the currently loaded manager. Aggregate
+    /// catalog callers should construct {@link PluginStoreDependencyResolver} directly with their snapshot winners.
     ///
     /// @param pluginId requested root plugin ID
     /// @param requestedVersion exact requested remote version
@@ -344,429 +364,17 @@ public final class PluginStoreManager {
             @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifactIdentities,
             @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalledArtifacts
     ) throws IOException {
-        @Nullable PluginStoreRegistry currentRegistry = registry;
-        if (currentRegistry == null) {
-            throw new IOException("Plugin registry is not loaded");
+        Map<String, PluginStoreItem> winningItems = new LinkedHashMap<>();
+        for (PluginStoreItem item : getStoreItems()) {
+            winningItems.putIfAbsent(item.getEntry().getId(), item);
         }
-
-        @Nullable PluginStoreRegistry.PluginStoreEntry rootStoreEntry = currentRegistry.findPlugin(pluginId);
-        if (rootStoreEntry == null) {
-            throw new IOException("Plugin is not published by the active registry: " + pluginId);
-        }
-        PluginStoreManifest rootManifest = getPluginManifest(pluginId, rootStoreEntry.getManifestUrl());
-        PluginStoreManifest.PluginVersionEntry rootVersion = requirePublishedVersion(
+        return new PluginStoreDependencyResolver(winningItems).resolveInstallPlan(
                 pluginId,
-                rootManifest,
-                requestedVersion
+                requestedVersion,
+                installedManifests,
+                installedArtifactIdentities,
+                reusableInstalledArtifacts
         );
-        validateCompatibility(rootVersion);
-
-        @Unmodifiable Map<String, PluginManifest> installed = Map.copyOf(installedManifests);
-        @Unmodifiable Map<String, PluginArtifactIdentity> installedArtifacts =
-                Map.copyOf(installedArtifactIdentities);
-        @Unmodifiable Map<String, PluginArtifactIdentity> reusableInstalled =
-                Map.copyOf(reusableInstalledArtifacts);
-        if (!installed.keySet().equals(installedArtifacts.keySet())) {
-            throw new IllegalArgumentException("Every installed manifest must have one exact prior artifact identity");
-        }
-        if (!installedArtifacts.keySet().containsAll(reusableInstalled.keySet())) {
-            throw new IllegalArgumentException("Reusable artifacts must belong to the installed manifest snapshot");
-        }
-        for (Map.Entry<String, PluginArtifactIdentity> entry : installedArtifacts.entrySet()) {
-            @Nullable PluginManifest installedManifest = installed.get(entry.getKey());
-            PluginArtifactIdentity identity = entry.getValue();
-            if (!entry.getKey().equals(identity.getPluginId())
-                    || installedManifest == null
-                    || !installedManifest.getVersion().equals(identity.getVersion())) {
-                throw new IllegalArgumentException("Reusable artifact identity does not match the installed snapshot: "
-                        + entry.getKey());
-            }
-        }
-        for (Map.Entry<String, PluginArtifactIdentity> entry : reusableInstalled.entrySet()) {
-            if (!entry.getValue().equals(installedArtifacts.get(entry.getKey()))) {
-                throw new IllegalArgumentException("Reusable artifact differs from the installed snapshot: "
-                        + entry.getKey());
-            }
-        }
-        Map<String, PluginInstallPlan.Entry> selected = new LinkedHashMap<>();
-        selected.put(pluginId, createRemotePlanEntry(pluginId, rootStoreEntry, rootVersion, installed));
-        Map<String, PluginInstallPlan.Entry> solution = new LinkedHashMap<>();
-        List<IOException> failures = new ArrayList<>();
-        if (!solvePlanSelections(
-                pluginId,
-                currentRegistry,
-                installed,
-                reusableInstalled.keySet(),
-                selected,
-                solution,
-                failures
-        )) {
-            if (!failures.isEmpty()) {
-                throw failures.get(failures.size() - 1);
-            }
-            throw new IOException("Plugin dependency graph cannot be satisfied for " + pluginId);
-        }
-
-        validateReverseDependents(installed, solution);
-        Map<String, PluginArtifactIdentity> selectedReusableArtifacts = new LinkedHashMap<>();
-        Map<String, Optional<PluginArtifactIdentity>> expectedPriorArtifacts = new LinkedHashMap<>();
-        for (PluginInstallPlan.Entry entry : solution.values()) {
-            if (entry.getAction() == PluginInstallPlan.Action.REUSE) {
-                PluginArtifactIdentity identity = reusableInstalled.get(entry.getPluginId());
-                if (identity == null) {
-                    throw new IllegalStateException("Selected reusable entry has no exact artifact identity: "
-                            + entry.getPluginId());
-                }
-                selectedReusableArtifacts.put(entry.getPluginId(), identity);
-            } else if (entry.getAction() == PluginInstallPlan.Action.UPDATE) {
-                PluginArtifactIdentity priorIdentity = installedArtifacts.get(entry.getPluginId());
-                if (priorIdentity == null) {
-                    throw new IllegalStateException("Selected update has no exact prior artifact identity: "
-                            + entry.getPluginId());
-                }
-                expectedPriorArtifacts.put(entry.getPluginId(), Optional.of(priorIdentity));
-            } else {
-                expectedPriorArtifacts.put(entry.getPluginId(), Optional.empty());
-            }
-        }
-        return new PluginInstallPlan(
-                pluginId,
-                buildDependencyOrder(pluginId, solution),
-                Map.copyOf(selectedReusableArtifacts),
-                Map.copyOf(expectedPriorArtifacts)
-        );
-    }
-
-    /// Searches the complete dependency graph with backtracking so constraints discovered by later siblings can
-    /// revise an earlier version choice.
-    ///
-    /// @param rootPluginId requested root plugin ID
-    /// @param currentRegistry active registry
-    /// @param installedManifests installed manifests
-    /// @param reusableInstalledPluginIds exact installed artifacts approved for reuse
-    /// @param selected mutable candidate assignment for the current branch
-    /// @param solution successful assignment copied when the graph is complete
-    /// @param failures branch diagnostics retained for the final error
-    /// @return whether a complete, acyclic assignment was found
-    private boolean solvePlanSelections(
-            String rootPluginId,
-            PluginStoreRegistry currentRegistry,
-            Map<String, PluginManifest> installedManifests,
-            Set<String> reusableInstalledPluginIds,
-            Map<String, PluginInstallPlan.Entry> selected,
-            Map<String, PluginInstallPlan.Entry> solution,
-            List<IOException> failures
-    ) {
-        Map<String, List<PluginDependency>> requirements = collectRequirements(
-                rootPluginId,
-                selected,
-                installedManifests
-        );
-        for (Map.Entry<String, PluginInstallPlan.Entry> assignment : selected.entrySet()) {
-            @Nullable List<PluginDependency> constraints = requirements.get(assignment.getKey());
-            if (constraints != null && !matchesAll(assignment.getValue().getVersion(), constraints)) {
-                failures.add(new IOException("Conflicting dependency constraints for plugin " + assignment.getKey()
-                        + ": selected " + assignment.getValue().getVersion() + " does not satisfy "
-                        + formatConstraints(constraints)));
-                return false;
-            }
-        }
-
-        @Nullable String unresolvedPluginId = requirements.keySet().stream()
-                .filter(candidate -> !selected.containsKey(candidate))
-                .findFirst()
-                .orElse(null);
-        if (unresolvedPluginId == null) {
-            try {
-                buildDependencyOrder(rootPluginId, selected);
-                solution.clear();
-                solution.putAll(selected);
-                return true;
-            } catch (IOException exception) {
-                failures.add(exception);
-                return false;
-            }
-        }
-
-        @Unmodifiable List<PluginInstallPlan.Entry> candidates;
-        try {
-            candidates = getCandidateEntries(
-                    unresolvedPluginId,
-                    requirements.getOrDefault(unresolvedPluginId, List.of()),
-                    currentRegistry,
-                    installedManifests,
-                    reusableInstalledPluginIds
-            );
-        } catch (IOException exception) {
-            failures.add(exception);
-            return false;
-        }
-        if (candidates.isEmpty()) {
-            failures.add(new IOException("No compatible version of dependency " + unresolvedPluginId
-                    + " satisfies " + formatConstraints(requirements.getOrDefault(unresolvedPluginId, List.of()))));
-            return false;
-        }
-
-        for (PluginInstallPlan.Entry candidate : candidates) {
-            selected.put(unresolvedPluginId, candidate);
-            if (solvePlanSelections(
-                    rootPluginId,
-                    currentRegistry,
-                    installedManifests,
-                    reusableInstalledPluginIds,
-                    selected,
-                    solution,
-                    failures
-            )) {
-                return true;
-            }
-            selected.remove(unresolvedPluginId);
-        }
-        return false;
-    }
-
-    /// Collects dependency constraints contributed by all candidates selected in the current search branch.
-    ///
-    /// @param rootPluginId requested root plugin ID
-    /// @param selected current candidate assignment
-    /// @param installedManifests installed manifests whose out-of-plan reverse constraints must remain valid
-    /// @return mutable insertion-ordered constraints indexed by dependency ID
-    private static Map<String, List<PluginDependency>> collectRequirements(
-            String rootPluginId,
-            Map<String, PluginInstallPlan.Entry> selected,
-            Map<String, PluginManifest> installedManifests
-    ) {
-        Map<String, List<PluginDependency>> requirements = new LinkedHashMap<>();
-        requirements.put(rootPluginId, new ArrayList<>());
-        for (PluginInstallPlan.Entry entry : selected.values()) {
-            for (PluginDependency dependency : entry.getDependencies()) {
-                requirements.computeIfAbsent(dependency.getId(), ignored -> new ArrayList<>()).add(dependency);
-            }
-        }
-
-        // Only executable API-v4 plugins can constrain the active dependency graph.
-        for (PluginManifest installed : installedManifests.values()) {
-            if (installed.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
-                    || requirements.containsKey(installed.getId())) {
-                continue;
-            }
-            for (PluginDependency dependency : installed.getPluginDependencies()) {
-                @Nullable List<PluginDependency> dependencyRequirements = requirements.get(dependency.getId());
-                if (dependencyRequirements != null) {
-                    dependencyRequirements.add(dependency);
-                }
-            }
-        }
-        return requirements;
-    }
-
-    /// Builds candidate versions in preference order for one dependency under all currently known constraints.
-    ///
-    /// @param pluginId dependency plugin ID
-    /// @param requirements all incoming version requirements
-    /// @param currentRegistry active registry
-    /// @param installedManifests installed manifests
-    /// @param reusableInstalledPluginIds exact installed artifacts approved for reuse
-    /// @return immutable candidate list, with an approved compatible installed package first
-    /// @throws IOException if remote metadata is required but unavailable
-    private @Unmodifiable List<PluginInstallPlan.Entry> getCandidateEntries(
-            String pluginId,
-            List<PluginDependency> requirements,
-            PluginStoreRegistry currentRegistry,
-            Map<String, PluginManifest> installedManifests,
-            Set<String> reusableInstalledPluginIds
-    ) throws IOException {
-        List<PluginInstallPlan.Entry> candidates = new ArrayList<>();
-        @Nullable PluginManifest installed = installedManifests.get(pluginId);
-        boolean installedVersionMatches = installed != null && matchesAll(installed.getVersion(), requirements);
-        boolean installedArtifactMayBeReused = installed != null
-                && installed.getSchemaVersion() >= PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION
-                && installedVersionMatches
-                && reusableInstalledPluginIds.contains(pluginId);
-        if (installedArtifactMayBeReused) {
-            candidates.add(new PluginInstallPlan.Entry(
-                    pluginId,
-                    installed.getName(),
-                    installed.getVersion(),
-                    PluginInstallPlan.Action.REUSE,
-                    null,
-                    null,
-                    installed
-            ));
-        }
-
-        @Nullable PluginStoreRegistry.PluginStoreEntry storeEntry = currentRegistry.findPlugin(pluginId);
-        if (storeEntry == null) {
-            if (candidates.isEmpty()) {
-                if (installedVersionMatches) {
-                    throw new IOException("Installed dependency " + pluginId
-                            + " cannot be reused without complete artifact-bound required grants, and the active "
-                            + "registry provides no package for a fresh permission review");
-                }
-                throw new IOException("Missing plugin dependency in active registry: " + pluginId);
-            }
-            return List.copyOf(candidates);
-        }
-
-        PluginStoreManifest manifest = getPluginManifest(pluginId, storeEntry.getManifestUrl());
-        for (PluginStoreManifest.PluginVersionEntry version : getCompatibleVersions(manifest)) {
-            if (matchesAll(version.getVersion(), requirements)) {
-                candidates.add(createRemotePlanEntry(pluginId, storeEntry, version, installedManifests));
-            }
-        }
-        if (candidates.isEmpty() && installedVersionMatches) {
-            throw new IOException("Installed dependency " + pluginId
-                    + " cannot be reused without complete artifact-bound required grants, and no compatible remote "
-                    + "package is available for a fresh permission review");
-        }
-        return List.copyOf(candidates);
-    }
-
-    /// Creates a downloadable plan entry for an exact remote version.
-    ///
-    /// @param pluginId plugin ID
-    /// @param storeEntry parent registry metadata
-    /// @param version exact remote version metadata
-    /// @param installedManifests installed manifests
-    /// @return remote install or update entry
-    private static PluginInstallPlan.Entry createRemotePlanEntry(
-            String pluginId,
-            PluginStoreRegistry.PluginStoreEntry storeEntry,
-            PluginStoreManifest.PluginVersionEntry version,
-            Map<String, PluginManifest> installedManifests
-    ) {
-        @Nullable PluginManifest installed = installedManifests.get(pluginId);
-        return new PluginInstallPlan.Entry(
-                pluginId,
-                storeEntry.getName().isBlank() ? pluginId : storeEntry.getName(),
-                version.getVersion(),
-                installed == null ? PluginInstallPlan.Action.INSTALL : PluginInstallPlan.Action.UPDATE,
-                storeEntry,
-                version,
-                installed
-        );
-    }
-
-    /// Returns whether a version satisfies every incoming dependency requirement.
-    ///
-    /// @param version candidate plugin version
-    /// @param requirements incoming requirements
-    /// @return whether all requirements match
-    private static boolean matchesAll(String version, List<PluginDependency> requirements) {
-        return requirements.stream().allMatch(requirement -> requirement.matchesVersion(version));
-    }
-
-    /// Formats incoming dependency constraints for deterministic diagnostics.
-    ///
-    /// @param requirements incoming requirements
-    /// @return comma-separated constraint expressions
-    private static String formatConstraints(List<PluginDependency> requirements) {
-        if (requirements.isEmpty()) {
-            return "*";
-        }
-        return requirements.stream().map(PluginDependency::getVersion).distinct().reduce((left, right) -> left
-                + ", " + right).orElse("*");
-    }
-
-    /// Produces a dependency-first order and rejects cycles in an otherwise complete assignment.
-    ///
-    /// @param rootPluginId requested root plugin ID
-    /// @param selected complete selected entries indexed by ID
-    /// @return immutable dependency-first plan order
-    /// @throws IOException if the selected dependency graph contains a cycle or incomplete edge
-    private static @Unmodifiable List<PluginInstallPlan.Entry> buildDependencyOrder(
-            String rootPluginId,
-            Map<String, PluginInstallPlan.Entry> selected
-    ) throws IOException {
-        List<PluginInstallPlan.Entry> order = new ArrayList<>();
-        Set<String> visiting = new HashSet<>();
-        Set<String> visited = new HashSet<>();
-        appendDependencyOrder(rootPluginId, selected, visiting, visited, order);
-        return List.copyOf(order);
-    }
-
-    /// Appends one selected entry after recursively appending all of its dependencies.
-    ///
-    /// @param pluginId selected plugin ID
-    /// @param selected complete selected entries indexed by ID
-    /// @param visiting current recursion stack
-    /// @param visited completed plugin IDs
-    /// @param order dependency-first output
-    /// @throws IOException if a cycle or missing selected dependency is found
-    private static void appendDependencyOrder(
-            String pluginId,
-            Map<String, PluginInstallPlan.Entry> selected,
-            Set<String> visiting,
-            Set<String> visited,
-            List<PluginInstallPlan.Entry> order
-    ) throws IOException {
-        if (visited.contains(pluginId)) {
-            return;
-        }
-        if (!visiting.add(pluginId)) {
-            throw new IOException("Cyclic plugin dependency detected at " + pluginId);
-        }
-        @Nullable PluginInstallPlan.Entry entry = selected.get(pluginId);
-        if (entry == null) {
-            throw new IOException("Dependency plan has no selected version for " + pluginId);
-        }
-        for (PluginDependency dependency : entry.getDependencies()) {
-            appendDependencyOrder(dependency.getId(), selected, visiting, visited, order);
-        }
-        visiting.remove(pluginId);
-        visited.add(pluginId);
-        order.add(entry);
-    }
-
-    /// Verifies that an exact requested version belongs to the resolved repository manifest.
-    ///
-    /// @param pluginId plugin ID
-    /// @param manifest repository manifest
-    /// @param requestedVersion requested version metadata
-    /// @return canonical version entry from the manifest
-    /// @throws IOException if the requested version is not published
-    private static PluginStoreManifest.PluginVersionEntry requirePublishedVersion(
-            String pluginId,
-            PluginStoreManifest manifest,
-            PluginStoreManifest.PluginVersionEntry requestedVersion
-    ) throws IOException {
-        @Nullable PluginStoreManifest.PluginVersionEntry published = manifest.getVersion(requestedVersion.getVersion());
-        if (published == null) {
-            throw new IOException("Plugin " + pluginId + " does not publish version " + requestedVersion.getVersion());
-        }
-        return published;
-    }
-
-    /// Ensures selected dependency updates do not break installed plugins outside the plan.
-    ///
-    /// @param installedManifests installed manifests
-    /// @param resolved resolved plan entries
-    /// @throws IOException if an installed reverse dependent would become invalid
-    private static void validateReverseDependents(
-            Map<String, PluginManifest> installedManifests,
-            Map<String, PluginInstallPlan.Entry> resolved
-    ) throws IOException {
-        Map<String, String> effectiveVersions = new HashMap<>();
-        installedManifests.forEach((id, manifest) -> effectiveVersions.put(id, manifest.getVersion()));
-        resolved.forEach((id, entry) -> effectiveVersions.put(id, entry.getVersion()));
-
-        for (PluginManifest installed : installedManifests.values()) {
-            if (installed.getSchemaVersion() < PluginManifest.MIN_EXECUTABLE_SCHEMA_VERSION) {
-                continue;
-            }
-            if (resolved.containsKey(installed.getId())
-                    && resolved.get(installed.getId()).getAction() != PluginInstallPlan.Action.REUSE) {
-                continue;
-            }
-            for (PluginDependency dependency : installed.getPluginDependencies()) {
-                @Nullable String effectiveVersion = effectiveVersions.get(dependency.getId());
-                if (effectiveVersion == null || !dependency.matchesVersion(effectiveVersion)) {
-                    throw new IOException("Installing this plan would break " + installed.getId()
-                            + ": dependency " + dependency.getId() + " " + dependency.getVersion()
-                            + " would resolve to " + (effectiveVersion == null ? "missing" : effectiveVersion));
-                }
-            }
-        }
     }
 
     /// Downloads a package to a temporary file, validates size and SHA-256, then atomically replaces `pluginId.npl`.
@@ -840,7 +448,7 @@ public final class PluginStoreManager {
         long totalBytes = 0;
         byte[] buffer = new byte[8192];
         LOG.info("Downloading plugin " + pluginId + " v" + version.getVersion()
-                + " from " + version.getPackageUrl());
+                + " from " + PluginSourceLabels.diagnosticUrl(version.getPackageUrl()));
 
         @Nullable HttpURLConnection connection = null;
         try {
@@ -997,99 +605,68 @@ public final class PluginStoreManager {
         return PluginVersion.compare(left, right);
     }
 
-    /// Returns whether a plugin is marked as a local favorite.
+    /// Returns the registry URL associated with the currently loaded source.
     ///
-    /// @param pluginId plugin ID
-    /// @return favorite state
-    public boolean isFavorite(String pluginId) {
-        return preferences.isFavorite(pluginId);
-    }
-
-    /// Updates a plugin favorite and persists the change immediately.
-    ///
-    /// @param pluginId plugin ID
-    /// @param favorite desired favorite state
-    public void setFavorite(String pluginId, boolean favorite) {
-        preferences.setFavorite(pluginId, favorite);
-    }
-
-    /// Toggles and returns the resulting favorite state.
-    ///
-    /// @param pluginId plugin ID
-    /// @return resulting favorite state
-    public boolean toggleFavorite(String pluginId) {
-        boolean favorite = !isFavorite(pluginId);
-        setFavorite(pluginId, favorite);
-        return favorite;
-    }
-
-    /// Returns an immutable snapshot of favorite plugin IDs.
-    ///
-    /// @return favorite plugin IDs
-    public @Unmodifiable Set<String> getFavoritePluginIds() {
-        return preferences.getFavoritePluginIds();
-    }
-
-    /// Adds a custom secure registry URL to the source selector.
-    ///
-    /// @param url registry URL
-    /// @throws IllegalArgumentException if the URL violates remote transport policy
-    public void addCustomRegistry(String url) {
-        try {
-            validateRemoteUrl(url, "plugin registry");
-        } catch (IOException exception) {
-            throw new IllegalArgumentException(exception.getMessage(), exception);
-        }
-        if (!registryUrls.contains(url)) {
-            registryUrls.add(url);
-        }
-        preferences.addCustomRegistryUrl(url);
-    }
-
-    /// Adds and loads a registry URL.
-    ///
-    /// @param url registry URL
-    /// @throws IOException if validation or loading fails
-    public void setActiveRegistryUrl(String url) throws IOException {
-        validateRemoteUrl(url, "plugin registry");
-        if (!registryUrls.contains(url)) {
-            registryUrls.add(url);
-            preferences.addCustomRegistryUrl(url);
-        }
-        loadRegistry(url);
-    }
-
-    /// Returns the registry URL currently selected or loaded by this manager.
-    ///
-    /// @return registry URL
+    /// @return loaded source URL
+    /// @throws IllegalStateException if no source has loaded successfully
     public String getRegistryUrl() {
-        return registryUrl;
+        return getSource().getUrl();
     }
 
     /// Returns the currently loaded registry.
     ///
-    /// @return registry or `null`
+    /// @return loaded registry, or `null` before the first successful source load
     public @Nullable PluginStoreRegistry getRegistry() {
-        return registry;
+        @Nullable SourceContext currentContext = context;
+        return currentContext == null ? null : currentContext.registry;
     }
 
-    /// Returns an immutable snapshot of known registry URLs.
+    /// Downloads and caches a bounded UTF-8 README from one source-bound store item.
     ///
-    /// @return registry URLs
-    public @Unmodifiable List<String> getRegistryUrls() {
-        return List.copyOf(registryUrls);
+    /// @param item source-bound item declaring the repository manifest
+    /// @return README Markdown text, or an empty string when no URL is declared
+    /// @throws IOException if transport, URL policy, response status, or size validation fails
+    public String fetchReadme(PluginStoreItem item) throws IOException {
+        if (item.getSourceManager() != this) {
+            throw new IllegalArgumentException("Plugin store item belongs to a different source manager");
+        }
+        @Nullable PluginStoreManifest manifest = item.getManifest();
+        if (manifest == null) {
+            throw new IOException("Plugin store item has no resolved manifest: " + item.getEntry().getId());
+        }
+        @Nullable SourceContext sourceContext = item.getSourceContext();
+        if (sourceContext == null) {
+            throw new IllegalArgumentException("Plugin store item has no source context");
+        }
+        return fetchReadme(sourceContext, manifest);
     }
 
-    /// Downloads and caches a bounded UTF-8 README from the explicit URL in a repository manifest.
+    /// Downloads and caches a bounded UTF-8 README through the legacy explicit-manifest compatibility API.
+    ///
+    /// This overload never uses a loaded source context because a manifest alone cannot prove which source
+    /// produced it. Source-bound callers must use [#fetchReadme(PluginStoreItem)].
     ///
     /// @param manifest plugin repository manifest
     /// @return README Markdown text, or an empty string when no URL is declared
     /// @throws IOException if transport, URL policy, response status, or size validation fails
     public String fetchReadme(PluginStoreManifest manifest) throws IOException {
+        return fetchReadme(null, manifest);
+    }
+
+    /// Downloads and caches a bounded UTF-8 README through one captured context.
+    ///
+    /// @param sourceContext captured source context, or `null` before any source loads
+    /// @param manifest plugin repository manifest
+    /// @return README Markdown text, or an empty string when no URL is declared
+    /// @throws IOException if transport, URL policy, response status, or size validation fails
+    private String fetchReadme(@Nullable SourceContext sourceContext, PluginStoreManifest manifest) throws IOException {
         String readmeUrl = manifest.getReadmeUrl();
         if (readmeUrl.isBlank()) {
             return "";
         }
+        Map<String, String> readmeCache = sourceContext == null
+                ? unloadedReadmeCache
+                : sourceContext.readmeCache;
         @Nullable String cached = readmeCache.get(readmeUrl);
         if (cached != null) {
             return cached;
@@ -1100,10 +677,15 @@ public final class PluginStoreManager {
         return readme;
     }
 
-    /// Clears resolved repository manifests.
+    /// Clears request caches for the currently published source context or the unloaded README compatibility cache.
     public void clearCache() {
-        manifestCache.clear();
-        readmeCache.clear();
+        @Nullable SourceContext currentContext = context;
+        if (currentContext == null) {
+            unloadedReadmeCache.clear();
+            return;
+        }
+        currentContext.manifestCache.clear();
+        currentContext.readmeCache.clear();
     }
 
     /// Enforces HTTPS for remote hosts while allowing loopback HTTP registries used for local development.
@@ -1111,24 +693,24 @@ public final class PluginStoreManager {
     /// @param url URL to validate
     /// @param purpose value used in diagnostics
     /// @throws IOException if the URL is malformed or insecure
-    private static void validateRemoteUrl(String url, String purpose) throws IOException {
+    static void validateRemoteUrl(String url, String purpose) throws IOException {
         final URI uri;
         try {
             uri = new URI(url);
         } catch (URISyntaxException exception) {
-            throw new IOException("Invalid " + purpose + " URL: " + url, exception);
+            throw new IOException("Invalid " + purpose + " URL: " + PluginSourceLabels.diagnosticUrl(url), exception);
         }
         @Nullable String scheme = uri.getScheme();
         @Nullable String host = uri.getHost();
         if (scheme == null || host == null) {
-            throw new IOException("Invalid " + purpose + " URL: " + url);
+            throw new IOException("Invalid " + purpose + " URL: " + PluginSourceLabels.diagnosticUrl(url));
         }
         boolean loopback = host.equalsIgnoreCase("localhost")
                 || host.equals("127.0.0.1")
                 || host.equals("::1")
                 || host.equals("[::1]");
         if (!scheme.equalsIgnoreCase("https") && !(scheme.equalsIgnoreCase("http") && loopback)) {
-            throw new IOException("Insecure " + purpose + " URL is not allowed: " + url);
+            throw new IOException("Insecure " + purpose + " URL is not allowed: " + PluginSourceLabels.diagnosticUrl(url));
         }
     }
 
@@ -1198,7 +780,8 @@ public final class PluginStoreManager {
             try {
                 currentUrl = currentUrl.resolve(new URI(location));
             } catch (IllegalArgumentException | URISyntaxException exception) {
-                throw new IOException("Invalid " + purpose + " redirect URL: " + location, exception);
+                throw new IOException("Invalid " + purpose + " redirect URL: "
+                        + PluginSourceLabels.diagnosticUrl(location), exception);
             }
         }
         throw new IOException(purpose + " has too many redirects");
@@ -1217,7 +800,7 @@ public final class PluginStoreManager {
                 && (!"https".equalsIgnoreCase(redirectUrl.getScheme())
                 || isLoopbackHost(redirectUrl.getHost()))) {
             throw new IOException("Remote " + purpose + " cannot redirect to a local or insecure URL: "
-                    + redirectUrl);
+                    + PluginSourceLabels.diagnosticUrl(redirectUrl.toString()));
         }
     }
 
@@ -1239,7 +822,7 @@ public final class PluginStoreManager {
         try {
             return new URI(url);
         } catch (URISyntaxException exception) {
-            throw new IOException("Invalid " + purpose + " URL: " + url, exception);
+            throw new IOException("Invalid " + purpose + " URL: " + PluginSourceLabels.diagnosticUrl(url), exception);
         }
     }
 

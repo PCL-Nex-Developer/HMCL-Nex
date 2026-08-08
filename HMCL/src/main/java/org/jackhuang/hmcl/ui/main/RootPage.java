@@ -141,6 +141,21 @@ public class RootPage extends DecoratorAnimatedPage implements DecoratorPage {
         return mainPage;
     }
 
+    static final class PluginPopupSelection {
+        private PluginPopupSelection() {
+        }
+
+        static Runnable runAndDismiss(Runnable action, Runnable dismiss) {
+            return () -> {
+                try {
+                    action.run();
+                } finally {
+                    dismiss.run();
+                }
+            };
+        }
+    }
+
     private static class Skin extends DecoratorAnimatedPageSkin<RootPage> {
 
         protected Skin(RootPage control) {
@@ -264,29 +279,30 @@ public class RootPage extends DecoratorAnimatedPage implements DecoratorPage {
         }
 
         private void showPluginPopupMenu(Region pluginItem) {
-            AdvancedListBox menu = new AdvancedListBox()
-                    .addNavigationDrawerItem(i18n("plugin.manage"), SVG.EXTENSION, () -> {
-                        Controllers.getSettingsPage().showPluginManagement();
-                        Controllers.navigate(Controllers.getSettingsPage());
-                    })
-                    .addNavigationDrawerItem(i18n("plugin.store"), SVG.LISTS, () -> {
-                        Controllers.getSettingsPage().showPluginStore();
-                        Controllers.navigate(Controllers.getSettingsPage());
-                    });
+            AdvancedListBox menu = new AdvancedListBox();
+            JFXPopup popup = new JFXPopup(menu);
+            menu.addNavigationDrawerItem(i18n("plugin.manage"), SVG.EXTENSION, PluginPopupSelection.runAndDismiss(() -> {
+                Controllers.getSettingsPage().showPluginManagement();
+                Controllers.navigate(Controllers.getSettingsPage());
+            }, popup::hide));
+            menu.addNavigationDrawerItem(i18n("plugin.store"), SVG.LISTS, PluginPopupSelection.runAndDismiss(() -> {
+                Controllers.getSettingsPage().showPluginStore();
+                Controllers.navigate(Controllers.getSettingsPage());
+            }, popup::hide));
 
             // Add plugin-contributed sidebar items
             List<PluginUIRegistry.SidebarItem> pluginItems = PluginUIRegistry.getSidebarItems();
             if (!pluginItems.isEmpty()) {
                 menu.startCategory(i18n("plugin").toUpperCase(Locale.ROOT));
                 for (PluginUIRegistry.SidebarItem item : pluginItems) {
-                    menu.addNavigationDrawerItem(item.getTitle(), SVG.EXTENSION_FILL, item.getOnAction());
+                    menu.addNavigationDrawerItem(item.getTitle(), SVG.EXTENSION_FILL,
+                            PluginPopupSelection.runAndDismiss(item.getOnAction(), popup::hide));
                 }
             }
 
             menu.getStyleClass().add("popup-menu-content");
             FXUtils.setLimitWidth(menu, 220);
 
-            JFXPopup popup = new JFXPopup(menu);
             popup.show(pluginItem,
                     JFXPopup.PopupVPosition.TOP,
                     JFXPopup.PopupHPosition.LEFT,
