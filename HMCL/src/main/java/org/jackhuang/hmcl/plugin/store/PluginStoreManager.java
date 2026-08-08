@@ -161,7 +161,7 @@ public final class PluginStoreManager {
     /// @throws IOException if transport, parsing, URL policy, or validation fails
     private PluginStoreRegistry loadRegistryForRequest(String registryUrl) throws IOException {
         validateRemoteUrl(registryUrl, "plugin registry");
-        LOG.info("Loading plugin registry from: " + registryUrl);
+        LOG.info("Loading plugin registry from: " + PluginSourceLabels.diagnosticUrl(registryUrl));
         try {
             String content = fetchBoundedUtf8(registryUrl, "plugin registry", MAX_REGISTRY_BYTES);
             @Nullable PluginStoreRegistry loadedRegistry = JsonUtils.GSON.fromJson(
@@ -169,7 +169,7 @@ public final class PluginStoreManager {
                     PluginStoreRegistry.class
             );
             if (loadedRegistry == null) {
-                throw new IOException("Empty plugin registry: " + registryUrl);
+                throw new IOException("Empty plugin registry: " + PluginSourceLabels.diagnosticUrl(registryUrl));
             }
             loadedRegistry.validate();
             for (PluginStoreRegistry.PluginStoreEntry entry : loadedRegistry.getPlugins()) {
@@ -227,12 +227,12 @@ public final class PluginStoreManager {
         }
 
         validateRemoteUrl(manifestUrl, "plugin manifest");
-        LOG.info("Fetching plugin manifest from: " + manifestUrl);
+        LOG.info("Fetching plugin manifest from: " + PluginSourceLabels.diagnosticUrl(manifestUrl));
         try {
             String content = fetchBoundedUtf8(manifestUrl, "plugin manifest", MAX_STORE_MANIFEST_BYTES);
             @Nullable PluginStoreManifest manifest = JsonUtils.GSON.fromJson(content, PluginStoreManifest.class);
             if (manifest == null) {
-                throw new IOException("Empty plugin manifest: " + manifestUrl);
+                throw new IOException("Empty plugin manifest: " + PluginSourceLabels.diagnosticUrl(manifestUrl));
             }
             manifest.validate(pluginId);
             for (PluginStoreManifest.PluginVersionEntry version : manifest.getVersions()) {
@@ -266,7 +266,7 @@ public final class PluginStoreManager {
                         sourceContext
                 ));
             } catch (IOException exception) {
-                LOG.warning("Failed to load plugin manifest: " + entry.getId(), exception);
+                LOG.warning("Failed to load plugin manifest: " + entry.getId());
                 items.add(new PluginStoreItem(
                         sourceContext.source,
                         sourceContext.registry,
@@ -448,7 +448,7 @@ public final class PluginStoreManager {
         long totalBytes = 0;
         byte[] buffer = new byte[8192];
         LOG.info("Downloading plugin " + pluginId + " v" + version.getVersion()
-                + " from " + version.getPackageUrl());
+                + " from " + PluginSourceLabels.diagnosticUrl(version.getPackageUrl()));
 
         @Nullable HttpURLConnection connection = null;
         try {
@@ -698,19 +698,19 @@ public final class PluginStoreManager {
         try {
             uri = new URI(url);
         } catch (URISyntaxException exception) {
-            throw new IOException("Invalid " + purpose + " URL: " + url, exception);
+            throw new IOException("Invalid " + purpose + " URL: " + PluginSourceLabels.diagnosticUrl(url), exception);
         }
         @Nullable String scheme = uri.getScheme();
         @Nullable String host = uri.getHost();
         if (scheme == null || host == null) {
-            throw new IOException("Invalid " + purpose + " URL: " + url);
+            throw new IOException("Invalid " + purpose + " URL: " + PluginSourceLabels.diagnosticUrl(url));
         }
         boolean loopback = host.equalsIgnoreCase("localhost")
                 || host.equals("127.0.0.1")
                 || host.equals("::1")
                 || host.equals("[::1]");
         if (!scheme.equalsIgnoreCase("https") && !(scheme.equalsIgnoreCase("http") && loopback)) {
-            throw new IOException("Insecure " + purpose + " URL is not allowed: " + url);
+            throw new IOException("Insecure " + purpose + " URL is not allowed: " + PluginSourceLabels.diagnosticUrl(url));
         }
     }
 
@@ -780,7 +780,8 @@ public final class PluginStoreManager {
             try {
                 currentUrl = currentUrl.resolve(new URI(location));
             } catch (IllegalArgumentException | URISyntaxException exception) {
-                throw new IOException("Invalid " + purpose + " redirect URL: " + location, exception);
+                throw new IOException("Invalid " + purpose + " redirect URL: "
+                        + PluginSourceLabels.diagnosticUrl(location), exception);
             }
         }
         throw new IOException(purpose + " has too many redirects");
@@ -799,7 +800,7 @@ public final class PluginStoreManager {
                 && (!"https".equalsIgnoreCase(redirectUrl.getScheme())
                 || isLoopbackHost(redirectUrl.getHost()))) {
             throw new IOException("Remote " + purpose + " cannot redirect to a local or insecure URL: "
-                    + redirectUrl);
+                    + PluginSourceLabels.diagnosticUrl(redirectUrl.toString()));
         }
     }
 
@@ -821,7 +822,7 @@ public final class PluginStoreManager {
         try {
             return new URI(url);
         } catch (URISyntaxException exception) {
-            throw new IOException("Invalid " + purpose + " URL: " + url, exception);
+            throw new IOException("Invalid " + purpose + " URL: " + PluginSourceLabels.diagnosticUrl(url), exception);
         }
     }
 

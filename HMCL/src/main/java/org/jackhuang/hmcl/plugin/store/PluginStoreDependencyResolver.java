@@ -319,6 +319,7 @@ public final class PluginStoreDependencyResolver {
                     installed,
                     null,
                     null,
+                    null,
                     null
             ));
         }
@@ -385,13 +386,12 @@ public final class PluginStoreDependencyResolver {
         return manifest;
     }
 
-    /// Returns the source alias when configured, otherwise its remote registry display name.
+    /// Returns a credential-safe source label for dependency diagnostics and install plans.
     ///
     /// @param item item bound to one source
     /// @return human-readable source name
     private static String getSourceDisplayName(PluginStoreItem item) {
-        @Nullable String alias = item.getSource().getAlias();
-        return alias == null ? item.getRegistry().getName() : alias;
+        return PluginSourceLabels.displayName(item.getSource(), item.getRegistry().getName());
     }
 
     /// Creates a downloadable plan entry for an exact remote version.
@@ -419,6 +419,7 @@ public final class PluginStoreDependencyResolver {
                 installed,
                 item.getSource().getId(),
                 getSourceDisplayName(item),
+                PluginSourceProvenance.from(item.getSource()),
                 item.getSourceManager()
         );
     }

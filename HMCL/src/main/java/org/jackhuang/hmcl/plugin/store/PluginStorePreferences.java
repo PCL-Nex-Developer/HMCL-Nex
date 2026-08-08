@@ -20,6 +20,7 @@ package org.jackhuang.hmcl.plugin.store;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import org.jackhuang.hmcl.util.StringUtils;
+import org.jackhuang.hmcl.util.function.ExceptionalRunnable;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -69,6 +70,9 @@ public final class PluginStorePreferences implements PluginSourceRepository {
 
     /// Sources in persisted priority order.
     private final List<PluginSource> sources = new ArrayList<>();
+
+    /// Monotonic in-process revision advanced after every successfully persisted source mutation.
+    private long sourceRevision;
 
     /// Loads preferences from the supplied launcher-local home.
     ///
@@ -241,7 +245,7 @@ public final class PluginStorePreferences implements PluginSourceRepository {
                         migrated.add(new PluginSource(newSourceId(migrated), registryUrl, null, true, false));
                     }
                 } catch (IOException exception) {
-                    LOG.warning("Ignoring invalid persisted plugin registry: " + registryUrl, exception);
+                    LOG.warning("Ignoring invalid persisted plugin registry: " + migrationDiagnostic(registryUrl));
                 }
             }
         }
@@ -256,10 +260,26 @@ public final class PluginStorePreferences implements PluginSourceRepository {
                     }
                 }
             } catch (IOException exception) {
-                LOG.warning("Ignoring invalid active plugin registry: " + state.activeRegistryUrl, exception);
+                LOG.warning("Ignoring invalid active plugin registry: " + migrationDiagnostic(state.activeRegistryUrl));
             }
         }
         return migrated;
+    }
+
+    /// Returns a credential-safe legacy migration diagnostic without including exception messages.
+    ///
+    /// @param registryUrl legacy configured registry URL
+    /// @return credential-free URI diagnostic or a generic safe marker
+    static String migrationDiagnostic(String registryUrl) {
+        try {
+            URI uri = new URI(registryUrl);
+            if (StringUtils.isBlank(uri.getScheme()) || StringUtils.isBlank(uri.getHost())) {
+                return "invalid plugin registry";
+            }
+            return PluginSourceLabels.diagnosticUrl(registryUrl);
+        } catch (URISyntaxException exception) {
+            return "invalid plugin registry";
+        }
     }
 
     /// Writes a version-two replacement while retaining a legacy backup until publication succeeds.
@@ -309,6 +329,14 @@ public final class PluginStorePreferences implements PluginSourceRepository {
     @Override
     public synchronized @Unmodifiable List<PluginSource> getSources() {
         return List.copyOf(sources);
+    }
+
+    /// Returns sources and their monotonic configuration revision as one atomic snapshot.
+    ///
+    /// @return immutable revision-bearing source configuration
+    @Override
+    public synchronized PluginSourceConfiguration getSourceConfiguration() {
+        return new PluginSourceConfiguration(sourceRevision, sources);
     }
 
     /// Adds an enabled custom registry source.
@@ -436,9 +464,13 @@ public final class PluginStorePreferences implements PluginSourceRepository {
     /// @throws IOException if the disk replacement fails
     private synchronized @Unmodifiable List<PluginSource> persistSources(List<PluginSource> candidate) throws IOException {
         validateSources(candidate);
+        if (PluginStoreSnapshot.matchesSourceConfigurations(candidate, sources)) {
+            return List.copyOf(sources);
+        }
         save(candidate, favoritePluginIds);
         sources.clear();
         sources.addAll(candidate);
+        sourceRevision++;
         return List.copyOf(sources);
     }
 
@@ -463,7 +495,9 @@ public final class PluginStorePreferences implements PluginSourceRepository {
                     throw new IllegalArgumentException("Plugin source URLs must be unique");
                 }
             } catch (IOException exception) {
-                throw new IllegalArgumentException("Invalid plugin source URL: " + source.getUrl(), exception);
+                throw new IllegalArgumentException(
+                        "Invalid plugin source URL: " + PluginSourceLabels.diagnosticUrl(source.getUrl())
+                );
             }
             if (source.isOfficial()) {
                 if (!PluginSource.OFFICIAL_ID.equals(source.getId())
@@ -571,7 +605,7 @@ public final class PluginStorePreferences implements PluginSourceRepository {
                 addSource(registryUrl, null);
             }
         } catch (IOException exception) {
-            LOG.warning("Failed to save custom plugin registry", exception);
+            LOG.warning("Failed to save custom plugin registry");
         }
     }
 
@@ -595,8 +629,28 @@ public final class PluginStorePreferences implements PluginSourceRepository {
             reorderedIds.add(0, active.getId());
             reorder(reorderedIds);
         } catch (IOException exception) {
-            LOG.warning("Failed to persist active plugin registry", exception);
+            LOG.warning("Failed to persist active plugin registry");
         }
+    }
+
+    /// Runs publication while holding the same monitor used by every source mutation.
+    ///
+    /// @param expectedConfiguration revision-bearing source configuration that selected the operation
+    /// @param action publication action that must not race a source mutation
+    /// @throws IOException if the expected configuration is stale or publication fails
+    @Override
+    public synchronized void executeIfSourcesMatch(
+            PluginSourceConfiguration expectedConfiguration,
+            ExceptionalRunnable<IOException> action
+    ) throws IOException {
+        if (expectedConfiguration.getRevision() != sourceRevision
+                || !PluginStoreSnapshot.matchesSourceConfigurations(
+                        expectedConfiguration.getSources(),
+                        sources
+                )) {
+            throw new IOException("Plugin source configuration changed");
+        }
+        action.run();
     }
 
     /// Returns whether the supplied plugin is a user favorite.

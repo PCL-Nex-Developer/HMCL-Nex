@@ -100,18 +100,30 @@ public final class PluginStoreAggregator implements AutoCloseable {
     /// @param sources configured source priority order
     /// @return future completing with the requested generation's aggregate snapshot
     public CompletableFuture<PluginStoreSnapshot> refresh(@Unmodifiable List<PluginSource> sources) {
+        return refresh(new PluginSourceConfiguration(0, sources));
+    }
+
+    /// Starts a priority-ordered refresh for one atomic repository source configuration.
+    ///
+    /// @param configuration revision-bearing configured source priority order
+    /// @return future completing with the requested generation's aggregate snapshot
+    public CompletableFuture<PluginStoreSnapshot> refresh(PluginSourceConfiguration configuration) {
         long requestGeneration;
         synchronized (publicationLock) {
             requestGeneration = generation.incrementAndGet();
         }
-        List<PluginSource> sourceSnapshot = List.copyOf(sources);
+        List<PluginSource> sourceSnapshot = configuration.getSources();
         List<CompletableFuture<PluginSourceLoadResult>> requests = sourceSnapshot.stream()
                 .map(source -> source.isEnabled()
                         ? CompletableFuture.supplyAsync(() -> load(source), executor)
                         : CompletableFuture.completedFuture(PluginSourceLoadResult.disabled(source)))
                 .toList();
         return CompletableFuture.allOf(requests.toArray(CompletableFuture[]::new))
-                .thenApply(ignored -> publishIfCurrent(requestGeneration, requests));
+                .thenApply(ignored -> publishIfCurrent(
+                        requestGeneration,
+                        configuration.getRevision(),
+                        requests
+                ));
     }
 
     /// Loads one enabled source while preventing an individual I/O failure from failing the aggregate refresh.
@@ -174,14 +186,17 @@ public final class PluginStoreAggregator implements AutoCloseable {
     /// Builds a completed snapshot and publishes it only when no newer request has begun.
     ///
     /// @param requestGeneration generation for the completing request
+    /// @param sourceRevision repository source revision captured for the request
     /// @param requests completed ordered source-result futures
     /// @return computed snapshot for this request, whether stale or current
     private PluginStoreSnapshot publishIfCurrent(
             long requestGeneration,
+            long sourceRevision,
             List<CompletableFuture<PluginSourceLoadResult>> requests
     ) {
         PluginStoreSnapshot snapshot = new PluginStoreSnapshot(
                 requestGeneration,
+                sourceRevision,
                 requests.stream().map(CompletableFuture::join).toList()
         );
         synchronized (publicationLock) {

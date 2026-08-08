@@ -213,8 +213,11 @@ public final class PluginInstallPlan {
         /// Stable identifier of the source that selected a downloadable package.
         private final @Nullable String sourceId;
 
-        /// Human-readable name of the source that selected a downloadable package.
+        /// Human-readable cosmetic name of the source that selected a downloadable package.
         private final @Nullable String sourceDisplayName;
+
+        /// Immutable security provenance of the source that selected a downloadable package.
+        private final @Nullable PluginSourceProvenance sourceProvenance;
 
         /// Source-scoped manager that must download a downloadable package.
         private final @Nullable PluginStoreManager sourceManager;
@@ -229,7 +232,8 @@ public final class PluginInstallPlan {
         /// @param remoteVersion remote metadata or `null` for a reused installed plugin
         /// @param installedManifest previous installed manifest or `null`
         /// @param sourceId selected source ID or `null` for a reused installed plugin
-        /// @param sourceDisplayName selected source display name or `null` for a reused installed plugin
+        /// @param sourceDisplayName selected cosmetic source name or `null` for a reused installed plugin
+        /// @param sourceProvenance selected immutable security provenance or `null` for a reused installed plugin
         /// @param sourceManager selected source manager or `null` for a reused installed plugin
         Entry(
                 String pluginId,
@@ -241,6 +245,7 @@ public final class PluginInstallPlan {
                 @Nullable PluginManifest installedManifest,
                 @Nullable String sourceId,
                 @Nullable String sourceDisplayName,
+                @Nullable PluginSourceProvenance sourceProvenance,
                 @Nullable PluginStoreManager sourceManager
         ) {
             this.pluginId = pluginId;
@@ -252,10 +257,17 @@ public final class PluginInstallPlan {
             this.installedManifest = installedManifest;
             this.sourceId = sourceId;
             this.sourceDisplayName = sourceDisplayName;
+            this.sourceProvenance = sourceProvenance;
             this.sourceManager = sourceManager;
 
-            boolean hasCompleteSource = sourceId != null && sourceDisplayName != null && sourceManager != null;
-            boolean hasNoSource = sourceId == null && sourceDisplayName == null && sourceManager == null;
+            boolean hasCompleteSource = sourceId != null
+                    && sourceDisplayName != null
+                    && sourceProvenance != null
+                    && sourceManager != null;
+            boolean hasNoSource = sourceId == null
+                    && sourceDisplayName == null
+                    && sourceProvenance == null
+                    && sourceManager == null;
             if (requiresDownload() && !hasCompleteSource) {
                 throw new IllegalArgumentException("Downloadable plan entry has no complete source: " + pluginId);
             }
@@ -337,11 +349,31 @@ public final class PluginInstallPlan {
             return sourceId;
         }
 
-        /// Returns the selected source's human-readable display name for a downloadable package.
+        /// Returns the selected source's human-readable cosmetic name for a downloadable package.
+        ///
+        /// This value must not be used for security decisions because local aliases and registry names are mutable.
         ///
         /// @return source display name or `null` for a reused artifact
         public @Nullable String getSourceDisplayName() {
             return sourceDisplayName;
+        }
+
+        /// Returns immutable selected-source security provenance for a downloadable package.
+        ///
+        /// @return source provenance or `null` for a reused artifact
+        public @Nullable PluginSourceProvenance getSourceProvenance() {
+            return sourceProvenance;
+        }
+
+        /// Returns immutable security provenance required by a downloadable package.
+        ///
+        /// @return source provenance for an installation or update
+        /// @throws IllegalStateException if this entry reuses an installed artifact
+        public PluginSourceProvenance requireSourceProvenance() {
+            if (!requiresDownload() || sourceProvenance == null) {
+                throw new IllegalStateException("Plan entry has no downloadable source provenance: " + pluginId);
+            }
+            return sourceProvenance;
         }
 
         /// Returns the source-scoped manager for a downloadable package.

@@ -17,6 +17,7 @@
  */
 package org.jackhuang.hmcl.plugin.store;
 
+import org.jackhuang.hmcl.util.function.ExceptionalRunnable;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
@@ -32,6 +33,11 @@ public interface PluginSourceRepository {
     ///
     /// @return immutable source snapshot
     @Unmodifiable List<PluginSource> getSources();
+
+    /// Returns sources and their monotonic configuration revision as one atomic snapshot.
+    ///
+    /// @return immutable revision-bearing source configuration
+    PluginSourceConfiguration getSourceConfiguration();
 
     /// Adds an enabled custom registry source.
     ///
@@ -78,6 +84,18 @@ public interface PluginSourceRepository {
     /// @return immutable persisted source snapshot
     /// @throws IOException if validation or persistence fails
     @Unmodifiable List<PluginSource> reorder(@Unmodifiable List<String> sourceIds) throws IOException;
+
+    /// Runs publication only while this repository still holds the expected revision and exact source values.
+    ///
+    /// Implementations must hold the same lock used by source mutations across both comparison and action.
+    ///
+    /// @param expectedConfiguration revision-bearing source configuration that selected the operation
+    /// @param action publication action that must not race a source mutation
+    /// @throws IOException if the expected configuration is stale or publication fails
+    void executeIfSourcesMatch(
+            PluginSourceConfiguration expectedConfiguration,
+            ExceptionalRunnable<IOException> action
+    ) throws IOException;
 
     /// Returns whether one plugin is a local favorite.
     ///

@@ -22,8 +22,6 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.List;
 import java.util.Objects;
 import java.util.regex.Matcher;
@@ -223,7 +221,7 @@ public final class PluginSourceLoadResult {
         return failure;
     }
 
-    /// Returns a compact failure message with URL credentials and query strings removed.
+    /// Returns a compact failure message without URL user information, paths, queries, or fragments.
     ///
     /// @return credential-safe source failure message, or `null` if the source did not fail
     public @Nullable String getFailureMessage() {
@@ -237,7 +235,7 @@ public final class PluginSourceLoadResult {
         return status == Status.SUCCESS || status == Status.PARTIAL_FAILURE;
     }
 
-    /// Builds a display-safe message without retaining URL user information or complete query strings.
+    /// Builds a display-safe message without retaining URL user information, paths, queries, or fragments.
     ///
     /// @param failure full source failure
     /// @return compact sanitized failure message
@@ -255,36 +253,12 @@ public final class PluginSourceLoadResult {
         return sanitized.toString();
     }
 
-    /// Removes a URL's user-info, query, and fragment while preserving a concise host and path diagnostic.
+    /// Removes a URL's user information, path, query, and fragment.
     ///
     /// @param url URL found in a failure message
-    /// @return URL-safe diagnostic text
+    /// @return URL-safe origin or generic diagnostic text
     private static String sanitizeUrl(String url) {
-        try {
-            URI uri = new URI(url);
-            return new URI(uri.getScheme(), null, uri.getHost(), uri.getPort(), uri.getPath(), null, null).toString();
-        } catch (URISyntaxException exception) {
-            int queryIndex = url.indexOf('?');
-            int fragmentIndex = url.indexOf('#');
-            int suffixIndex = earliestIndex(queryIndex, fragmentIndex);
-            String withoutSensitiveSuffix = suffixIndex < 0 ? url : url.substring(0, suffixIndex);
-            int credentialsIndex = withoutSensitiveSuffix.indexOf('@');
-            int schemeIndex = withoutSensitiveSuffix.indexOf("://");
-            return credentialsIndex > schemeIndex ? withoutSensitiveSuffix.substring(0, schemeIndex + 3)
-                    + withoutSensitiveSuffix.substring(credentialsIndex + 1) : withoutSensitiveSuffix;
-        }
-    }
-
-    /// Returns the earliest non-negative index, or `-1` when neither candidate is present.
-    ///
-    /// @param first first optional index
-    /// @param second second optional index
-    /// @return earliest present index
-    private static int earliestIndex(int first, int second) {
-        if (first < 0) {
-            return second;
-        }
-        return second < 0 ? first : Math.min(first, second);
+        return PluginSourceLabels.diagnosticUrl(url);
     }
 
     /// Enumerates every explicit outcome of one source refresh request.

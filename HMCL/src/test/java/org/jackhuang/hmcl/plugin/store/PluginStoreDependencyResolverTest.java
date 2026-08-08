@@ -81,6 +81,9 @@ public final class PluginStoreDependencyResolverTest {
                 null,
                 "test",
                 "Test Source",
+                PluginSourceProvenance.from(new PluginSource(
+                        "test", "https://test.example.test/registry.json", "Test Source", true, false
+                )),
                 new PluginStoreManager()
         );
         PluginInstallPlan.Entry unchangedUpdate = new PluginInstallPlan.Entry(
@@ -93,6 +96,9 @@ public final class PluginStoreDependencyResolverTest {
                 unchangedInstalled,
                 "test",
                 "Test Source",
+                PluginSourceProvenance.from(new PluginSource(
+                        "test", "https://test.example.test/registry.json", "Test Source", true, false
+                )),
                 new PluginStoreManager()
         );
         PluginInstallPlan.Entry emptyUpdate = new PluginInstallPlan.Entry(
@@ -105,6 +111,9 @@ public final class PluginStoreDependencyResolverTest {
                 emptyInstalled,
                 "test",
                 "Test Source",
+                PluginSourceProvenance.from(new PluginSource(
+                        "test", "https://test.example.test/registry.json", "Test Source", true, false
+                )),
                 new PluginStoreManager()
         );
         PluginInstallPlan.Entry reuse = new PluginInstallPlan.Entry(
@@ -115,6 +124,7 @@ public final class PluginStoreDependencyResolverTest {
                 null,
                 null,
                 reusedInstalled,
+                null,
                 null,
                 null,
                 null
@@ -151,6 +161,58 @@ public final class PluginStoreDependencyResolverTest {
         assertEquals(List.of(installation, unchangedUpdate, emptyUpdate), plan.getPermissionReviewEntries());
         assertEquals(List.of(PluginPermission.NETWORK), unchangedUpdate.getPermissions());
         assertTrue(emptyUpdate.getPermissions().isEmpty());
+    }
+
+    /// Sanitizes hostile aliases and remote registry names in install-plan source labels and dependency diagnostics.
+    @Test
+    public void sourceLabelsInPlansAndDependencyDiagnosticsNeverExposeCredentials() throws Exception {
+        String rootId = "dev.test.root";
+        String dependencyId = "dev.test.dependency";
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        server.createContext("/registry", exchange -> respond(exchange, """
+                {
+                  "schemaVersion": 1,
+                  "name": "https://user:secret@host/catalog?token=secret#fragment",
+                  "plugins": [
+                    {"id":"%s","name":"Root","manifestUrl":"%s/root"},
+                    {"id":"%s","name":"Dependency","manifestUrl":"%s/dependency"}
+                  ]
+                }
+                """.formatted(rootId, baseUrl, dependencyId, baseUrl)));
+        server.createContext("/root", exchange -> respond(exchange, repositoryManifest(
+                rootId,
+                version(baseUrl, "root", "1.0.0", "1", """
+                        [{"id":"%s","version":">=2.0.0"}]
+                        """.formatted(dependencyId))
+        )));
+        server.createContext("/dependency", exchange -> respond(exchange, repositoryManifest(
+                dependencyId, version(baseUrl, "dependency", "1.0.0", "2", "[]")
+        )));
+        server.start();
+
+        try (PluginStoreAggregator aggregator = new PluginStoreAggregator()) {
+            PluginSource source = new PluginSource(
+                    "hostile",
+                    baseUrl + "/registry",
+                    "https://user:secret@host/catalog?token=secret#fragment",
+                    true,
+                    false
+            );
+            PluginStoreSnapshot snapshot = aggregator.refresh(List.of(source)).get();
+            PluginStoreItem root = Objects.requireNonNull(snapshot.getWinningItems().get(rootId));
+            PluginStoreManifest.PluginVersionEntry rootVersion = Objects.requireNonNull(
+                    Objects.requireNonNull(root.getManifest()).getVersion("1.0.0")
+            );
+            PluginStoreDependencyResolver resolver = new PluginStoreDependencyResolver(snapshot.getWinningItems());
+            IOException failure = assertThrows(IOException.class, () -> resolver.resolveInstallPlan(
+                    rootId, rootVersion, Map.of(), Map.of(), Map.of()
+            ));
+
+            assertSafeSourceText(Objects.requireNonNull(failure.getMessage()));
+        } finally {
+            server.stop(0);
+        }
     }
 
     /// Rejects a conflict candidate when the selected catalog winner cannot satisfy a dependency constraint.
@@ -279,9 +341,13 @@ public final class PluginStoreDependencyResolverTest {
             PluginInstallPlan.Entry installedRoot = installPlan.getRootEntry();
             assertEquals(dependencySource.getId(), installedDependency.getSourceId());
             assertEquals("Dependency Alias", installedDependency.getSourceDisplayName());
+            assertFalse(installedDependency.requireSourceProvenance().isOfficial());
+            assertEquals("127.0.0.1", installedDependency.requireSourceProvenance().getHostIdentity());
             assertSame(dependency.getSourceManager(), installedDependency.requireSourceManager());
             assertEquals(rootSource.getId(), installedRoot.getSourceId());
             assertEquals("Root Alias", installedRoot.getSourceDisplayName());
+            assertFalse(installedRoot.requireSourceProvenance().isOfficial());
+            assertEquals("127.0.0.1", installedRoot.requireSourceProvenance().getHostIdentity());
             assertSame(root.getSourceManager(), installedRoot.requireSourceManager());
 
             PluginManifest outdatedDependencyManifest = packageManifest(dependencyId, "0.9.0", "[]");
@@ -324,7 +390,9 @@ public final class PluginStoreDependencyResolverTest {
             assertEquals(PluginInstallPlan.Action.REUSE, reusedDependency.getAction());
             assertNull(reusedDependency.getSourceId());
             assertNull(reusedDependency.getSourceDisplayName());
+            assertNull(reusedDependency.getSourceProvenance());
             assertNull(reusedDependency.getSourceManager());
+            assertThrows(IllegalStateException.class, reusedDependency::requireSourceProvenance);
             assertThrows(IllegalStateException.class, reusedDependency::requireSourceManager);
             assertEquals(rootSource.getId(), updatedRoot.getSourceId());
             assertEquals("Root Alias", updatedRoot.getSourceDisplayName());
@@ -909,6 +977,17 @@ public final class PluginStoreDependencyResolverTest {
                   "dependencies": %s
                 }
                 """.formatted(pluginId, pluginId, pluginVersion, dependenciesJson)));
+    }
+
+    /// Asserts that source text cannot disclose a credential-bearing hostile label.
+    ///
+    /// @param text source-derived text shown to a user
+    private static void assertSafeSourceText(String text) {
+        assertTrue(text.contains("127.0.0.1"));
+        assertTrue(!text.contains("secret"));
+        assertTrue(!text.contains("token"));
+        assertTrue(!text.contains("#fragment"));
+        assertTrue(!text.contains("https://user:"));
     }
 
     /// Writes a UTF-8 JSON response for one local repository route.
