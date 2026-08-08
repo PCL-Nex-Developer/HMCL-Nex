@@ -143,6 +143,16 @@
         <property name="files" value=".*[\\/]org[\\/]jackhuang[\\/]hmcl[\\/]ui[\\/]game[\\/]GameSettingsPage.java"/>
     </module>
 
+    <module name="SuppressionSingleFilter">
+        <property name="checks" value="FileLength"/>
+        <property name="files" value=".*[\\/]org[\\/]jackhuang[\\/]hmcl[\\/]plugin[\\/]PluginManager.java"/>
+    </module>
+
+    <module name="SuppressionSingleFilter">
+        <property name="checks" value="FileLength"/>
+        <property name="files" value=".*[\\/]org[\\/]jackhuang[\\/]hmcl[\\/]ui[\\/]main[\\/]PluginStorePage.java"/>
+    </module>
+
     <module name="RegexpHeader">
         <property name="headerFile" value="${licenseHeaderFile}"/>
         <property name="charset" value="UTF-8"/>
