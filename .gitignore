@@ -71,7 +71,12 @@ language-subtag-registry
 /HMCL/.hmcl/
 
 # AI
+/.claude/
 /.gemini/
 !/.gemini/config.yaml
 .codex
+.omc/
 /.gradle-*/
+
+# Local launcher artifacts
+/HMCL-*.jar
