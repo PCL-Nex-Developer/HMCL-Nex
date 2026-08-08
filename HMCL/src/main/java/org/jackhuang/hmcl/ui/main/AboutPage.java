@@ -52,19 +52,25 @@ public final class AboutPage extends SpinnerPane {
 
         ComponentList about = new ComponentList();
         {
-            var launcher = LineButton.createExternalLinkButton(Metadata.PUBLISH_URL);
+            var launcher = LineButton.createExternalLinkButton("https://github.com/PCL-Nex-Developer/HMCL-Nex");
             launcher.setLargeTitle(true);
             launcher.setLeading(FXUtils.newBuiltinImage("/assets/img/icon.png"));
-            launcher.setTitle("Hello Minecraft! Launcher");
+            launcher.setTitle("HMCL Nex");
             launcher.setSubtitle(Metadata.VERSION);
 
-            var author = LineButton.createExternalLinkButton("https://space.bilibili.com/1445341");
-            author.setLargeTitle(true);
-            author.setLeading(FXUtils.newBuiltinImage("/assets/img/yellow_fish.png"));
-            author.setTitle("huanghongxun");
-            author.setSubtitle(i18n("about.author.statement"));
+            var author1 = LineButton.createExternalLinkButton("https://github.com/AnxunBCX");
+            author1.setLargeTitle(true);
+            author1.setLeading(FXUtils.newBuiltinImage("/assets/img/anxunbcx.png"));
+            author1.setTitle("AnxunBCX");
+            author1.setSubtitle("GitHub @AnxunBCX");
 
-            about.getContent().setAll(launcher, author);
+            var author2 = LineButton.createExternalLinkButton("https://github.com/XueL1ng");
+            author2.setLargeTitle(true);
+            author2.setLeading(FXUtils.newBuiltinImage("/assets/img/xuel1ng.png"));
+            author2.setTitle("XueL1ng");
+            author2.setSubtitle("GitHub @XueL1ng");
+
+            about.getContent().setAll(launcher, author1, author2);
         }
 
         ComponentList thanks = loadIconedTwoLineList("/assets/about/thanks.json");
