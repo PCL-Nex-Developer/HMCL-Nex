@@ -30,8 +30,10 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
+import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -49,7 +51,7 @@ public final class PluginSourceManagementPageTest {
         assertEquals("My plugins", PluginSourceManagementPage.displayName(source, "Remote"));
         assertEquals("Remote", PluginSourceManagementPage.displayName(
                 source.withConfiguration(source.getUrl(), null), "Remote"));
-        assertEquals("plugins.example.org / plugins.json",
+        assertEquals("plugins.example.org",
                 PluginSourceManagementPage.displayName(
                         source.withConfiguration(source.getUrl(), null), null));
     }
@@ -66,6 +68,72 @@ public final class PluginSourceManagementPageTest {
         );
         assertEquals(Set.of(PluginSourceManagementPage.Action.TEST, PluginSourceManagementPage.Action.DETAILS),
                 PluginSourceManagementPage.secondaryActions(official));
+    }
+
+    /// Replaces hostile aliases and remote registry names throughout compact rows and accessibility text.
+    @Test
+    public void compactRowsAndAccessibilitySanitizeHostileSourceLabels() {
+        PluginSource source = new PluginSource(
+                "source_one",
+                "https://user:secret@plugins.example.org/catalog/plugins.json?token=secret#fragment",
+                "https://user:secret@host/catalog?token=secret#fragment",
+                true,
+                false
+        );
+        String hostileRemoteName = "https://user:secret@host/catalog?token=secret#fragment";
+        PluginSourceManagementPage.SourceRow row = PluginSourceManagementPage.sourceRow(source, hostileRemoteName, null);
+        String accessibleText = PluginSourceManagementPage.sourceRowAccessibleText(
+                PluginSourceManagementPage.accessibleSourceName(1, row.title()), row);
+
+        assertEquals("plugins.example.org", row.title());
+        assertFalse(row.subtitle().contains("secret"));
+        assertFalse(row.subtitle().contains("token"));
+        assertFalse(accessibleText.contains("secret"));
+        assertFalse(accessibleText.contains("token"));
+        assertFalse(accessibleText.contains("#fragment"));
+    }
+
+    /// Limits full URL disclosure to the configured source URL, never hostile aliases or remote registry names.
+    @Test
+    public void detailsAndPreviewSanitizeHostileAliasAndRegistryName() {
+        PluginSource source = new PluginSource(
+                "source_one",
+                "https://configured.example.org/catalog.json",
+                "https://user:alias-secret@host.example/catalog?token=alias-secret#fragment",
+                true,
+                false
+        );
+        String remoteName = "https://user:remote-secret@host.example/catalog?token=remote-secret#fragment";
+        String hostileDescription = "Mirror https://user:description-secret@host.example/catalog?token=description-secret#fragment";
+        PluginSourceLoadResult result = successfulResult(source, "dev.hmclnex.description");
+        String details = PluginSourceManagementPage.sourceDetails(source, remoteName,
+                PluginSourceLoadResult.success(
+                        source,
+                        result.getDurationMillis(),
+                        result.getItems(),
+                        result.getPartialManifestFailureCount(),
+                        org.jackhuang.hmcl.util.gson.JsonUtils.GSON.fromJson("""
+                                {
+                                  "schemaVersion": 1,
+                                  "name": "Registry",
+                                  "description": "%s",
+                                  "plugins": []
+                                }
+                                """.formatted(hostileDescription),
+                                org.jackhuang.hmcl.plugin.store.PluginStoreRegistry.class),
+                        Objects.requireNonNull(result.getManager())
+                )).message();
+        String preview = PluginSourceManagementPage.previewMessage(
+                source.getUrl(), source.getAlias(), remoteName, hostileDescription, null, 0);
+
+        for (String text : List.of(details, preview)) {
+            assertFalse(text.contains("alias-secret"));
+            assertFalse(text.contains("remote-secret"));
+            assertFalse(text.contains("token="));
+            assertFalse(text.contains("#fragment"));
+        }
+        assertTrue(details.contains(source.getUrl()));
+        assertTrue(preview.contains(source.getUrl()));
     }
 
     /// Keeps full URLs out of compact rows while retaining them in an explicit source details model.
@@ -171,6 +239,41 @@ public final class PluginSourceManagementPageTest {
         assertEquals(PluginSourceLoadResult.Status.PARTIAL_FAILURE, merged.get(source.getId()).getStatus());
         assertEquals(20, merged.get(source.getId()).getDurationMillis());
         assertEquals(1, merged.get(source.getId()).getItems().size());
+    }
+
+    /// Replaces a manual test result once a newer matching aggregate snapshot publishes.
+    @Test
+    public void newerAggregateResultsSupersedeManualResultsForRowsAndDeletionWarnings() {
+        PluginSource source = new PluginSource(
+                "source_one", "https://plugins.example.org/catalog/plugins.json", null, true, false);
+        PluginSourceLoadResult manual = successfulResult(source, "dev.hmclnex.manual");
+        PluginSourceLoadResult aggregate = successfulResult(source, "dev.hmclnex.aggregate");
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(2, List.of(aggregate));
+
+        Map<String, PluginSourceLoadResult> merged = PluginSourceManagementPage.mergeSourceResults(
+                snapshot,
+                Map.of(source.getId(), manual),
+                1,
+                List.of(source)
+        );
+
+        assertEquals(aggregate, merged.get(source.getId()));
+        assertTrue(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
+                Map.of(source.getId(), manual),
+                1,
+                snapshot,
+                List.of(source),
+                Set.of("dev.hmclnex.aggregate")
+        ));
+        assertFalse(PluginSourceManagementPage.sourceAffectsInstalledPlugins(
+                source,
+                Map.of(source.getId(), manual),
+                1,
+                snapshot,
+                List.of(source),
+                Set.of("dev.hmclnex.manual")
+        ));
     }
 
     /// Discards aggregate and manual outcomes whose source URL no longer matches persisted configuration.
@@ -383,7 +486,7 @@ public final class PluginSourceManagementPageTest {
         ));
         assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
                 "plugin.store.source.details.failure",
-                "Cannot read https://plugins.example.org/catalog/plugins.json"
+                "Cannot read https://plugins.example.org"
         )));
         assertTrue(details.message().contains(org.jackhuang.hmcl.util.i18n.I18n.i18n(
                 "plugin.store.source.details.type",
@@ -425,8 +528,50 @@ public final class PluginSourceManagementPageTest {
         assertFalse(PluginSourceManagementPage.canPublishTestResult(
                 source, List.of(source.withConfiguration("https://plugins.example.org/changed.json", null)),
                 2, 2, 1, 1));
+        assertFalse(PluginSourceManagementPage.canPublishTestResult(
+                source, List.of(source.withConfiguration(source.getUrl(), "Renamed")),
+                2, 2, 1, 1));
+        assertFalse(PluginSourceManagementPage.canPublishTestResult(
+                source, List.of(source.withEnabled(false)),
+                2, 2, 1, 1));
+        assertFalse(PluginSourceManagementPage.canPublishTestResult(
+                source, List.of(new PluginSource(source.getId(), source.getUrl(), null, true, true)),
+                2, 2, 1, 1));
         assertTrue(PluginSourceManagementPage.canPublishTestResult(
                 source, List.of(source), 2, 2, 1, 1));
+    }
+
+    /// Creates localized, URL-safe source-row and source-specific action accessibility text.
+    @Test
+    public void accessibleTextUsesCompactSourceContentWithoutUrlCredentials() {
+        PluginSource source = new PluginSource(
+                "source_one",
+                "https://user:secret@plugins.example.org/catalog/plugins.json?token=secret#fragment",
+                null,
+                false,
+                false
+        );
+        PluginSourceManagementPage.SourceRow row = PluginSourceManagementPage.sourceRow(source, null, null);
+
+        String accessibleName = PluginSourceManagementPage.accessibleSourceName(2, row.title());
+        assertEquals(i18n("plugin.store.source.details.priority", 2) + ", " + row.title(), accessibleName);
+        assertEquals(i18n("plugin.store.source.accessible.row", accessibleName, row.subtitle()),
+                PluginSourceManagementPage.sourceRowAccessibleText(accessibleName, row));
+        assertEquals(i18n("plugin.store.source.accessible.enable", accessibleName),
+                PluginSourceManagementPage.sourceActionAccessibleText("enable", accessibleName));
+        assertEquals(i18n("plugin.store.source.accessible.previous", accessibleName),
+                PluginSourceManagementPage.sourceActionAccessibleText("previous", accessibleName));
+        assertEquals(i18n("plugin.store.source.accessible.next", accessibleName),
+                PluginSourceManagementPage.sourceActionAccessibleText("next", accessibleName));
+        assertEquals(i18n("plugin.store.source.accessible.more", accessibleName),
+                PluginSourceManagementPage.sourceActionAccessibleText("more", accessibleName));
+        assertFalse(PluginSourceManagementPage.sourceRowAccessibleText(accessibleName, row).contains("secret"));
+        assertFalse(PluginSourceManagementPage.sourceRowAccessibleText(accessibleName, row).contains("token="));
+        assertFalse(PluginSourceManagementPage.sourceRowAccessibleText(accessibleName, row).contains("#fragment"));
+        assertFalse(
+                PluginSourceManagementPage.accessibleSourceName(1, "Duplicate")
+                        .equals(PluginSourceManagementPage.accessibleSourceName(2, "Duplicate"))
+        );
     }
 
     /// Moves a dragged source directly before its drop target while retaining every configured ID exactly once.

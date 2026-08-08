@@ -22,6 +22,7 @@ import org.jackhuang.hmcl.plugin.PluginPermission;
 import org.jackhuang.hmcl.plugin.PluginRuntimeStatus;
 import org.jackhuang.hmcl.plugin.store.PluginInstallPlan;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
+import org.jackhuang.hmcl.plugin.store.PluginSourceConfiguration;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
 import org.jackhuang.hmcl.plugin.store.PluginStoreDependencyResolver;
 import org.jackhuang.hmcl.plugin.store.PluginStoreItem;
@@ -56,6 +57,15 @@ public final class PluginStorePageTest {
     @Test
     public void everyPluginSourceManagementKeyExists() {
         for (String key : List.of(
+                "button.add",
+                "button.cancel",
+                "button.delete",
+                "button.disable",
+                "button.edit",
+                "button.enable",
+                "button.save",
+                "plugin.disabled",
+                "plugin.enabled",
                 "plugin.store.manage_sources",
                 "plugin.store.id",
                 "plugin.store.sources.summary",
@@ -67,6 +77,7 @@ public final class PluginStorePageTest {
                 "plugin.store.sources.conflicts",
                 "plugin.store.source",
                 "plugin.store.source.official",
+                "plugin.store.source.custom",
                 "plugin.store.source.third_party",
                 "plugin.store.source.label",
                 "plugin.store.source.conflict",
@@ -74,11 +85,22 @@ public final class PluginStorePageTest {
                 "plugin.store.source.configured",
                 "plugin.store.source.other_candidates",
                 "plugin.store.source.plan_entry",
+                "plugin.store.source.provenance.official",
+                "plugin.store.source.provenance.third_party",
+                "plugin.store.source.accessible.row",
+                "plugin.store.source.accessible.enable",
+                "plugin.store.source.accessible.disable",
+                "plugin.store.source.accessible.previous",
+                "plugin.store.source.accessible.next",
+                "plugin.store.source.accessible.more",
                 "plugin.store.source.status.unchecked",
                 "plugin.store.source.status.loading",
                 "plugin.store.source.status.loaded",
                 "plugin.store.source.status.partial_failure",
                 "plugin.store.source.status.failed",
+                "plugin.store.source.registry_fallback",
+                "plugin.store.source.test.failed",
+                "plugin.store.source.test.missing_registry",
                 "plugin.store.source.details.url",
                 "plugin.store.source.details.alias",
                 "plugin.store.source.details.registry",
@@ -95,8 +117,79 @@ public final class PluginStorePageTest {
                 "plugin.store.source.details.conflicts",
                 "plugin.store.source.preview.homepage",
                 "plugin.store.source.preview.confirm",
+                "plugin.store.source.preview.missing_registry",
+                "plugin.store.catalog.unavailable",
                 "plugin.store.source.delete.confirm",
                 "plugin.store.source.delete.installed_confirm",
+                "plugin.store.category",
+                "plugin.store.category.all",
+                "plugin.store.changelog",
+                "plugin.store.changelog.empty",
+                "plugin.store.channel",
+                "plugin.store.compatibility",
+                "plugin.store.compatibility.any_launcher",
+                "plugin.store.compatibility.current",
+                "plugin.store.compatibility.incompatible",
+                "plugin.store.compatibility.java",
+                "plugin.store.compatibility.launcher",
+                "plugin.store.compatibility.plugin_api",
+                "plugin.store.compatibility.unsupported_api",
+                "plugin.store.dependencies",
+                "plugin.store.dependencies.none",
+                "plugin.store.details",
+                "plugin.store.empty",
+                "plugin.store.empty.description",
+                "plugin.store.favorite.add",
+                "plugin.store.favorite.only",
+                "plugin.store.favorite.remove",
+                "plugin.store.favorite.show_all",
+                "plugin.store.install.conflict",
+                "plugin.store.install.download_complete",
+                "plugin.store.install.downloading_package",
+                "plugin.store.install.incompatible",
+                "plugin.store.install.plan_failed",
+                "plugin.store.install.publishing_package",
+                "plugin.store.install.resolving",
+                "plugin.store.install.selected",
+                "plugin.store.install_failed",
+                "plugin.store.installed",
+                "plugin.store.installed_version",
+                "plugin.store.installing",
+                "plugin.store.launcher_version",
+                "plugin.store.license",
+                "plugin.store.load_failed",
+                "plugin.store.load_failed.detail",
+                "plugin.store.loaded",
+                "plugin.store.loading",
+                "plugin.store.manifest_load_failed",
+                "plugin.store.no_result",
+                "plugin.store.no_result.description",
+                "plugin.store.open_repository",
+                "plugin.store.permissions",
+                "plugin.store.plan.dependency",
+                "plugin.store.plan.install",
+                "plugin.store.plan.keep",
+                "plugin.store.plan.update",
+                "plugin.store.plugins",
+                "plugin.store.readme",
+                "plugin.store.readme.failed",
+                "plugin.store.readme.loading",
+                "plugin.store.readme.retry",
+                "plugin.store.readme.unavailable",
+                "plugin.store.refresh",
+                "plugin.store.registry_url",
+                "plugin.store.release_date",
+                "plugin.store.requires_restart",
+                "plugin.store.requires_restart.no",
+                "plugin.store.requires_restart.yes",
+                "plugin.store.search",
+                "plugin.store.settings",
+                "plugin.store.size",
+                "plugin.store.tags",
+                "plugin.store.update",
+                "plugin.store.update_available",
+                "plugin.store.version",
+                "plugin.store.version.incompatible",
                 "plugin.store.install.degraded_sources_warning"
         )) {
             assertTrue(org.jackhuang.hmcl.util.i18n.I18n.hasKey(key), key);
@@ -507,13 +600,146 @@ public final class PluginStorePageTest {
         );
     }
 
-    /// Identifies the winner's source for every remotely downloaded install-plan row.
+    /// Rejects an aggregate snapshot for installation if persisted sources changed after the catalog was loaded.
+    @Test
+    public void snapshotMustMatchCurrentSourcesBeforeInstallation() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(successfulResult(
+                source, "dev.hmclnex.source.fresh", "Fresh Plugin"
+        )));
+
+        assertTrue(PluginStorePage.canUseSnapshotForInstallation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of(source))
+        ));
+        assertFalse(PluginStorePage.canUseSnapshotForInstallation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of(source.withEnabled(false)))
+        ));
+        assertFalse(PluginStorePage.canUseSnapshotForInstallation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of(source.withConfiguration(
+                        source.getUrl(), "Changed Alias"
+                )))
+        ));
+        assertFalse(PluginStorePage.canUseSnapshotForInstallation(
+                snapshot,
+                new PluginSourceConfiguration(1, List.of(source))
+        ));
+    }
+
+    /// Keeps an install operation actionable only while its exact source snapshot remains current.
+    @Test
+    public void installOperationStopsWhenSourcesChangeDuringDownloadOrPublication() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(successfulResult(
+                source, "dev.hmclnex.source.fresh", "Fresh Plugin"
+        )));
+
+        assertTrue(PluginStorePage.canContinueInstallOperation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of(source))
+        ));
+        assertFalse(PluginStorePage.canContinueInstallOperation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of(source.withEnabled(false)))
+        ));
+        assertFalse(PluginStorePage.canContinueInstallOperation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of(source.withConfiguration(
+                        source.getUrl(), "Changed Alias"
+                )))
+        ));
+        assertFalse(PluginStorePage.canContinueInstallOperation(
+                snapshot,
+                new PluginSourceConfiguration(0, List.of())
+        ));
+        assertFalse(PluginStorePage.canContinueInstallOperation(
+                snapshot,
+                new PluginSourceConfiguration(1, List.of(source))
+        ));
+    }
+
+    /// Uses shared source label sanitization in catalog provenance and degradation warnings.
+    @Test
+    public void catalogProvenanceAndWarningsSanitizeHostileSourceLabels() {
+        PluginSource source = new PluginSource(
+                "source_a",
+                "https://user:secret@plugins.example.test/catalog.json?token=secret#fragment",
+                "https://user:secret@host/catalog?token=secret#fragment",
+                true,
+                false
+        );
+        PluginStoreItem item = successfulItem(source, "dev.hmclnex.source.safe", "Safe Plugin");
+        PluginStoreSnapshot failed = new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.failed(source, 1, new IOException("offline"))
+        ));
+        String provenance = PluginStorePage.buildPluginRowSubtitle(item, null);
+        String warning = Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(failed));
+
+        assertTrue(provenance.contains("plugins.example.test"));
+        assertTrue(warning.contains("plugins.example.test"));
+        for (String text : List.of(provenance, warning)) {
+            assertFalse(text.contains("secret"));
+            assertFalse(text.contains("token"));
+            assertFalse(text.contains("#fragment"));
+            assertFalse(text.contains(source.getUrl()));
+        }
+    }
+
+    /// Identifies every remote plan winner by immutable trust status and configured host rather than its alias.
     @Test
     public void everyDownloadedPlanRowIdentifiesItsWinningSource() throws IOException {
         List<String> rows = PluginStorePage.formatInstallPlan(planWithTwoRemoteSources());
 
-        assertTrue(rows.stream().anyMatch(row -> row.contains("Source A")));
-        assertTrue(rows.stream().anyMatch(row -> row.contains("Source B")));
+        List<String> sourceRows = rows.stream()
+                .filter(row -> row.contains("source-a.example.test") || row.contains("source-b.example.test"))
+                .toList();
+        assertEquals(2, sourceRows.size());
+        assertTrue(sourceRows.stream().allMatch(row -> row.contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.third_party")
+        )));
+        assertTrue(rows.stream().noneMatch(row -> row.contains("Source A") || row.contains("Source B")));
+    }
+
+    /// Prevents a custom source alias or registry name from impersonating official final-install provenance.
+    @Test
+    public void customSourceCannotImpersonateOfficialInstallPlanProvenance() throws IOException {
+        PluginSource source = new PluginSource(
+                "impersonator",
+                "https://user:secret@third-party.example.test/catalog/registry.json?token=secret#fragment",
+                "HMCL Nex Plugin Store",
+                true,
+                false
+        );
+        PluginStoreItem item = itemWithManifest(
+                source, "dev.hmclnex.impersonator", "Impersonator", "[]", "a"
+        );
+        PluginStoreManifest.PluginVersionEntry version = Objects.requireNonNull(
+                Objects.requireNonNull(item.getManifest()).getVersion("1.0.0")
+        );
+        PluginInstallPlan plan = new PluginStoreDependencyResolver(Map.of(
+                item.getEntry().getId(), item
+        )).resolveInstallPlan(item.getEntry().getId(), version, Map.of(), Map.of(), Map.of());
+
+        PluginInstallPlan.Entry entry = plan.getRootEntry();
+        String finalConfirmationRow = PluginStorePage.formatInstallPlan(plan).get(0);
+
+        assertEquals("HMCL Nex Plugin Store", entry.getSourceDisplayName());
+        assertFalse(entry.requireSourceProvenance().isOfficial());
+        assertEquals("third-party.example.test", entry.requireSourceProvenance().getHostIdentity());
+        assertTrue(finalConfirmationRow.contains(
+                org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.third_party")
+        ));
+        assertTrue(finalConfirmationRow.contains("third-party.example.test"));
+        assertFalse(finalConfirmationRow.contains("HMCL Nex Plugin Store"));
+        assertFalse(finalConfirmationRow.contains("user"));
+        assertFalse(finalConfirmationRow.contains("secret"));
+        assertFalse(finalConfirmationRow.contains("/catalog"));
+        assertFalse(finalConfirmationRow.contains("token"));
+        assertFalse(finalConfirmationRow.contains("#fragment"));
     }
 
     /// Retains the accepted aggregate state while a newer refresh is still active.
@@ -528,9 +754,30 @@ public final class PluginStorePageTest {
         PluginStoreSnapshot stale = degradedSnapshot();
         PluginStoreSnapshot current = conflictingSnapshot();
 
-        assertFalse(PluginStorePage.canPublishSnapshot(1, 2, stale, stale));
-        assertFalse(PluginStorePage.canPublishSnapshot(2, 2, stale, current));
-        assertTrue(PluginStorePage.canPublishSnapshot(2, 2, current, current));
+        PluginSourceConfiguration staleConfiguration = stale.getSourceConfiguration();
+        PluginSourceConfiguration currentConfiguration = current.getSourceConfiguration();
+
+        assertFalse(PluginStorePage.canPublishSnapshot(1, 2, stale, stale, staleConfiguration));
+        assertFalse(PluginStorePage.canPublishSnapshot(2, 2, stale, current, staleConfiguration));
+        assertTrue(PluginStorePage.canPublishSnapshot(2, 2, current, current, currentConfiguration));
+    }
+
+    /// Rejects a current-generation completion after source values pass through an ABA cycle.
+    @Test
+    public void sourceRevisionChangeRejectsOtherwiseCurrentSnapshotPublication() {
+        PluginSource source = new PluginSource(
+                "source_a", "https://source-a.example.test/plugins.json", "Source A", true, false);
+        PluginStoreSnapshot completed = new PluginStoreSnapshot(1, 4, List.of(successfulResult(
+                source, "dev.hmclnex.source.stale", "Stale Plugin"
+        )));
+
+        assertFalse(PluginStorePage.canPublishSnapshot(
+                1,
+                1,
+                completed,
+                completed,
+                new PluginSourceConfiguration(6, List.of(source))
+        ));
     }
 
     /// Closes a page-owned aggregate loader exactly once at its deterministic application lifetime boundary.
@@ -584,8 +831,11 @@ public final class PluginStorePageTest {
                     PluginSourceLoadResult.failed(hostile, 1, new IOException("offline"))
             ));
 
-            assertTrue(Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot))
-                    .endsWith(org.jackhuang.hmcl.util.i18n.I18n.i18n("plugin.store.source.configured")));
+            String warning = Objects.requireNonNull(PluginStorePage.degradedCatalogWarning(snapshot));
+            assertTrue(warning.contains("source.example.test"));
+            assertFalse(warning.contains("secret"));
+            assertFalse(warning.contains("token"));
+            assertFalse(warning.contains("#fragment"));
         }
 
         PluginSource ordinary = new PluginSource(
@@ -607,6 +857,39 @@ public final class PluginStorePageTest {
 
         assertEquals(PluginStorePage.StoreState.ALL_FAILED, presentation.state());
         assertFalse(presentation.showPluginRows());
+    }
+
+    /// Provides priority-ordered credential-safe diagnostics and direct retry eligibility when every enabled source fails.
+    @Test
+    public void allFailedDiagnosticsAreSafeAndRetryableOnlyWhenIdle() {
+        PluginSource hostile = new PluginSource(
+                "source_a",
+                "https://source-a.example.test/plugins.json",
+                "https://user:secret@host.example/catalog?token=private#fragment",
+                true,
+                false
+        );
+        PluginSource ordinary = new PluginSource(
+                "source_b", "https://source-b.example.test/plugins.json", "Source B", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(
+                PluginSourceLoadResult.failed(hostile, 1,
+                        new IOException("Unable to load https://user:secret@host.example/catalog?token=private#fragment")),
+                PluginSourceLoadResult.failed(ordinary, 1, new IOException("offline"))
+        ));
+        PluginStorePage.StorePresentation presentation = PluginStorePage.presentationFor(snapshot);
+
+        List<PluginStorePage.SourceFailureDiagnostic> diagnostics = PluginStorePage.allFailedDiagnostics(snapshot);
+        assertEquals(2, diagnostics.size());
+        assertEquals("source-a.example.test", diagnostics.get(0).sourceName());
+        assertEquals("Source B", diagnostics.get(1).sourceName());
+        assertFalse(diagnostics.get(0).message().contains("secret"));
+        assertFalse(diagnostics.get(0).message().contains("token"));
+        assertFalse(diagnostics.get(0).message().contains("?"));
+        assertFalse(diagnostics.get(0).message().contains("#"));
+        assertTrue(PluginStorePage.canRetryFailedSources(presentation, false));
+        assertFalse(PluginStorePage.canRetryFailedSources(presentation, true));
+        assertFalse(PluginStorePage.canRetryFailedSources(
+                PluginStorePage.presentationFor(noEnabledSnapshot()), false));
     }
 
     /// Returns the source-management state when no configured source is enabled.

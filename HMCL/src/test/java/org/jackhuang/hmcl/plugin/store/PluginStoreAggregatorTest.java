@@ -65,6 +65,23 @@ public final class PluginStoreAggregatorTest {
         }
     }
 
+    /// Carries the repository source revision into the completed aggregate snapshot.
+    @Test
+    public void aggregateSnapshotRetainsSourceConfigurationRevision() throws Exception {
+        try (RegistryFixture fixture = RegistryFixture.start("Revision", "dev.test.revision", "1.0.0");
+             PluginStoreAggregator aggregator = new PluginStoreAggregator()) {
+            PluginSource source = source("revision", fixture.registryUrl(), true);
+
+            PluginStoreSnapshot snapshot = aggregator.refresh(new PluginSourceConfiguration(
+                    17,
+                    List.of(source)
+            )).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+            assertEquals(17, snapshot.getSourceRevision());
+            assertTrue(snapshot.matchesSourceConfiguration(new PluginSourceConfiguration(17, List.of(source))));
+        }
+    }
+
     /// Combines entries with distinct IDs from independent enabled sources.
     @Test
     public void aggregatesUniqueItemsFromEachEnabledSource() throws Exception {
@@ -158,6 +175,27 @@ public final class PluginStoreAggregatorTest {
         }
     }
 
+    /// Requires a snapshot's sources to exactly match the current persisted source configuration in order.
+    @Test
+    public void snapshotFreshnessIncludesEveryBehaviorRelevantSourceFieldAndOrder() {
+        PluginSource original = new PluginSource(
+                "source", "https://plugins.example.test/catalog.json", "Community", true, false);
+        PluginStoreSnapshot snapshot = new PluginStoreSnapshot(1, List.of(PluginSourceLoadResult.disabled(original)));
+
+        assertTrue(snapshot.matchesSources(List.of(original)));
+        assertTrue(snapshot.matchesSources(List.of(new PluginSource(
+                "source", "https://plugins.example.test/catalog.json", "Community", true, false))));
+        assertTrue(!snapshot.matchesSources(List.of(original.withConfiguration(
+                "https://plugins.example.test/changed.json", "Community"))));
+        assertTrue(!snapshot.matchesSources(List.of(original.withConfiguration(
+                original.getUrl(), "Changed"))));
+        assertTrue(!snapshot.matchesSources(List.of(original.withEnabled(false))));
+        assertTrue(!snapshot.matchesSources(List.of(new PluginSource(
+                original.getId(), original.getUrl(), original.getAlias(), true, true))));
+        assertTrue(!snapshot.matchesSources(List.of(original, new PluginSource(
+                "second", "https://plugins.example.test/second.json", null, true, false))));
+    }
+
     /// Removes non-HTTP URL credentials, queries, and fragments from source failure diagnostics while retaining the original failure.
     @Test
     public void sourceFailureMessageSanitizesNonHttpUrlCredentialsAndParameters() {
@@ -170,7 +208,7 @@ public final class PluginStoreAggregatorTest {
                 failure
         );
 
-        assertEquals("Unable to load ftp://example.test/plugins.json", result.getFailureMessage());
+        assertEquals("Unable to load ftp://example.test", result.getFailureMessage());
         assertSame(failure, result.getFailure());
         assertTrue(Objects.requireNonNull(result.getFailureMessage()).contains("example.test"));
         assertTrue(!result.getFailureMessage().contains("secret"));
@@ -178,11 +216,11 @@ public final class PluginStoreAggregatorTest {
         assertTrue(!result.getFailureMessage().contains("fragment"));
     }
 
-    /// Removes fragments from malformed URI tokens while retaining the full failure for logs.
+    /// Never decodes encoded credential and query delimiters from a failure URL path.
     @Test
-    public void sourceFailureMessageSanitizesMalformedUriFragments() {
+    public void sourceFailureMessageDoesNotDiscloseEncodedSensitivePath() {
         IOException failure = new IOException(
-                "Unable to load ftp://user:secret@example.test/path%zz#fragment-secret"
+                "Unable to load https://example.test/catalog/user%3Asecret%40host%3Ftoken%3Dprivate"
         );
         PluginSourceLoadResult result = PluginSourceLoadResult.failed(
                 source("failed", "https://example.test/plugins.json", true),
@@ -190,10 +228,46 @@ public final class PluginStoreAggregatorTest {
                 failure
         );
 
-        assertEquals("Unable to load ftp://example.test/path%zz", result.getFailureMessage());
-        assertSame(failure, result.getFailure());
+        assertEquals("Unable to load https://example.test", result.getFailureMessage());
         assertTrue(!Objects.requireNonNull(result.getFailureMessage()).contains("secret"));
-        assertTrue(!result.getFailureMessage().contains("fragment"));
+        assertTrue(!result.getFailureMessage().contains("token"));
+        assertTrue(!result.getFailureMessage().contains("%"));
+    }
+
+    /// Redacts every component of malformed URI tokens while preserving harmless surrounding failure text.
+    @Test
+    public void sourceFailureMessageDoesNotDiscloseMalformedUriSecrets() {
+        String malformedUrl = "ftp://user:user-secret@example.test/plain-path-secret%zz?token=query-secret#fragment-secret";
+        IOException failure = new IOException("Unable to load " + malformedUrl + " while refreshing");
+        PluginSourceLoadResult result = PluginSourceLoadResult.failed(
+                source("failed", "https://example.test/plugins.json", true),
+                0,
+                failure
+        );
+
+        String message = Objects.requireNonNull(result.getFailureMessage());
+        assertEquals("Unable to load " + PluginSourceLabels.diagnosticUrl(malformedUrl) + " while refreshing", message);
+        assertSame(failure, result.getFailure());
+        assertTrue(!message.contains("user-secret"));
+        assertTrue(!message.contains("plain-path-secret"));
+        assertTrue(!message.contains("query-secret"));
+        assertTrue(!message.contains("fragment-secret"));
+    }
+
+    /// Redacts credential-bearing remote URLs from validation diagnostics before they can reach logs or source status UI.
+    @Test
+    public void remoteUrlValidationDiagnosticsRedactCredentialsAndParameters() {
+        IOException exception = assertThrows(IOException.class, () -> PluginStoreManager.validateRemoteUrl(
+                "ftp://user:secret@example.test/plugins.json?token=private#fragment",
+                "plugin registry"
+        ));
+
+        String message = Objects.requireNonNull(exception.getMessage());
+        assertTrue(message.contains("ftp://example.test"));
+        assertTrue(!message.contains("secret"));
+        assertTrue(!message.contains("token"));
+        assertTrue(!message.contains("?"));
+        assertTrue(!message.contains("#"));
     }
 
     /// Rejects success-result counts that do not match the source items with unresolved manifests.

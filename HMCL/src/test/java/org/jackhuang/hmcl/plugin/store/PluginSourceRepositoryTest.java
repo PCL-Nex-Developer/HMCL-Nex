@@ -39,6 +39,38 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Verifies durable ordered plugin-source configuration and legacy preference migration.
 @NotNullByDefault
 public final class PluginSourceRepositoryTest {
+    /// Redacts credentials, query strings, fragments, and exception text from legacy migration diagnostics.
+    @Test
+    public void migrationDiagnosticRedactsSensitiveAndMalformedRegistryUrls() {
+        String valid = "https://user:secret@host.example/catalog/plugins.json?token=secret#fragment";
+        String malformed = "https://user:secret@host.example/%zz?token=secret#fragment";
+
+        assertEquals("https://host.example", PluginStorePreferences.migrationDiagnostic(valid));
+        assertEquals("invalid plugin registry", PluginStorePreferences.migrationDiagnostic(malformed));
+        for (String diagnostic : List.of(
+                PluginStorePreferences.migrationDiagnostic(valid),
+                PluginStorePreferences.migrationDiagnostic(malformed)
+        )) {
+            assertFalse(diagnostic.contains("secret"));
+            assertFalse(diagnostic.contains("token"));
+            assertFalse(diagnostic.contains("?"));
+            assertFalse(diagnostic.contains("#"));
+        }
+    }
+
+    /// Never decodes encoded credential and query delimiters in legacy migration diagnostics.
+    @Test
+    public void migrationDiagnosticDoesNotDiscloseEncodedSensitivePath() {
+        String encoded = "https://host.example/catalog/user%3Asecret%40host%3Ftoken%3Dprivate";
+
+        String diagnostic = PluginStorePreferences.migrationDiagnostic(encoded);
+
+        assertEquals("https://host.example", diagnostic);
+        assertFalse(diagnostic.contains("secret"));
+        assertFalse(diagnostic.contains("token"));
+        assertFalse(diagnostic.contains("%"));
+    }
+
     /// Migrates version-one sources with the old active custom source directly after the official source.
     @Test
     public void migratesVersionOneAndMovesTheOldActiveCustomSourceAfterOfficial(
@@ -62,6 +94,38 @@ public final class PluginSourceRepositoryTest {
         assertEquals(first, preferences.getSources().get(2).getUrl());
         assertTrue(preferences.isFavorite("dev.hmclnex.pcltheme"));
         assertEquals(2, readSavedState(localHome).get("schemaVersion").getAsInt());
+    }
+
+    /// Rejects an ABA-restored source configuration while leaving its revision unchanged for favorite updates.
+    @Test
+    public void sourceRevisionRejectsRestoredValuesButIgnoresFavoriteUpdates(@TempDir Path localHome) throws Exception {
+        PluginStorePreferences preferences = new PluginStorePreferences(localHome, () -> "source_guarded");
+        PluginSource custom = preferences.addSource("https://one.example/plugins.json", "One");
+        PluginSourceConfiguration expected = preferences.getSourceConfiguration();
+        AtomicInteger publications = new AtomicInteger();
+
+        preferences.executeIfSourcesMatch(expected, publications::incrementAndGet);
+        preferences.setEnabled(custom.getId(), true);
+        assertEquals(expected.getRevision(), preferences.getSourceConfiguration().getRevision());
+        preferences.setFavorite("dev.hmclnex.favorite", true);
+        assertEquals(expected.getRevision(), preferences.getSourceConfiguration().getRevision());
+        preferences.executeIfSourcesMatch(expected, publications::incrementAndGet);
+        assertEquals(2, publications.get());
+
+        preferences.setEnabled(custom.getId(), false);
+        assertThrows(IOException.class, () -> preferences.executeIfSourcesMatch(
+                expected,
+                publications::incrementAndGet
+        ));
+        preferences.setEnabled(custom.getId(), true);
+        PluginSourceConfiguration restored = preferences.getSourceConfiguration();
+        assertTrue(PluginStoreSnapshot.matchesSourceConfigurations(expected.getSources(), restored.getSources()));
+        assertTrue(restored.getRevision() > expected.getRevision());
+        assertThrows(IOException.class, () -> preferences.executeIfSourcesMatch(
+                expected,
+                publications::incrementAndGet
+        ));
+        assertEquals(2, publications.get());
     }
 
     /// Preserves version-two source IDs, aliases, enablement, and priority through a reload.

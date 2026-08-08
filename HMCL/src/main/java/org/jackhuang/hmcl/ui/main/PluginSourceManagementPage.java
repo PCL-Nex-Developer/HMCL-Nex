@@ -33,6 +33,7 @@ import javafx.scene.control.Tooltip;
 import javafx.scene.input.ClipboardContent;
 import javafx.scene.input.Dragboard;
 import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
 import javafx.scene.input.TransferMode;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
@@ -41,6 +42,7 @@ import javafx.scene.layout.VBox;
 import org.jackhuang.hmcl.plugin.store.PluginSource;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadExecutor;
 import org.jackhuang.hmcl.plugin.store.PluginSourceLoadResult;
+import org.jackhuang.hmcl.plugin.store.PluginSourceLabels;
 import org.jackhuang.hmcl.plugin.store.PluginSourceRepository;
 import org.jackhuang.hmcl.plugin.store.PluginStoreManager;
 import org.jackhuang.hmcl.plugin.store.PluginStoreRegistry;
@@ -104,8 +106,11 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
     /// Prevents concurrent controls from publishing changes before the active repository write completes.
     private boolean writing;
 
-    /// Transient source test outcomes retained only for this open source-management page.
+    /// Transient source test outcomes retained only until a newer aggregate snapshot is published.
     private final Map<String, PluginSourceLoadResult> testedResults = new LinkedHashMap<>();
+
+    /// Aggregate generation current when each manual result was published.
+    private final Map<String, Long> testedResultSnapshotGenerations = new LinkedHashMap<>();
 
     /// Latest independent test generation requested for each source ID.
     private final Map<String, Long> testGenerations = new LinkedHashMap<>();
@@ -185,10 +190,66 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
     ///
     /// @return source result snapshot indexed by configured source ID
     private @Unmodifiable Map<String, PluginSourceLoadResult> sourceResultsById() {
-        return mergeSourceResults(snapshotSupplier.get(), testedResults, repository.getSources());
+        return mergeSourceResults(
+                snapshotSupplier.get(),
+                testedResults,
+                testedResultSnapshotGenerations,
+                repository.getSources()
+        );
     }
 
-    /// Merges current aggregate outcomes with configuration-matching manual tests, preferring the newer manual result.
+    /// Merges current aggregate outcomes with manual tests that are newer than the aggregate publication.
+    ///
+    /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
+    /// @param manualResults latest successfully completed manual test results by source ID
+    /// @param manualSnapshotGenerations aggregate generation current for each manual result
+    /// @param sources current persisted source configuration
+    /// @return immutable current source outcomes indexed by source ID
+    static @Unmodifiable Map<String, PluginSourceLoadResult> mergeSourceResults(
+            @Nullable PluginStoreSnapshot snapshot,
+            @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
+            @Unmodifiable Map<String, Long> manualSnapshotGenerations,
+            @Unmodifiable List<PluginSource> sources
+    ) {
+        Map<String, PluginSourceLoadResult> results = new LinkedHashMap<>();
+        if (snapshot != null && snapshot.matchesSources(sources)) {
+            for (PluginSourceLoadResult result : snapshot.getSourceResults()) {
+                results.put(result.getSource().getId(), result);
+            }
+        }
+        for (Map.Entry<String, PluginSourceLoadResult> entry : manualResults.entrySet()) {
+            if (isCurrentManualResult(
+                    snapshot,
+                    entry.getKey(),
+                    entry.getValue(),
+                    manualSnapshotGenerations.get(entry.getKey()),
+                    sources
+            )) {
+                results.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return Map.copyOf(results);
+    }
+
+    /// Merges current aggregate outcomes with manual results published after the supplied aggregate generation.
+    ///
+    /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
+    /// @param manualResults latest successfully completed manual test results by source ID
+    /// @param manualSnapshotGeneration aggregate generation current when every manual result was published
+    /// @param sources current persisted source configuration
+    /// @return immutable current source outcomes indexed by source ID
+    static @Unmodifiable Map<String, PluginSourceLoadResult> mergeSourceResults(
+            @Nullable PluginStoreSnapshot snapshot,
+            @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
+            long manualSnapshotGeneration,
+            @Unmodifiable List<PluginSource> sources
+    ) {
+        Map<String, Long> manualSnapshotGenerations = new LinkedHashMap<>();
+        manualResults.keySet().forEach(sourceId -> manualSnapshotGenerations.put(sourceId, manualSnapshotGeneration));
+        return mergeSourceResults(snapshot, manualResults, manualSnapshotGenerations, sources);
+    }
+
+    /// Merges current aggregate outcomes with manual results assumed newer than the supplied aggregate snapshot.
     ///
     /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
     /// @param manualResults latest successfully completed manual test results by source ID
@@ -199,30 +260,42 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
             @Unmodifiable List<PluginSource> sources
     ) {
-        Map<String, PluginSourceLoadResult> results = new LinkedHashMap<>();
-        if (snapshot != null) {
-            for (PluginSourceLoadResult result : snapshot.getSourceResults()) {
-                if (containsCurrentSource(sources, result.getSource())) {
-                    results.put(result.getSource().getId(), result);
-                }
-            }
-        }
-        for (Map.Entry<String, PluginSourceLoadResult> entry : manualResults.entrySet()) {
-            if (containsCurrentSource(sources, entry.getValue().getSource())) {
-                results.put(entry.getKey(), entry.getValue());
-            }
-        }
-        return Map.copyOf(results);
+        return mergeSourceResults(
+                snapshot,
+                manualResults,
+                snapshot == null ? -1 : snapshot.getGeneration(),
+                sources
+        );
+    }
+
+    /// Returns whether a manual result is still current after a matching aggregate snapshot publishes.
+    ///
+    /// @param snapshot current aggregate snapshot, or `null` before one publishes
+    /// @param sourceId source ID indexed by manual result maps
+    /// @param manual manual source result
+    /// @param manualSnapshotGeneration aggregate generation current when the manual result completed
+    /// @param sources current persisted source configuration
+    /// @return whether the manual result may override the aggregate result
+    private static boolean isCurrentManualResult(
+            @Nullable PluginStoreSnapshot snapshot,
+            String sourceId,
+            PluginSourceLoadResult manual,
+            @Nullable Long manualSnapshotGeneration,
+            @Unmodifiable List<PluginSource> sources
+    ) {
+        return sourceId.equals(manual.getSource().getId())
+                && containsCurrentSource(sources, manual.getSource())
+                && (snapshot == null || manualSnapshotGeneration == null
+                || manualSnapshotGeneration >= snapshot.getGeneration());
     }
 
     /// Returns whether the specified source configuration still matches the persisted snapshot.
     ///
     /// @param sources current persisted sources
     /// @param candidate aggregate or manual-test source configuration
-    /// @return whether the source ID and URL remain current
+    /// @return whether every aggregation-relevant source field remains current
     private static boolean containsCurrentSource(@Unmodifiable List<PluginSource> sources, PluginSource candidate) {
-        return sources.stream().anyMatch(source -> source.getId().equals(candidate.getId())
-                && source.getUrl().equals(candidate.getUrl()));
+        return sources.stream().anyMatch(source -> PluginStoreSnapshot.sourceConfigurationsMatch(candidate, source));
     }
 
     /// Builds one compact source row with source metadata, a direct enablement switch, and overflow actions.
@@ -239,22 +312,16 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             @Nullable PluginSourceLoadResult result
     ) {
         SourceRow model = sourceRow(source, remoteName(result), result);
+        String accessibleName = accessibleSourceName(index + 1, model.title());
         LineButton row = new LineButton();
         row.setLeading(source.isOfficial() ? SVG.CHECK_CIRCLE : SVG.EXTENSION);
         row.setTitle((index + 1) + ". " + model.title());
         row.setSubtitle(model.subtitle());
         row.setMinHeight(88);
         row.setFocusTraversable(true);
+        row.setAccessibleText(sourceRowAccessibleText(accessibleName, model));
         row.setOnAction(event -> showDetails(source, result));
-        row.setOnKeyPressed(event -> {
-            if (event.isControlDown() && event.getCode() == KeyCode.UP) {
-                move(source, -1);
-                event.consume();
-            } else if (event.isControlDown() && event.getCode() == KeyCode.DOWN) {
-                move(source, 1);
-                event.consume();
-            }
-        });
+        row.addEventFilter(KeyEvent.KEY_PRESSED, event -> reorderOnShortcut(source, event));
         row.setOnDragDetected(event -> {
             if (writing) {
                 return;
@@ -286,22 +353,42 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         JFXToggleButton enabled = new JFXToggleButton();
         enabled.setSelected(source.isEnabled());
         enabled.setTooltip(new Tooltip(i18n(source.isEnabled() ? "button.disable" : "button.enable")));
-        enabled.setAccessibleText(enabled.getTooltip().getText());
+        enabled.setAccessibleText(sourceActionAccessibleText(source.isEnabled() ? "disable" : "enable", accessibleName));
         enabled.setOnMouseClicked(event -> event.consume());
         enabled.setOnAction(event -> setEnabled(source, enabled.isSelected()));
 
         JFXButton previous = createActionButton(SVG.KEYBOARD_ARROW_UP, () -> move(source, -1));
         previous.setDisable(index == 0 || writing);
+        previous.setAccessibleText(sourceActionAccessibleText("previous", accessibleName));
         JFXButton next = createActionButton(SVG.KEYBOARD_ARROW_DOWN, () -> move(source, 1));
         next.setDisable(index == sourceCount - 1 || writing);
+        next.setAccessibleText(sourceActionAccessibleText("next", accessibleName));
         JFXButton more = createActionButton(SVG.MORE_VERT, () -> {
         });
+        more.setAccessibleText(sourceActionAccessibleText("more", accessibleName));
         more.setOnAction(event -> showSourceActions(source, result, more));
         enabled.setDisable(writing);
         actions.getChildren().addAll(enabled, previous, next, more);
         row.setTrailingIcon(actions);
         row.setDisable(writing);
         return row;
+    }
+
+    /// Reorders a source when the current source row receives the documented control shortcut.
+    ///
+    /// @param source source to reorder
+    /// @param event pressed key event from the row or one of its child controls
+    private void reorderOnShortcut(PluginSource source, KeyEvent event) {
+        if (!event.isControlDown()) {
+            return;
+        }
+        if (event.getCode() == KeyCode.UP) {
+            move(source, -1);
+            event.consume();
+        } else if (event.getCode() == KeyCode.DOWN) {
+            move(source, 1);
+            event.consume();
+        }
     }
 
     /// Creates a fixed-size action control suitable for source-row trailing controls.
@@ -439,7 +526,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                         Math.max(0, (System.nanoTime() - startedAt) / 1_000_000),
                         exception instanceof IOException ioException
                                 ? ioException
-                                : new IOException("Failed to test plugin source", exception)
+                                : new IOException(i18n("plugin.store.source.test.failed"), exception)
                 );
             }
         }).whenComplete(Schedulers.javafx(), (@Nullable var result, @Nullable var exception) -> {
@@ -458,6 +545,8 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 return;
             }
             testedResults.put(source.getId(), Objects.requireNonNull(result));
+            @Nullable PluginStoreSnapshot snapshot = snapshotSupplier.get();
+            testedResultSnapshotGenerations.put(source.getId(), snapshot == null ? -1 : snapshot.getGeneration());
             refreshRows();
             refreshStore.run();
         }).start();
@@ -474,7 +563,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         manager.loadSource(source);
         @Nullable PluginStoreRegistry registry = manager.getRegistry();
         if (registry == null) {
-            throw new IOException("Plugin source test has no registry");
+            throw new IOException(i18n("plugin.store.source.test.missing_registry"));
         }
         List<org.jackhuang.hmcl.plugin.store.PluginStoreItem> items = manager.getStoreItems();
         int partialFailures = (int) items.stream().filter(item -> item.getManifest() == null).count();
@@ -507,8 +596,8 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
     ) {
         return requestGeneration == latestTestGeneration
                 && configurationGeneration == latestConfigurationGeneration
-                && currentSources.stream().anyMatch(source -> source.getId().equals(testedSource.getId())
-                        && source.getUrl().equals(testedSource.getUrl()));
+                && currentSources.stream().anyMatch(source ->
+                PluginStoreSnapshot.sourceConfigurationsMatch(testedSource, source));
     }
 
     /// Shows source details including the full configured URL and latest source outcome.
@@ -561,7 +650,29 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 .anyMatch(installedPluginIdsSupplier.get()::contains);
     }
 
-    /// Computes installed-plugin deletion impact from the same current manual-first source-item selection used at runtime.
+    /// Computes installed-plugin deletion impact from the same fresh manual-or-aggregate selection used at runtime.
+    ///
+    /// @param source source whose deletion impact is queried
+    /// @param manualResults latest manually tested source results by source ID
+    /// @param manualSnapshotGeneration aggregate generation current when every manual result was published
+    /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
+    /// @param sources current persisted source configuration
+    /// @param installedPluginIds installed plugin IDs
+    /// @return whether the freshest successful source items intersect installed plugin IDs
+    static boolean sourceAffectsInstalledPlugins(
+            PluginSource source,
+            @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
+            long manualSnapshotGeneration,
+            @Nullable PluginStoreSnapshot snapshot,
+            @Unmodifiable List<PluginSource> sources,
+            @Unmodifiable Set<String> installedPluginIds
+    ) {
+        return selectLatestSourceItems(source, manualResults, manualSnapshotGeneration, snapshot, sources).stream()
+                .map(item -> item.getEntry().getId())
+                .anyMatch(installedPluginIds::contains);
+    }
+
+    /// Computes installed-plugin deletion impact with manual results assumed newer than the current snapshot.
     ///
     /// @param source source whose deletion impact is queried
     /// @param manualResults latest manually tested source results by source ID
@@ -576,46 +687,62 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             @Unmodifiable List<PluginSource> sources,
             @Unmodifiable Set<String> installedPluginIds
     ) {
-        return selectLatestSourceItems(source, manualResults, snapshot, sources).stream()
-                .map(item -> item.getEntry().getId())
-                .anyMatch(installedPluginIds::contains);
+        return sourceAffectsInstalledPlugins(
+                source,
+                manualResults,
+                snapshot == null ? -1 : snapshot.getGeneration(),
+                snapshot,
+                sources,
+                installedPluginIds
+        );
     }
 
-    /// Selects current successful manual source items before falling back to the current aggregate source result.
+    /// Selects fresh successful manual source items before falling back to the matching aggregate source result.
     ///
     /// @param source source whose latest items are selected
     /// @param manualResults latest manually tested source results by source ID
+    /// @param manualSnapshotGeneration aggregate generation current when every manual result was published
     /// @param snapshot current aggregate snapshot, or `null` before a refresh completes
     /// @param sources current persisted source configuration
     /// @return immutable selected source item snapshot
     static @Unmodifiable List<org.jackhuang.hmcl.plugin.store.PluginStoreItem> selectLatestSourceItems(
             PluginSource source,
             @Unmodifiable Map<String, PluginSourceLoadResult> manualResults,
+            long manualSnapshotGeneration,
             @Nullable PluginStoreSnapshot snapshot,
             @Unmodifiable List<PluginSource> sources
     ) {
         @Nullable PluginSourceLoadResult manual = manualResults.get(source.getId());
-        if (manual != null && manual.isSuccessful() && containsCurrentSource(sources, manual.getSource())) {
+        if (manual != null
+                && manual.isSuccessful()
+                && isCurrentManualResult(snapshot, source.getId(), manual, manualSnapshotGeneration, sources)) {
             return manual.getItems();
         }
-        if (snapshot == null) {
+        if (snapshot == null || !snapshot.matchesSources(sources)) {
             return List.of();
         }
         return snapshot.getSourceResults().stream()
                 .filter(result -> result.getSource().getId().equals(source.getId()))
-                .filter(result -> containsCurrentSource(sources, result.getSource()))
                 .filter(PluginSourceLoadResult::isSuccessful)
                 .findFirst()
                 .map(PluginSourceLoadResult::getItems)
                 .orElse(List.of());
     }
 
-    /// Retrieves source-bound items from the latest successful manual or aggregate result for deletion impact checks.
+    /// Retrieves source-bound items from the freshest successful manual or aggregate result for deletion impact checks.
     ///
     /// @param source source whose items are queried
     /// @return immutable latest source item snapshot
     private @Unmodifiable List<org.jackhuang.hmcl.plugin.store.PluginStoreItem> latestSourceItems(PluginSource source) {
-        return selectLatestSourceItems(source, testedResults, snapshotSupplier.get(), repository.getSources());
+        @Nullable PluginStoreSnapshot snapshot = snapshotSupplier.get();
+        @Nullable Long manualSnapshotGeneration = testedResultSnapshotGenerations.get(source.getId());
+        return selectLatestSourceItems(
+                source,
+                testedResults,
+                manualSnapshotGeneration == null ? -1 : manualSnapshotGeneration,
+                snapshot,
+                repository.getSources()
+        );
     }
 
     /// Runs a single repository write, rebuilding from persistence when the write fails.
@@ -643,6 +770,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             }
             sourceConfigurationGeneration++;
             testedResults.clear();
+            testedResultSnapshotGenerations.clear();
             if (onSuccess != null) {
                 onSuccess.run();
             }
@@ -659,38 +787,13 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         return registry == null || StringUtils.isBlank(registry.getName()) ? null : registry.getName();
     }
 
-    /// Returns the preferred source name using local alias, remote registry name, then a compact host-and-file fallback.
+    /// Returns the shared credential-safe compact source label.
     ///
     /// @param source persisted source configuration
     /// @param remoteName latest remote registry name, or `null` when unavailable
     /// @return safe compact source display name
     static String displayName(PluginSource source, @Nullable String remoteName) {
-        @Nullable String alias = source.getAlias();
-        if (StringUtils.isNotBlank(alias)) {
-            return Objects.requireNonNull(alias);
-        }
-        if (StringUtils.isNotBlank(remoteName)) {
-            return Objects.requireNonNull(remoteName);
-        }
-        return compactUrlFallback(source.getUrl());
-    }
-
-    /// Derives a credential-free compact fallback label from a configured source URL.
-    ///
-    /// @param url source URL
-    /// @return compact host-and-file label
-    private static String compactUrlFallback(String url) {
-        try {
-            URI uri = new URI(url);
-            @Nullable String host = uri.getHost();
-            String path = uri.getPath();
-            String file = path == null || path.isBlank() || path.endsWith("/")
-                    ? "registry"
-                    : path.substring(path.lastIndexOf('/') + 1);
-            return StringUtils.isBlank(host) ? file : host + " / " + file;
-        } catch (URISyntaxException exception) {
-            return i18n("plugin.store.source.custom");
-        }
+        return PluginSourceLabels.displayName(source, remoteName);
     }
 
     /// Returns source overflow actions, permanently excluding edit and delete for the fixed official source.
@@ -716,8 +819,9 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
     ) {
         String title = displayName(source, remoteName);
         List<String> details = new ArrayList<>();
-        if (StringUtils.isNotBlank(remoteName) && !remoteName.equals(title)) {
-            details.add(remoteName);
+        if (PluginSourceLabels.isSafeHumanLabel(remoteName)
+                && !Objects.requireNonNull(remoteName).trim().equals(title)) {
+            details.add(remoteName.trim());
         }
         details.add(i18n(source.isOfficial() ? "plugin.store.source.official" : "plugin.store.source.third_party"));
         details.add(i18n(source.isEnabled() ? "plugin.enabled" : "plugin.disabled"));
@@ -725,6 +829,33 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
         details.add(i18n("plugin.store.source.details.plugins", result == null ? 0 : result.getItems().size()));
         details.add(result == null ? "-" : i18n("plugin.store.source.details.duration", result.getDurationMillis()));
         return new SourceRow(title, String.join(" · ", details));
+    }
+
+    /// Creates a source-specific, URL-safe accessibility name with a unique visible priority.
+    ///
+    /// @param priority current one-based source priority
+    /// @param sourceName compact source display name
+    /// @return localized priority and source name
+    static String accessibleSourceName(int priority, String sourceName) {
+        return i18n("plugin.store.source.details.priority", priority) + ", " + sourceName;
+    }
+
+    /// Creates URL-safe accessibility text that identifies a compact source row and its status.
+    ///
+    /// @param sourceName unique compact source accessibility name
+    /// @param row compact source row content
+    /// @return localized source-row accessibility text
+    static String sourceRowAccessibleText(String sourceName, SourceRow row) {
+        return i18n("plugin.store.source.accessible.row", sourceName, row.subtitle());
+    }
+
+    /// Creates source-specific accessibility text for an icon-only source-row action.
+    ///
+    /// @param action action identifier
+    /// @param sourceName compact source display name
+    /// @return localized action accessibility text
+    static String sourceActionAccessibleText(String action, String sourceName) {
+        return i18n("plugin.store.source.accessible." + action, sourceName);
     }
 
     /// Returns a localized compact label for the latest source load outcome.
@@ -776,7 +907,8 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
             @Nullable PluginStoreSnapshot snapshot
     ) {
         @Nullable PluginStoreRegistry registry = result == null ? null : result.getRegistry();
-        @Nullable String alias = source.getAlias();
+        @Nullable String alias = safeOptionalSourceLabel(source.getAlias());
+        @Nullable String safeRemoteName = safeOptionalSourceLabel(remoteName);
         String status = sourceStatusLabel(result);
         @Nullable String failureMessage = result == null ? null : result.getFailureMessage();
         int pluginCount = result == null ? 0 : result.getItems().size();
@@ -787,8 +919,8 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 displayName(source, remoteName),
                 source.getUrl(),
                 alias,
-                remoteName,
-                registry == null ? null : registry.getDescription(),
+                safeRemoteName,
+                registry == null ? null : PluginSourceLabels.sanitizeMetadata(registry.getDescription()),
                 registry == null ? null : homepageHost(registry.getHomepageUrl()),
                 source.isOfficial(),
                 source.isEnabled(),
@@ -800,6 +932,14 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                 partialFailures,
                 conflicts
         );
+    }
+
+    /// Returns an ordinary alias or registry name when it can be safely repeated outside an explicit URL field.
+    ///
+    /// @param label source alias or registry name
+    /// @return trimmed safe label, or `null` for URL-shaped untrusted metadata
+    private static @Nullable String safeOptionalSourceLabel(@Nullable String label) {
+        return PluginSourceLabels.isSafeHumanLabel(label) ? Objects.requireNonNull(label).trim() : null;
     }
 
     /// Returns the aggregate winner conflicts involving one source, or a localized empty value.
@@ -852,12 +992,16 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
     ) {
         List<String> lines = new ArrayList<>();
         lines.add(i18n("plugin.store.source.details.url", url));
-        if (alias != null) {
-            lines.add(i18n("plugin.store.source.details.alias", alias));
+        @Nullable String safeAlias = safeOptionalSourceLabel(alias);
+        @Nullable String safeName = safeOptionalSourceLabel(name);
+        if (safeAlias != null) {
+            lines.add(i18n("plugin.store.source.details.alias", safeAlias));
         }
-        lines.add(name);
+        if (safeName != null) {
+            lines.add(safeName);
+        }
         if (StringUtils.isNotBlank(description)) {
-            lines.add(description);
+            lines.add(PluginSourceLabels.sanitizeMetadata(description));
         }
         if (homepageHost != null) {
             lines.add(i18n("plugin.store.source.preview.homepage", homepageHost));
@@ -1235,7 +1379,7 @@ public final class PluginSourceManagementPage extends VBox implements DecoratorP
                     previewManager.loadSource(previewSource);
                     @Nullable PluginStoreRegistry registry = previewManager.getRegistry();
                     if (registry == null) {
-                        throw new IOException("Plugin source preview has no registry");
+                        throw new IOException(i18n("plugin.store.source.preview.missing_registry"));
                     }
                     return new SourcePreview(previewSource, registry, previewManager.getStoreItems().size());
                 });
