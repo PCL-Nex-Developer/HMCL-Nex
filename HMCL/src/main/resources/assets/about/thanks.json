@@ -1,5 +1,11 @@
 [
   {
+    "image" : "/assets/img/yellow_fish.png",
+    "title" : "huanghongxun",
+    "subtitle" : "HMCL 原作者",
+    "externalLink" : "https://space.bilibili.com/1445341"
+  },
+  {
     "image" : "/assets/img/yushijinhun.png",
     "title" : "yushijinhun",
     "subtitleLocalized" : "about.thanks_to.yushijinhun.statement",

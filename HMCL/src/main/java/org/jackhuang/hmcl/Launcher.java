@@ -39,6 +39,7 @@ import org.jackhuang.hmcl.task.Schedulers;
 import org.jackhuang.hmcl.theme.Themes;
 import org.jackhuang.hmcl.ui.Controllers;
 import org.jackhuang.hmcl.ui.FXUtils;
+import org.jackhuang.hmcl.ui.StartupLogo;
 import org.jackhuang.hmcl.ui.animation.AnimationUtils;
 import org.jackhuang.hmcl.upgrade.UpdateChecker;
 import org.jackhuang.hmcl.upgrade.UpdateHandler;
@@ -123,19 +124,33 @@ public final class Launcher extends Application {
                 showAlert(AlertType.WARNING, i18n("fatal.illegal_char"));
             }
 
+            // Raised here, not around Controllers.initialize: that call and
+            // primaryStage.show() below share one callback, so a logo shown inside
+            // it would hold the JavaFX thread for all of initialization and never
+            // be painted before it was told to fade.
+            StartupLogo.show();
+
             // runLater to ensure SettingsManager.init() finished initialization
-            Platform.runLater(() -> {
+            StartupLogo.runAfterFirstPaint(() -> {
                 // When launcher visibility is set to "hide and reopen" without Platform.implicitExit = false,
                 // Stage.show() cannot work again because JavaFX Toolkit have already shut down.
                 Platform.setImplicitExit(false);
-                Controllers.initialize(primaryStage);
+                try {
+                    Controllers.initialize(primaryStage);
 
-                if (OperatingSystem.CURRENT_OS == OperatingSystem.MACOS)
-                    Themes.applyNativeDarkMode(primaryStage);
+                    if (OperatingSystem.CURRENT_OS == OperatingSystem.MACOS)
+                        Themes.applyNativeDarkMode(primaryStage);
 
-                UpdateChecker.init();
+                    UpdateChecker.init();
 
-                primaryStage.show();
+                    primaryStage.centerOnScreen();
+                    primaryStage.show();
+                } finally {
+                    // In finally so a failure here cannot leave the logo alone on
+                    // the desktop: exceptions from this callback go to the JavaFX
+                    // thread's handler, not to the catch below.
+                    StartupLogo.dismiss();
+                }
             });
         } catch (Throwable e) {
             CRASH_REPORTER.uncaughtException(Thread.currentThread(), e);
