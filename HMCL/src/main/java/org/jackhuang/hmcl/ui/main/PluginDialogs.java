@@ -57,10 +57,7 @@ import static org.jackhuang.hmcl.util.logging.Logger.LOG;
 /// Builds HMCL-styled plugin installation, progress, result, and lifecycle dialogs.
 @NotNullByDefault
 final class PluginDialogs {
-    /// Shows a formal per-plugin permission grant form before an installation or update mutates state.
-    ///
-    /// Every mutable package receives its own permission group. The callback runs only after the user confirms;
-    /// closing or cancelling the dialog leaves package and permission state unchanged.
+    /// Shows permission review without an aggregate-source warning for local package installation.
     ///
     /// @param pluginName display name of the root package
     /// @param update whether the root package replaces an installed artifact
@@ -74,11 +71,31 @@ final class PluginDialogs {
             List<String> installPlan,
             Consumer<@Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>>> callback
     ) {
+        confirmPluginInstall(pluginName, update, permissionRequests, installPlan, null, callback);
+    }
+
+    /// Shows permission review with an optional aggregate-source warning.
+    ///
+    /// @param pluginName display name of the root package
+    /// @param update whether the root package replaces an installed artifact
+    /// @param permissionRequests permission forms for every package that will be installed or updated
+    /// @param installPlan localized dependency-first installation plan
+    /// @param catalogWarning aggregate-source warning without source URLs, or `null` when every source is available
+    /// @param callback receives immutable grants indexed by plugin ID after confirmation
+    static void confirmPluginInstall(
+            String pluginName,
+            boolean update,
+            List<PluginPermissionRequest> permissionRequests,
+            List<String> installPlan,
+            @Nullable String catalogWarning,
+            Consumer<@Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>>> callback
+    ) {
         Platform.runLater(() -> Controllers.dialog(new PluginInstallPermissionDialog(
                 pluginName,
                 update,
                 permissionRequests,
                 installPlan,
+                catalogWarning,
                 callback
         )));
     }
@@ -234,12 +251,14 @@ final class PluginDialogs {
         /// @param update whether the root package is an update
         /// @param permissionRequests permission groups for mutable packages
         /// @param installPlan localized dependency-first plan rows
+        /// @param catalogWarning aggregate-source warning without source URLs, or `null` when unavailable
         /// @param callback receives confirmed immutable grants
         private PluginInstallPermissionDialog(
                 String pluginName,
                 boolean update,
                 List<PluginPermissionRequest> permissionRequests,
                 List<String> installPlan,
+                @Nullable String catalogWarning,
                 Consumer<@Unmodifiable Map<String, @Unmodifiable Set<PluginPermission>>> callback
         ) {
             setHeading(new HBox(new Label(i18n(
@@ -259,6 +278,11 @@ final class PluginDialogs {
             }
             runtimeHint.setText(runtimeWarning);
             content.getChildren().add(runtimeHint);
+            if (catalogWarning != null) {
+                HintPane catalogWarningHint = new HintPane(MessageDialogPane.MessageType.WARNING);
+                catalogWarningHint.setText(catalogWarning);
+                content.getChildren().add(catalogWarningHint);
+            }
 
             content.getChildren().add(ComponentList.createComponentListTitle(i18n("plugin.install.plan")));
             ComponentList planList = new ComponentList();
